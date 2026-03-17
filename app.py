@@ -33,12 +33,7 @@ HEADERS = {"Content-Type": "application/json"}
 ultimo_estado = {}
 lock = threading.Lock()
 
-# ──────────────────────────────────────────────
-#  BASE DE DATOS
-# ──────────────────────────────────────────────
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
-
+# Inicializar DB al cargar el módulo
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -65,6 +60,12 @@ def init_db():
             """)
         conn.commit()
     print("✅ Base de datos lista")
+
+# ──────────────────────────────────────────────
+#  BASE DE DATOS
+# ──────────────────────────────────────────────
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
 def guardar_snapshot(m):
     with get_conn() as conn:
@@ -514,3 +515,8 @@ if __name__ == "__main__":
     t.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+else:
+    # Cuando corre con gunicorn
+    init_db()
+    t = threading.Thread(target=ciclo_colector, daemon=True)
+    t.start()
