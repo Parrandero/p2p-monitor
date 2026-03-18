@@ -46,6 +46,11 @@ def init_db():
                     WHERE table_name='snapshots' AND column_name='mejor_comprador'
                   ) THEN DROP TABLE snapshots;
                   END IF;
+                  IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='snapshots' AND column_name='spread_pond_abs'
+                  ) THEN DROP TABLE IF EXISTS snapshots;
+                  END IF;
                 END $$;
             """)
             cur.execute("""
@@ -68,6 +73,8 @@ def init_db():
                     liq_tab_venta NUMERIC,
                     n_tab_compra INTEGER,
                     n_tab_venta INTEGER,
+                    spread_pond_abs NUMERIC,
+                    spread_pond_pct NUMERIC,
                     precio_maker_vender NUMERIC,
                     precio_maker_comprar NUMERIC,
                     ganancia_neta_pct NUMERIC,
@@ -92,6 +99,7 @@ def guardar_snapshot(m):
                     spread_abs, spread_pct,
                     liq_tab_compra, liq_tab_venta,
                     n_tab_compra, n_tab_venta,
+                    spread_pond_abs, spread_pond_pct,
                     precio_maker_vender, precio_maker_comprar,
                     ganancia_neta_pct, estado, color
                 ) VALUES (
@@ -103,6 +111,7 @@ def guardar_snapshot(m):
                     %(spread_abs)s, %(spread_pct)s,
                     %(liq_tab_compra)s, %(liq_tab_venta)s,
                     %(n_tab_compra)s, %(n_tab_venta)s,
+                    %(spread_pond_abs)s, %(spread_pond_pct)s,
                     %(precio_maker_vender)s, %(precio_maker_comprar)s,
                     %(ganancia_neta_pct)s, %(estado)s, %(color)s
                 )
