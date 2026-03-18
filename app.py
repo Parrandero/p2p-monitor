@@ -7,9 +7,9 @@ import threading
 import time
 import os
 from datetime import datetime
-import pytz
+from zoneinfo import ZoneInfo
 
-SANTIAGO_TZ = pytz.timezone("America/Santiago")
+SANTIAGO_TZ = ZoneInfo("America/Santiago")
 from flask import Flask, jsonify, render_template_string
 import psycopg2
 from psycopg2.extras import RealDictCursor
