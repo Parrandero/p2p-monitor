@@ -7,6 +7,9 @@ import threading
 import time
 import os
 from datetime import datetime
+import pytz
+
+SANTIAGO_TZ = pytz.timezone("America/Santiago")
 from flask import Flask, jsonify, render_template_string
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -204,7 +207,11 @@ def analizar(tab_compra, tab_venta):
     pond_tc = round(precio_ponderado(tab_compra), 2)
     pond_tv = round(precio_ponderado(tab_venta),  2)
 
-    # Maker: un centavo mejor que el líder de cada lado
+    # Spread entre precios ponderados
+    spread_pond_abs = round(pond_tc - pond_tv, 2)
+    spread_pond_pct = round((spread_pond_abs / pond_tv) * 100, 4) if pond_tv > 0 else 0
+
+    # Maker: un centavo mejor que el lider de cada lado
     precio_maker_vender  = round(lider_tc["precio"]  - 0.01, 2)  # un centavo más barato que el más barato de Tab Compra
     precio_maker_comprar = round(lider_tv["precio"]  + 0.01, 2)  # un centavo más que el que más paga de Tab Venta
 
@@ -220,9 +227,9 @@ def analizar(tab_compra, tab_venta):
         estado, color = "NO APTO ❌", "red"
 
     return {
-        "timestamp":                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "hora":                     datetime.now().hour,
-        "dia":                      datetime.now().strftime("%A"),
+        "timestamp":                datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "hora":                     datetime.now(SANTIAGO_TZ).hour,
+        "dia":                      datetime.now(SANTIAGO_TZ).strftime("%A"),
         # Tab Compra (vendedores de USDT)
         "mejor_vendedor_tab_compra":  lider_tc["precio"],
         "peor_vendedor_tab_compra":   mas_caro_tc["precio"],
@@ -242,6 +249,8 @@ def analizar(tab_compra, tab_venta):
         "n_tab_venta":                len(tab_venta),
         "precio_maker_vender":        precio_maker_vender,
         "precio_maker_comprar":       precio_maker_comprar,
+        "spread_pond_abs":            spread_pond_abs,
+        "spread_pond_pct":            spread_pond_pct,
         "ganancia_neta_pct":          ganancia,
         "estado":                     estado,
         "color":                      color,
@@ -451,6 +460,13 @@ function renderTR(e){
         <div class="panel-liq"><b>Liquidez total:</b> ${fmt(e.liq_tab_venta,0)} USDT · ${e.n_tab_venta} anuncios</div>
         <div class="panel-rango">Menos paga: $${fmt(e.peor_comprador_tab_venta)}</div>
       </div>
+    </div>
+
+    <div style="margin:0 20px 4px; background:#12122a; border:1px solid #1e1e3f; border-radius:10px; padding:10px 16px; display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-size:0.72rem; color:#888;">Brecha precio ponderado</span>
+      <span style="font-size:1rem; font-weight:bold; color:#ffd740;">
+        $${fmt(e.spread_pond_abs)} CLP — ${parseFloat(e.spread_pond_pct).toFixed(2)}%
+      </span>
     </div>
 
     <div class="spread-row">
