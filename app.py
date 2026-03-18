@@ -35,6 +35,16 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Borrar tabla si tiene esquema viejo
+            cur.execute("""
+                DO $$ BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='snapshots' AND column_name='mejor_comprador'
+                  ) THEN DROP TABLE snapshots;
+                  END IF;
+                END $$;
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS snapshots (
                     id SERIAL PRIMARY KEY,
@@ -64,6 +74,7 @@ def init_db():
             """)
         conn.commit()
     print("✅ Base de datos lista")
+
 
 def guardar_snapshot(m):
     with get_conn() as conn:
