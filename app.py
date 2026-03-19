@@ -206,9 +206,9 @@ def parsear_y_filtrar(anuncios, tipo):
         adv   = item.get("adv", {})
         trade = item.get("advertiser", {})
         disponible  = float(adv.get("tradableQuantity", 0))
-        completadas = int(trade.get("tradeCount", 0))
-        tasa_exito  = float(trade.get("monthFinishRate", 0)) * 100
-        resp_time   = int(adv.get("avgAveReleastTime", 0)) // 60
+        completadas = int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0)
+        tasa_exito  = float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100
+        resp_time   = int(adv.get("avgAveReleastTime", 0) or 0) // 60
         min_clp     = float(adv.get("minSingleTransAmount", 0))
         if disponible  < c["FILTRO_MIN_USDT"]:  continue
         if completadas < c["FILTRO_MIN_ORD"]:   continue
@@ -299,7 +299,10 @@ def ciclo_colector():
             print("[COLECTOR] Consultando Binance BUY...")
             raw_compra = obtener_anuncios("BUY")
             print(f"[COLECTOR] BUY raw: {len(raw_compra)} anuncios")
-            if raw_compra: print(f"[DEBUG] Primer anuncio BUY: precio={raw_compra[0]['adv'].get('price')}, minCLP={raw_compra[0]['adv'].get('minSingleTransAmount')}, respTime={raw_compra[0]['adv'].get('avgAveReleastTime')}, ordenes={raw_compra[0]['advertiser'].get('tradeCount')}, tasa={raw_compra[0]['advertiser'].get('monthFinishRate')}")
+            if raw_compra:
+                a0 = raw_compra[0]
+                print(f"[DEBUG] Keys adv: {list(a0['adv'].keys())}")
+                print(f"[DEBUG] Keys trade: {list(a0['advertiser'].keys())}")
             tab_compra = parsear_y_filtrar(raw_compra, "BUY")
             print(f"[COLECTOR] BUY filtrado: {len(tab_compra)} anuncios")
 
