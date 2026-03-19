@@ -23,10 +23,8 @@ config = {
     "FIAT":             "CLP",
     "INTERVALO_MIN":    5,
     "FILTRO_MIN_USDT":  200,
-    "FILTRO_MIN_ORD":   150,
-    "FILTRO_MIN_TASA":  95.0,
-    "FILTRO_MAX_RESP":  30,
-    "FILTRO_MAX_MIN_CLP": 500000,
+    "FILTRO_MIN_ORD":   100,
+    "FILTRO_MIN_TASA":  90.0,
     "ALERTA_SPREAD":    0.8,
     "SPREAD_MINIMO":    0.2,
     "COMISION_BN":      0.002,
@@ -207,14 +205,10 @@ def parsear_y_filtrar(anuncios, tipo):
         trade = item.get("advertiser", {})
         disponible  = float(adv.get("tradableQuantity", 0))
         completadas = int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0)
-        tasa_exito  = float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100
-        resp_time   = int(adv.get("avgAveReleastTime", 0) or 0) // 60
-        min_clp     = float(adv.get("minSingleTransAmount", 0))
-        if disponible  < c["FILTRO_MIN_USDT"]:  continue
-        if completadas < c["FILTRO_MIN_ORD"]:   continue
-        if tasa_exito  < c["FILTRO_MIN_TASA"]:  continue
-        if c["FILTRO_MAX_RESP"] < 60 and resp_time > c["FILTRO_MAX_RESP"]: continue
-        if c["FILTRO_MAX_MIN_CLP"] > 0 and min_clp > c["FILTRO_MAX_MIN_CLP"]: continue
+        if disponible  < c["FILTRO_MIN_USDT"]: continue
+        if completadas < c["FILTRO_MIN_ORD"]:  continue
+        tasa_exito = float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100
+        if tasa_exito < c["FILTRO_MIN_TASA"]:  continue
         resultado.append({
             "tipo":       tipo,
             "precio":     float(adv.get("price", 0)),
@@ -431,24 +425,7 @@ header span{color:#888;font-size:0.7rem;}
     <div class="filtros-body" id="filtros-body">
       <div class="filtros-grid">
         <div class="f-item"><label>Mín. USDT disponible</label><input type="number" id="f-usdt" value="200"></div>
-        <div class="f-item"><label>Mín. órdenes completadas</label><input type="number" id="f-ord" value="150"></div>
-        <div class="f-item"><label>Tasa de éxito mínima (%)</label><input type="number" id="f-tasa" value="95" step="0.1"></div>
-        <div class="f-item"><label>Tiempo respuesta máx.</label>
-          <select id="f-resp">
-            <option value="15">15 min</option>
-            <option value="30" selected>30 min</option>
-            <option value="60">60 min</option>
-            <option value="999">Sin filtro</option>
-          </select>
-        </div>
-        <div class="f-item"><label>Mín. CLP por transacción</label>
-          <select id="f-clp">
-            <option value="0">Sin filtro</option>
-            <option value="200000">200,000 CLP</option>
-            <option value="500000" selected>500,000 CLP</option>
-            <option value="1000000">1,000,000 CLP</option>
-          </select>
-        </div>
+        <div class="f-item"><label>Mín. órdenes completadas</label><input type="number" id="f-ord" value="100"></div>
         <div class="f-item"><label>Intervalo de consulta</label>
           <select id="f-int">
             <option value="1">1 minuto</option>
@@ -499,9 +476,6 @@ async function aplicarFiltros(){
   const body={
     FILTRO_MIN_USDT: parseInt(document.getElementById('f-usdt').value),
     FILTRO_MIN_ORD:  parseInt(document.getElementById('f-ord').value),
-    FILTRO_MIN_TASA: parseFloat(document.getElementById('f-tasa').value),
-    FILTRO_MAX_RESP: parseInt(document.getElementById('f-resp').value),
-    FILTRO_MAX_MIN_CLP: parseInt(document.getElementById('f-clp').value),
     INTERVALO_MIN:   parseInt(document.getElementById('f-int').value),
   };
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -540,9 +514,6 @@ async function sincronizarFiltros(){
     const cfg=await fetch('/api/config').then(r=>r.json());
     document.getElementById('f-usdt').value=cfg.FILTRO_MIN_USDT;
     document.getElementById('f-ord').value=cfg.FILTRO_MIN_ORD;
-    document.getElementById('f-tasa').value=cfg.FILTRO_MIN_TASA;
-    document.getElementById('f-resp').value=cfg.FILTRO_MAX_RESP;
-    document.getElementById('f-clp').value=cfg.FILTRO_MAX_MIN_CLP;
     document.getElementById('f-int').value=cfg.INTERVALO_MIN;
   }catch(e){}
 }
@@ -711,8 +682,7 @@ def api_config():
     global config
     if request.method == "POST":
         data = request.get_json()
-        allowed = ["FILTRO_MIN_USDT","FILTRO_MIN_ORD","FILTRO_MIN_TASA",
-                   "FILTRO_MAX_RESP","FILTRO_MAX_MIN_CLP","INTERVALO_MIN"]
+        allowed = ["FILTRO_MIN_USDT","FILTRO_MIN_ORD","FILTRO_MIN_TASA","INTERVALO_MIN"]
         with config_lock:
             for k in allowed:
                 if k in data:
