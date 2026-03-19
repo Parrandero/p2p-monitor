@@ -213,8 +213,8 @@ def parsear_y_filtrar(anuncios, tipo):
         if disponible  < c["FILTRO_MIN_USDT"]:  continue
         if completadas < c["FILTRO_MIN_ORD"]:   continue
         if tasa_exito  < c["FILTRO_MIN_TASA"]:  continue
-        if c["FILTRO_MAX_RESP"] < 60 and resp_time > c["FILTRO_MAX_RESP"]: continue
-        if c["FILTRO_MAX_MIN_CLP"] > 0 and min_clp > c["FILTRO_MAX_MIN_CLP"]: continue
+        # if c["FILTRO_MAX_RESP"] < 60 and resp_time > c["FILTRO_MAX_RESP"]: continue  # desactivado temporalmente
+        # if c["FILTRO_MAX_MIN_CLP"] > 0 and min_clp > c["FILTRO_MAX_MIN_CLP"]: continue  # desactivado temporalmente
         resultado.append({
             "tipo":       tipo,
             "precio":     float(adv.get("price", 0)),
@@ -299,6 +299,7 @@ def ciclo_colector():
             print("[COLECTOR] Consultando Binance BUY...")
             raw_compra = obtener_anuncios("BUY")
             print(f"[COLECTOR] BUY raw: {len(raw_compra)} anuncios")
+            if raw_compra: print(f"[DEBUG] Primer anuncio BUY: precio={raw_compra[0]['adv'].get('price')}, minCLP={raw_compra[0]['adv'].get('minSingleTransAmount')}, respTime={raw_compra[0]['adv'].get('avgAveReleastTime')}, ordenes={raw_compra[0]['advertiser'].get('tradeCount')}, tasa={raw_compra[0]['advertiser'].get('monthFinishRate')}")
             tab_compra = parsear_y_filtrar(raw_compra, "BUY")
             print(f"[COLECTOR] BUY filtrado: {len(tab_compra)} anuncios")
 
