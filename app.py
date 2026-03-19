@@ -291,21 +291,38 @@ def analizar(tab_compra, tab_venta):
     }
 
 def ciclo_colector():
+    print("[COLECTOR] Iniciando thread...")
     time.sleep(5)
+    print("[COLECTOR] Primer ciclo comenzando")
     while True:
         try:
-            tab_compra = parsear_y_filtrar(obtener_anuncios("BUY"),  "BUY")
-            tab_venta  = parsear_y_filtrar(obtener_anuncios("SELL"), "SELL")
-            estado     = analizar(tab_compra, tab_venta)
+            print("[COLECTOR] Consultando Binance BUY...")
+            raw_compra = obtener_anuncios("BUY")
+            print(f"[COLECTOR] BUY raw: {len(raw_compra)} anuncios")
+            tab_compra = parsear_y_filtrar(raw_compra, "BUY")
+            print(f"[COLECTOR] BUY filtrado: {len(tab_compra)} anuncios")
+
+            print("[COLECTOR] Consultando Binance SELL...")
+            raw_venta = obtener_anuncios("SELL")
+            print(f"[COLECTOR] SELL raw: {len(raw_venta)} anuncios")
+            tab_venta = parsear_y_filtrar(raw_venta, "SELL")
+            print(f"[COLECTOR] SELL filtrado: {len(tab_venta)} anuncios")
+
+            estado = analizar(tab_compra, tab_venta)
             if estado:
                 guardar_snapshot(estado)
                 with data_lock:
                     ultimo_estado.update(estado)
                 print(f"[{estado['timestamp']}] Spread pond: {estado['spread_pond_pct']}% — {estado['estado']}")
+            else:
+                print("[COLECTOR] Sin datos suficientes para analizar")
         except Exception as e:
-            print(f"[ERROR] {e}")
+            import traceback
+            print(f"[ERROR COLECTOR] {e}")
+            print(traceback.format_exc())
         with config_lock:
             intervalo = config["INTERVALO_MIN"]
+        print(f"[COLECTOR] Esperando {intervalo} minutos...")
         time.sleep(intervalo * 60)
 
 # ──────────────────────────────────────────────
