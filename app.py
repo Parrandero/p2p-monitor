@@ -19,8 +19,10 @@ app = Flask(__name__)
 MONEDA          = "USDT"
 FIAT            = "CLP"
 INTERVALO_MIN   = 5
-FILTRO_MIN_USDT = 200
-TOP_ANUNCIOS    = 20
+FILTRO_MIN_USDT     = 200
+FILTRO_MIN_ORDENES  = 150       # Minimo de ordenes completadas
+FILTRO_MIN_TASA     = 95.0      # Tasa de exito minima (%)
+TOP_ANUNCIOS    = 30
 ALERTA_SPREAD   = 0.8
 SPREAD_MINIMO   = 0.2
 COMISION_BN     = 0.002
@@ -165,8 +167,14 @@ def parsear_y_filtrar(anuncios, tipo):
     for item in anuncios:
         adv   = item.get("adv", {})
         trade = item.get("advertiser", {})
-        disponible = float(adv.get("tradableQuantity", 0))
+        disponible  = float(adv.get("tradableQuantity", 0))
+        completadas = int(trade.get("tradeCount", 0))
+        tasa_exito  = float(trade.get("monthFinishRate", 0)) * 100
         if disponible < FILTRO_MIN_USDT:
+            continue
+        if completadas < FILTRO_MIN_ORDENES:
+            continue
+        if tasa_exito < FILTRO_MIN_TASA:
             continue
         resultado.append({
             "tipo":       tipo,
@@ -206,8 +214,8 @@ def analizar(tab_compra, tab_venta):
     lider_tv     = max(tab_venta, key=lambda x: x["precio"])   # paga más
     menos_tv     = min(tab_venta, key=lambda x: x["precio"])   # paga menos
 
-    # Spread = precio más bajo de Tab Compra − precio más alto de Tab Venta
-    spread_abs = lider_tc["precio"] - lider_tv["precio"]
+    # Spread = lo que pagan compradores (Tab Venta) − lo que piden vendedores (Tab Compra)
+    spread_abs = lider_tv["precio"] - lider_tc["precio"]
     spread_pct = round((spread_abs / lider_tv["precio"]) * 100, 4) if lider_tv["precio"] > 0 else 0
 
     liq_tc = sum(a["disponible"] for a in tab_compra)
@@ -217,7 +225,7 @@ def analizar(tab_compra, tab_venta):
     pond_tv = round(precio_ponderado(tab_venta),  2)
 
     # Spread entre precios ponderados
-    spread_pond_abs = round(pond_tc - pond_tv, 2)
+    spread_pond_abs = round(pond_tv - pond_tc, 2)
     spread_pond_pct = round((spread_pond_abs / pond_tv) * 100, 4) if pond_tv > 0 else 0
 
     # Maker: un centavo mejor que el lider de cada lado
