@@ -1,5 +1,5 @@
 """
-P2P Monitor Binance — Vision Maker v2
+P2P Monitor Binance — Vision Maker v2 + Detalle por Anunciante
 """
 
 import requests
@@ -15,9 +15,6 @@ from psycopg2.extras import RealDictCursor
 app = Flask(__name__)
 SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
-# ──────────────────────────────────────────────
-#  CONFIG (modificable desde la UI)
-# ──────────────────────────────────────────────
 config = {
     "MONEDA":           "USDT",
     "FIAT":             "CLP",
@@ -39,37 +36,13 @@ HEADERS = {"Content-Type": "application/json"}
 ultimo_estado = {}
 data_lock = threading.Lock()
 
-# ──────────────────────────────────────────────
-#  BASE DE DATOS
-# ──────────────────────────────────────────────
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                DO $$ BEGIN
-                  IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='snapshots'
-                    AND column_name NOT IN (
-                      'id','timestamp','hora','dia',
-                      'mejor_vendedor_tab_compra','peor_vendedor_tab_compra',
-                      'precio_pond_tab_compra','lider_tab_compra',
-                      'mejor_comprador_tab_venta','peor_comprador_tab_venta',
-                      'precio_pond_tab_venta','lider_tab_venta',
-                      'spread_abs','spread_pct',
-                      'spread_pond_abs','spread_pond_pct',
-                      'liq_tab_compra','liq_tab_venta',
-                      'n_tab_compra','n_tab_venta',
-                      'precio_maker_vender','precio_maker_comprar',
-                      'ganancia_neta_pct','estado','color'
-                    )
-                  ) THEN DROP TABLE snapshots;
-                  END IF;
-                END $$;
-            """)
+            # Tabla existente — sin tocar
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS snapshots (
                     id SERIAL PRIMARY KEY,
@@ -99,12 +72,38 @@ def init_db():
                     color TEXT
                 )
             """)
+            # NUEVA tabla de detalle por anunciante
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS snapshots_detalle (
+                    id SERIAL PRIMARY KEY,
+                    snapshot_timestamp TIMESTAMP NOT NULL,
+                    hora INTEGER,
+                    tipo TEXT,
+                    posicion INTEGER,
+                    anunciante TEXT,
+                    precio NUMERIC,
+                    disponible NUMERIC,
+                    completadas INTEGER,
+                    tasa_exito NUMERIC,
+                    es_merchant BOOLEAN
+                )
+            """)
+            # Índice para consultas rápidas por timestamp y tipo
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_detalle_timestamp 
+                ON snapshots_detalle(snapshot_timestamp)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_detalle_anunciante 
+                ON snapshots_detalle(anunciante, tipo)
+            """)
         conn.commit()
-    print("✅ Base de datos lista")
+    print("✅ Base de datos lista (snapshots + snapshots_detalle)")
 
 def reset_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS snapshots_detalle")
             cur.execute("DROP TABLE IF EXISTS snapshots")
         conn.commit()
     init_db()
@@ -144,6 +143,43 @@ def guardar_snapshot(m):
             """, m)
         conn.commit()
 
+def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
+    """Guarda los top 20 anunciantes de cada lado SIN filtros de mínimos"""
+    rows = []
+    for pos, item in enumerate(anuncios_raw_compra[:20], 1):
+        adv   = item.get("adv", {})
+        trade = item.get("advertiser", {})
+        rows.append((
+            timestamp, hora, "BUY", pos,
+            trade.get("nickName", ""),
+            float(adv.get("price", 0)),
+            float(adv.get("tradableQuantity", 0)),
+            int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0),
+            float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100,
+            bool(trade.get("userType") == "merchant"),
+        ))
+    for pos, item in enumerate(anuncios_raw_venta[:20], 1):
+        adv   = item.get("adv", {})
+        trade = item.get("advertiser", {})
+        rows.append((
+            timestamp, hora, "SELL", pos,
+            trade.get("nickName", ""),
+            float(adv.get("price", 0)),
+            float(adv.get("tradableQuantity", 0)),
+            int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0),
+            float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100,
+            bool(trade.get("userType") == "merchant"),
+        ))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO snapshots_detalle
+                (snapshot_timestamp, hora, tipo, posicion, anunciante, precio,
+                 disponible, completadas, tasa_exito, es_merchant)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, rows)
+        conn.commit()
+
 def obtener_historial(limit=200):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -177,9 +213,19 @@ def obtener_count():
             cur.execute("SELECT COUNT(*) FROM snapshots")
             return cur.fetchone()[0]
 
-# ──────────────────────────────────────────────
-#  COLECTOR
-# ──────────────────────────────────────────────
+def obtener_velocidad_anunciante(anunciante, tipo, limit=50):
+    """Retorna la velocidad de consumo de un anunciante específico"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT snapshot_timestamp, disponible
+                FROM snapshots_detalle
+                WHERE anunciante = %s AND tipo = %s
+                ORDER BY snapshot_timestamp DESC LIMIT %s
+            """, (anunciante, tipo, limit))
+            rows = cur.fetchall()
+    return [dict(r) for r in reversed(rows)]
+
 def obtener_anuncios(tipo):
     with config_lock:
         c = dict(config)
@@ -294,21 +340,24 @@ def ciclo_colector():
             raw_compra = obtener_anuncios("BUY")
             print(f"[COLECTOR] BUY raw: {len(raw_compra)} anuncios")
 
-            tab_compra = parsear_y_filtrar(raw_compra, "BUY")
-            print(f"[COLECTOR] BUY filtrado: {len(tab_compra)} anuncios")
-
             print("[COLECTOR] Consultando Binance SELL...")
             raw_venta = obtener_anuncios("SELL")
             print(f"[COLECTOR] SELL raw: {len(raw_venta)} anuncios")
-            tab_venta = parsear_y_filtrar(raw_venta, "SELL")
-            print(f"[COLECTOR] SELL filtrado: {len(tab_venta)} anuncios")
+
+            # Filtrar para el spread
+            tab_compra = parsear_y_filtrar(raw_compra, "BUY")
+            tab_venta  = parsear_y_filtrar(raw_venta,  "SELL")
 
             estado = analizar(tab_compra, tab_venta)
             if estado:
                 guardar_snapshot(estado)
+                # NUEVO: guardar detalle SIN filtros
+                ts   = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                hora = datetime.now(SANTIAGO_TZ).hour
+                guardar_detalle(ts, hora, raw_compra, raw_venta)
                 with data_lock:
                     ultimo_estado.update(estado)
-                print(f"[{estado['timestamp']}] Spread pond: {estado['spread_pond_pct']}% — {estado['estado']}")
+                print(f"[{estado['timestamp']}] Spread pond: {estado['spread_pond_pct']}% — {estado['estado']} | Detalle: {len(raw_compra)+len(raw_venta)} anunciantes guardados")
             else:
                 print("[COLECTOR] Sin datos suficientes para analizar")
         except Exception as e:
@@ -320,9 +369,7 @@ def ciclo_colector():
         print(f"[COLECTOR] Esperando {intervalo} minutos...")
         time.sleep(intervalo * 60)
 
-# ──────────────────────────────────────────────
-#  DASHBOARD
-# ──────────────────────────────────────────────
+# ── DASHBOARD (igual al original) ──
 DASHBOARD = r"""
 <!DOCTYPE html>
 <html lang="es">
@@ -413,7 +460,6 @@ header span{color:#888;font-size:0.7rem;}
   <div class="tab" onclick="showTab('hist',this)">Histórico</div>
   <div class="tab" onclick="showTab('heat',this)">Mapa de Calor</div>
 </div>
-
 <div id="tr" class="tab-content active">
   <div id="contenido-tr"><div class="sin-datos">Esperando primer ciclo de datos (5 min)...</div></div>
   <div class="filtros-panel">
@@ -440,213 +486,37 @@ header span{color:#888;font-size:0.7rem;}
     </div>
   </div>
 </div>
-
 <div id="hist" class="tab-content">
   <div class="seccion"><h2>Spread ponderado histórico</h2><div class="chart-wrap"><canvas id="chartSpread" height="100"></canvas></div></div>
   <div class="seccion"><h2>Liquidez histórica</h2><div class="chart-wrap"><canvas id="chartLiq" height="100"></canvas></div></div>
 </div>
-
 <div id="heat" class="tab-content">
   <div class="seccion"><h2>Spread ponderado promedio por hora y día</h2><div class="chart-wrap"><canvas id="chartHeat" height="180"></canvas></div></div>
   <div class="seccion"><div id="stats-resumen" class="chart-wrap"></div></div>
 </div>
-
 <div class="refresh">Actualización en <span id="countdown">30</span>s</div>
 <div class="toast" id="toast"></div>
-
 <script>
-function showTab(id,el){
-  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById(id).classList.add('active');el.classList.add('active');
-}
-function toggleFiltros(){
-  const b=document.getElementById('filtros-body');
-  const i=document.getElementById('toggle-icon');
-  b.classList.toggle('open');
-  i.textContent=b.classList.contains('open')?'▲':'▼';
-}
-function showToast(msg,color='#00e676'){
-  const t=document.getElementById('toast');
-  t.textContent=msg;t.style.color=color;t.style.borderColor=color;
-  t.style.background=color+'22';t.style.display='block';
-  setTimeout(()=>t.style.display='none',3000);
-}
-async function aplicarFiltros(){
-  const body={
-    FILTRO_MIN_USDT: parseInt(document.getElementById('f-usdt').value),
-    FILTRO_MIN_ORD:  parseInt(document.getElementById('f-ord').value),
-    INTERVALO_MIN:   parseInt(document.getElementById('f-int').value),
-  };
-  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(r.ok) showToast('Filtros aplicados');
-  else showToast('Error al aplicar filtros','#ff5252');
-}
-async function resetearDatos(){
-  if(!confirm('Esto borrará todos los datos históricos. ¿Continuar?')) return;
-  const r=await fetch('/api/reset',{method:'POST'});
-  if(r.ok){ showToast('Datos reseteados'); setTimeout(cargarDatos,500); }
-  else showToast('Error al resetear','#ff5252');
-}
-
-let cuenta=30;
-setInterval(()=>{cuenta--;document.getElementById('countdown').textContent=cuenta;if(cuenta<=0){cuenta=30;cargarDatos();}},1000);
+function showTab(id,el){document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.getElementById(id).classList.add('active');el.classList.add('active');}
+function toggleFiltros(){const b=document.getElementById('filtros-body');const i=document.getElementById('toggle-icon');b.classList.toggle('open');i.textContent=b.classList.contains('open')?'▲':'▼';}
+function showToast(msg,color='#00e676'){const t=document.getElementById('toast');t.textContent=msg;t.style.color=color;t.style.borderColor=color;t.style.background=color+'22';t.style.display='block';setTimeout(()=>t.style.display='none',3000);}
+async function aplicarFiltros(){const body={FILTRO_MIN_USDT:parseInt(document.getElementById('f-usdt').value),FILTRO_MIN_ORD:parseInt(document.getElementById('f-ord').value),INTERVALO_MIN:parseInt(document.getElementById('f-int').value)};const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(r.ok)showToast('Filtros aplicados');else showToast('Error al aplicar filtros','#ff5252');}
+async function resetearDatos(){if(!confirm('Esto borrará todos los datos históricos. ¿Continuar?'))return;const r=await fetch('/api/reset',{method:'POST'});if(r.ok){showToast('Datos reseteados');setTimeout(cargarDatos,500);}else showToast('Error al resetear','#ff5252');}
+let cuenta=30;setInterval(()=>{cuenta--;document.getElementById('countdown').textContent=cuenta;if(cuenta<=0){cuenta=30;cargarDatos();}},1000);
 let chartSpread,chartLiq,chartHeat;
 function fmt(n,dec=2){return parseFloat(n).toLocaleString('es-CL',{minimumFractionDigits:dec,maximumFractionDigits:dec});}
-
-async function cargarDatos(){
-  try{
-    const [estado,hist,heat,cnt]=await Promise.all([
-      fetch('/api/estado').then(r=>r.json()),
-      fetch('/api/historial').then(r=>r.json()),
-      fetch('/api/heatmap').then(r=>r.json()),
-      fetch('/api/count').then(r=>r.json()),
-    ]);
-    if(estado.timestamp){renderTR(estado,cnt.count);document.getElementById('ultima-act').textContent='Última act: '+estado.timestamp;}
-    if(hist.length>1) renderHistorico(hist);
-    if(heat.length>0){renderHeatmap(heat);renderStats(hist);}
-    sincronizarFiltros();
-  }catch(e){console.error(e);}
-}
-
-async function sincronizarFiltros(){
-  try{
-    const cfg=await fetch('/api/config').then(r=>r.json());
-    document.getElementById('f-usdt').value=cfg.FILTRO_MIN_USDT;
-    document.getElementById('f-ord').value=cfg.FILTRO_MIN_ORD;
-    document.getElementById('f-int').value=cfg.INTERVALO_MIN;
-  }catch(e){}
-}
-
-function renderTR(e,count){
-  const sp=parseFloat(e.spread_pct).toFixed(2);
-  const spp=parseFloat(e.spread_pond_pct).toFixed(2);
-  const gn=parseFloat(e.ganancia_neta_pct).toFixed(2);
-  const gnColor=parseFloat(e.ganancia_neta_pct)>0?'green':'red';
-  const estadoIcon={'MUY APTO':'🔥','APTO':'✅','ESTRECHO':'⚠️','NO APTO':'❌'}[e.estado]||'';
-  document.getElementById('contenido-tr').innerHTML=`
-    <div class="estado-banner banner-${e.color}">${estadoIcon} ${e.estado} — Spread ponderado ${spp}% · Spread puntual ${sp}%</div>
-    <div class="panel-grid">
-      <div class="panel-tc tc">
-        <div class="panel-header"><span class="tab-badge badge-tc">TAB COMPRA</span></div>
-        <div class="panel-desc">Vendedores de USDT · el usuario va aquí a comprar</div>
-        <div class="precio-pond-label">Precio ponderado</div>
-        <div class="precio-pond">$${fmt(e.precio_pond_tab_compra)}</div>
-        <div class="precio-puntual-label">Líder puntual (más barato)</div>
-        <div class="precio-puntual">$${fmt(e.mejor_vendedor_tab_compra)}</div>
-        <div class="panel-lider">👤 ${e.lider_tab_compra||'—'}</div>
-        <hr class="panel-sep">
-        <div class="panel-stats">${fmt(e.liq_tab_compra,0)} USDT · ${e.n_tab_compra} anuncios · rango $${fmt(e.mejor_vendedor_tab_compra)} – $${fmt(e.peor_vendedor_tab_compra)}</div>
-      </div>
-      <div class="panel-tv tv">
-        <div class="panel-header"><span class="tab-badge badge-tv">TAB VENTA</span></div>
-        <div class="panel-desc">Compradores de USDT · el usuario va aquí a vender</div>
-        <div class="precio-pond-label">Precio ponderado</div>
-        <div class="precio-pond">$${fmt(e.precio_pond_tab_venta)}</div>
-        <div class="precio-puntual-label">Líder puntual (más paga)</div>
-        <div class="precio-puntual">$${fmt(e.mejor_comprador_tab_venta)}</div>
-        <div class="panel-lider">👤 ${e.lider_tab_venta||'—'}</div>
-        <hr class="panel-sep">
-        <div class="panel-stats">${fmt(e.liq_tab_venta,0)} USDT · ${e.n_tab_venta} anuncios · rango $${fmt(e.peor_comprador_tab_venta)} – $${fmt(e.mejor_comprador_tab_venta)}</div>
-      </div>
-    </div>
-    <div class="brecha-bar">
-      <div class="bc-item">
-        <div class="bc-label">Brecha ponderada</div>
-        <div class="bc-val yellow">$${fmt(e.spread_pond_abs)} · ${spp}%</div>
-      </div>
-      <div class="bc-item">
-        <div class="bc-label">Ganancia neta est.</div>
-        <div class="bc-val ${gnColor}">${gn}%</div>
-      </div>
-      <div class="bc-item">
-        <div class="bc-label">Snapshots guardados</div>
-        <div class="bc-val cyan">${count}</div>
-      </div>
-    </div>
-    <div class="maker-title">— Como Maker pondrías tu anuncio un centavo mejor que el líder —</div>
-    <div class="maker-grid">
-      <div class="maker-card maker-tc">
-        <div class="mtipo">Si quiero VENDER USDT (posteo en Tab Compra)</div>
-        <div class="mprecio">$${fmt(e.precio_maker_vender)}</div>
-        <div class="mnota">Un centavo menos que <b>${e.lider_tab_compra||'el líder'}</b> que pide $${fmt(e.mejor_vendedor_tab_compra)}<br>→ aparecer primero en Tab Compra</div>
-      </div>
-      <div class="maker-card maker-tv">
-        <div class="mtipo">Si quiero COMPRAR USDT (posteo en Tab Venta)</div>
-        <div class="mprecio">$${fmt(e.precio_maker_comprar)}</div>
-        <div class="mnota">Un centavo más que <b>${e.lider_tab_venta||'el líder'}</b> que paga $${fmt(e.mejor_comprador_tab_venta)}<br>→ aparecer primero en Tab Venta</div>
-      </div>
-    </div>
-  `;
-}
-
-function renderHistorico(hist){
-  const labels=hist.map(h=>h.timestamp.toString().slice(11,16));
-  const spp=hist.map(h=>parseFloat(h.spread_pond_pct||0));
-  const sp=hist.map(h=>parseFloat(h.spread_pct||0));
-  const liqC=hist.map(h=>parseFloat(h.liq_tab_compra||0));
-  const liqV=hist.map(h=>parseFloat(h.liq_tab_venta||0));
-  const sc={x:{ticks:{color:'#888',maxTicksLimit:10},grid:{color:'#1e1e3f'}},y:{ticks:{color:'#888'},grid:{color:'#1e1e3f'}}};
-  if(chartSpread) chartSpread.destroy();
-  if(chartLiq) chartLiq.destroy();
-  chartSpread=new Chart(document.getElementById('chartSpread').getContext('2d'),{
-    type:'line',data:{labels,datasets:[
-      {label:'Spread ponderado %',data:spp,borderColor:'#ffd740',backgroundColor:'rgba(255,215,64,0.08)',borderWidth:2,pointRadius:2,tension:0.3,fill:true},
-      {label:'Spread puntual %',data:sp,borderColor:'#00d4ff',backgroundColor:'rgba(0,212,255,0.04)',borderWidth:1,pointRadius:1,tension:0.3,fill:false,borderDash:[4,3]},
-    ]},options:{responsive:true,plugins:{legend:{labels:{color:'#aaa'}}},scales:sc}
-  });
-  chartLiq=new Chart(document.getElementById('chartLiq').getContext('2d'),{
-    type:'line',data:{labels,datasets:[
-      {label:'Liquidez Tab Compra',data:liqC,borderColor:'#00e676',backgroundColor:'rgba(0,230,118,0.06)',borderWidth:2,pointRadius:1,tension:0.3,fill:true},
-      {label:'Liquidez Tab Venta',data:liqV,borderColor:'#ff5252',backgroundColor:'rgba(255,82,82,0.06)',borderWidth:2,pointRadius:1,tension:0.3,fill:true},
-    ]},options:{responsive:true,plugins:{legend:{labels:{color:'#aaa'}}},scales:sc}
-  });
-}
-
-function renderHeatmap(heat){
-  const dias=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
-  const diasEs=['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'];
-  const horas=Array.from({length:24},(_,i)=>i);
-  const datasets=dias.map((dia,di)=>({
-    label:diasEs[di],
-    data:horas.map(h=>{const m=heat.find(r=>r.dia===dia&&parseInt(r.hora)===h);return m?parseFloat(m.avg_spread):null;}),
-    backgroundColor:`hsla(${di*50},70%,55%,0.75)`,borderColor:`hsla(${di*50},70%,55%,1)`,borderWidth:1
-  }));
-  if(chartHeat) chartHeat.destroy();
-  chartHeat=new Chart(document.getElementById('chartHeat').getContext('2d'),{
-    type:'bar',data:{labels:horas.map(h=>h+':00'),datasets},
-    options:{responsive:true,plugins:{legend:{labels:{color:'#aaa',boxWidth:12}}},
-      scales:{x:{ticks:{color:'#888'},grid:{color:'#1e1e3f'}},y:{ticks:{color:'#888',callback:v=>v+'%'},grid:{color:'#1e1e3f'}}}}
-  });
-}
-
-function renderStats(hist){
-  if(!hist.length) return;
-  const spp=hist.map(h=>parseFloat(h.spread_pond_pct||0));
-  const avg=(spp.reduce((a,b)=>a+b,0)/spp.length).toFixed(2);
-  const max=Math.max(...spp).toFixed(2);
-  const min=Math.min(...spp).toFixed(2);
-  const hc={};
-  hist.forEach(h=>{(hc[h.hora]=hc[h.hora]||[]).push(parseFloat(h.spread_pond_pct||0));});
-  const mh=Object.entries(hc).map(([h,v])=>[h,v.reduce((a,b)=>a+b,0)/v.length]).sort((a,b)=>b[1]-a[1])[0];
-  document.getElementById('stats-resumen').innerHTML=`
-    <div style="color:#00d4ff;font-size:0.75rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Estadísticas del período (spread ponderado)</div>
-    <div class="stat-row"><span class="stat-label">Total snapshots</span><span class="stat-value cyan">${hist.length}</span></div>
-    <div class="stat-row"><span class="stat-label">Spread ponderado promedio</span><span class="stat-value yellow">${avg}%</span></div>
-    <div class="stat-row"><span class="stat-label">Spread ponderado máximo</span><span class="stat-value green">${max}%</span></div>
-    <div class="stat-row"><span class="stat-label">Spread ponderado mínimo</span><span class="stat-value red">${min}%</span></div>
-    ${mh?`<div class="stat-row"><span class="stat-label">Mejor hora promedio</span><span class="stat-value green">${mh[0]}:00 hs (${parseFloat(mh[1]).toFixed(2)}%)</span></div>`:''}
-  `;
-}
+async function cargarDatos(){try{const [estado,hist,heat,cnt]=await Promise.all([fetch('/api/estado').then(r=>r.json()),fetch('/api/historial').then(r=>r.json()),fetch('/api/heatmap').then(r=>r.json()),fetch('/api/count').then(r=>r.json())]);if(estado.timestamp){renderTR(estado,cnt.count);document.getElementById('ultima-act').textContent='Última act: '+estado.timestamp;}if(hist.length>1)renderHistorico(hist);if(heat.length>0){renderHeatmap(heat);renderStats(hist);}sincronizarFiltros();}catch(e){console.error(e);}}
+async function sincronizarFiltros(){try{const cfg=await fetch('/api/config').then(r=>r.json());document.getElementById('f-usdt').value=cfg.FILTRO_MIN_USDT;document.getElementById('f-ord').value=cfg.FILTRO_MIN_ORD;document.getElementById('f-int').value=cfg.INTERVALO_MIN;}catch(e){}}
+function renderTR(e,count){const sp=parseFloat(e.spread_pct).toFixed(2);const spp=parseFloat(e.spread_pond_pct).toFixed(2);const gn=parseFloat(e.ganancia_neta_pct).toFixed(2);const gnColor=parseFloat(e.ganancia_neta_pct)>0?'green':'red';const estadoIcon={'MUY APTO':'🔥','APTO':'✅','ESTRECHO':'⚠️','NO APTO':'❌'}[e.estado]||'';document.getElementById('contenido-tr').innerHTML=`<div class="estado-banner banner-${e.color}">${estadoIcon} ${e.estado} — Spread ponderado ${spp}% · Spread puntual ${sp}%</div><div class="panel-grid"><div class="panel-tc tc"><div class="panel-header"><span class="tab-badge badge-tc">TAB COMPRA</span></div><div class="panel-desc">Vendedores de USDT · el usuario va aquí a comprar</div><div class="precio-pond-label">Precio ponderado</div><div class="precio-pond">$${fmt(e.precio_pond_tab_compra)}</div><div class="precio-puntual-label">Líder puntual (más barato)</div><div class="precio-puntual">$${fmt(e.mejor_vendedor_tab_compra)}</div><div class="panel-lider">👤 ${e.lider_tab_compra||'—'}</div><hr class="panel-sep"><div class="panel-stats">${fmt(e.liq_tab_compra,0)} USDT · ${e.n_tab_compra} anuncios · rango $${fmt(e.mejor_vendedor_tab_compra)} – $${fmt(e.peor_vendedor_tab_compra)}</div></div><div class="panel-tv tv"><div class="panel-header"><span class="tab-badge badge-tv">TAB VENTA</span></div><div class="panel-desc">Compradores de USDT · el usuario va aquí a vender</div><div class="precio-pond-label">Precio ponderado</div><div class="precio-pond">$${fmt(e.precio_pond_tab_venta)}</div><div class="precio-puntual-label">Líder puntual (más paga)</div><div class="precio-puntual">$${fmt(e.mejor_comprador_tab_venta)}</div><div class="panel-lider">👤 ${e.lider_tab_venta||'—'}</div><hr class="panel-sep"><div class="panel-stats">${fmt(e.liq_tab_venta,0)} USDT · ${e.n_tab_venta} anuncios · rango $${fmt(e.peor_comprador_tab_venta)} – $${fmt(e.mejor_comprador_tab_venta)}</div></div></div><div class="brecha-bar"><div class="bc-item"><div class="bc-label">Brecha ponderada</div><div class="bc-val yellow">$${fmt(e.spread_pond_abs)} · ${spp}%</div></div><div class="bc-item"><div class="bc-label">Ganancia neta est.</div><div class="bc-val ${gnColor}">${gn}%</div></div><div class="bc-item"><div class="bc-label">Snapshots guardados</div><div class="bc-val cyan">${count}</div></div></div><div class="maker-title">— Como Maker pondrías tu anuncio un centavo mejor que el líder —</div><div class="maker-grid"><div class="maker-card maker-tc"><div class="mtipo">Si quiero VENDER USDT (posteo en Tab Compra)</div><div class="mprecio">$${fmt(e.precio_maker_vender)}</div><div class="mnota">Un centavo menos que <b>${e.lider_tab_compra||'el líder'}</b> que pide $${fmt(e.mejor_vendedor_tab_compra)}<br>→ aparecer primero en Tab Compra</div></div><div class="maker-card maker-tv"><div class="mtipo">Si quiero COMPRAR USDT (posteo en Tab Venta)</div><div class="mprecio">$${fmt(e.precio_maker_comprar)}</div><div class="mnota">Un centavo más que <b>${e.lider_tab_venta||'el líder'}</b> que paga $${fmt(e.mejor_comprador_tab_venta)}<br>→ aparecer primero en Tab Venta</div></div></div>`;}
+function renderHistorico(hist){const labels=hist.map(h=>h.timestamp.toString().slice(11,16));const spp=hist.map(h=>parseFloat(h.spread_pond_pct||0));const sp=hist.map(h=>parseFloat(h.spread_pct||0));const liqC=hist.map(h=>parseFloat(h.liq_tab_compra||0));const liqV=hist.map(h=>parseFloat(h.liq_tab_venta||0));const sc={x:{ticks:{color:'#888',maxTicksLimit:10},grid:{color:'#1e1e3f'}},y:{ticks:{color:'#888'},grid:{color:'#1e1e3f'}}};if(chartSpread)chartSpread.destroy();if(chartLiq)chartLiq.destroy();chartSpread=new Chart(document.getElementById('chartSpread').getContext('2d'),{type:'line',data:{labels,datasets:[{label:'Spread ponderado %',data:spp,borderColor:'#ffd740',backgroundColor:'rgba(255,215,64,0.08)',borderWidth:2,pointRadius:2,tension:0.3,fill:true},{label:'Spread puntual %',data:sp,borderColor:'#00d4ff',backgroundColor:'rgba(0,212,255,0.04)',borderWidth:1,pointRadius:1,tension:0.3,fill:false,borderDash:[4,3]}]},options:{responsive:true,plugins:{legend:{labels:{color:'#aaa'}}},scales:sc}});chartLiq=new Chart(document.getElementById('chartLiq').getContext('2d'),{type:'line',data:{labels,datasets:[{label:'Liquidez Tab Compra',data:liqC,borderColor:'#00e676',backgroundColor:'rgba(0,230,118,0.06)',borderWidth:2,pointRadius:1,tension:0.3,fill:true},{label:'Liquidez Tab Venta',data:liqV,borderColor:'#ff5252',backgroundColor:'rgba(255,82,82,0.06)',borderWidth:2,pointRadius:1,tension:0.3,fill:true}]},options:{responsive:true,plugins:{legend:{labels:{color:'#aaa'}}},scales:sc}});}
+function renderHeatmap(heat){const dias=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];const diasEs=['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'];const horas=Array.from({length:24},(_,i)=>i);const datasets=dias.map((dia,di)=>({label:diasEs[di],data:horas.map(h=>{const m=heat.find(r=>r.dia===dia&&parseInt(r.hora)===h);return m?parseFloat(m.avg_spread):null;}),backgroundColor:`hsla(${di*50},70%,55%,0.75)`,borderColor:`hsla(${di*50},70%,55%,1)`,borderWidth:1}));if(chartHeat)chartHeat.destroy();chartHeat=new Chart(document.getElementById('chartHeat').getContext('2d'),{type:'bar',data:{labels:horas.map(h=>h+':00'),datasets},options:{responsive:true,plugins:{legend:{labels:{color:'#aaa',boxWidth:12}}},scales:{x:{ticks:{color:'#888'},grid:{color:'#1e1e3f'}},y:{ticks:{color:'#888',callback:v=>v+'%'},grid:{color:'#1e1e3f'}}}}});}
+function renderStats(hist){if(!hist.length)return;const spp=hist.map(h=>parseFloat(h.spread_pond_pct||0));const avg=(spp.reduce((a,b)=>a+b,0)/spp.length).toFixed(2);const max=Math.max(...spp).toFixed(2);const min=Math.min(...spp).toFixed(2);const hc={};hist.forEach(h=>{(hc[h.hora]=hc[h.hora]||[]).push(parseFloat(h.spread_pond_pct||0));});const mh=Object.entries(hc).map(([h,v])=>[h,v.reduce((a,b)=>a+b,0)/v.length]).sort((a,b)=>b[1]-a[1])[0];document.getElementById('stats-resumen').innerHTML=`<div style="color:#00d4ff;font-size:0.75rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Estadísticas del período (spread ponderado)</div><div class="stat-row"><span class="stat-label">Total snapshots</span><span class="stat-value cyan">${hist.length}</span></div><div class="stat-row"><span class="stat-label">Spread ponderado promedio</span><span class="stat-value yellow">${avg}%</span></div><div class="stat-row"><span class="stat-label">Spread ponderado máximo</span><span class="stat-value green">${max}%</span></div><div class="stat-row"><span class="stat-label">Spread ponderado mínimo</span><span class="stat-value red">${min}%</span></div>${mh?`<div class="stat-row"><span class="stat-label">Mejor hora promedio</span><span class="stat-value green">${mh[0]}:00 hs (${parseFloat(mh[1]).toFixed(2)}%)</span></div>`:''}`;}
 cargarDatos();
 </script>
 </body>
 </html>
 """
 
-# ──────────────────────────────────────────────
-#  RUTAS
-# ──────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template_string(DASHBOARD)
@@ -699,9 +569,6 @@ def api_reset():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ──────────────────────────────────────────────
-#  INICIO
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=ciclo_colector, daemon=True).start()
