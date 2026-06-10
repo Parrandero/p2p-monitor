@@ -7,7 +7,7 @@ import time
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, Response, request
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -2763,7 +2763,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 # ──────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template_string(DASHBOARD)
+    return Response(DASHBOARD, mimetype='text/html')
 
 def clean(data):
     out = {}
