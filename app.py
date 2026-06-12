@@ -17,7 +17,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 config = {
     "MONEDA":           "USDT",
     "FIAT":             "CLP",
-    "INTERVALO_MIN":    5,
+    "INTERVALO_MIN":    2,
     "FILTRO_MIN_USDT":  200,
     "FILTRO_MIN_ORD":   100,
     "FILTRO_MIN_TASA":  90.0,
@@ -181,12 +181,28 @@ def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
             """, rows)
         conn.commit()
 
-def obtener_historial(limit=200):
+def obtener_historial(limit=720):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT %s", (limit,))
             rows = cur.fetchall()
     return [dict(r) for r in reversed(rows)]
+
+def obtener_precios_historico():
+    """Toda la historia de precios ponderados, liviano (solo 3 campos).
+    Para el gráfico interactivo de Lightweight Charts."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT timestamp,
+                       precio_pond_tab_compra,
+                       precio_pond_tab_venta
+                FROM snapshots
+                WHERE precio_pond_tab_compra IS NOT NULL
+                ORDER BY timestamp ASC
+            """)
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
 
 def obtener_ultimo():
     with get_conn() as conn:
@@ -617,6 +633,16 @@ body {
 .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
 .card-head h3 { font-size: 13.5px; font-weight: 600; color: var(--text); letter-spacing: -0.01em; }
 .card-sub { font-size: 11px; color: var(--text-3); }
+.precio-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+.precio-leg { display: flex; gap: 16px; flex-wrap: wrap; }
+.pl-item { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+.pl-dot { width: 10px; height: 10px; border-radius: 3px; }
+.precio-rangos { display: flex; gap: 6px; }
+.pr-btn { font-size: 12px; padding: 5px 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg-2); color: var(--text-2); cursor: pointer; }
+.pr-btn.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.precio-chart { border-radius: 8px; overflow: hidden; }
+.precio-msg { padding: 40px 16px; text-align: center; color: var(--text-3); font-size: 13px; }
+.precio-foot { margin-top: 10px; font-size: 11px; color: var(--text-3); text-align: center; }
 
 /* chart */
 .chart { position: relative; width: 100%; }
@@ -625,6 +651,7 @@ body {
 .ax.th { font-size: 9px; opacity: 0.85; }
 .chart-tip { position: absolute; top: 6px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; pointer-events: none; min-width: 132px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
 .ct-row { display: flex; align-items: center; gap: 7px; font-size: 11px; }
+.ct-time { font-size: 10.5px; color: var(--ink-2); margin-bottom: 5px; padding-bottom: 4px; border-bottom: 1px solid var(--line-soft); letter-spacing: .02em; }
 .ct-row + .ct-row { margin-top: 3px; }
 .ct-dot { width: 7px; height: 7px; border-radius: 2px; }
 .ct-lab { color: var(--text-2); flex: 1; }
@@ -712,6 +739,7 @@ body {
 .vel-big { font-family: var(--mono); font-size: clamp(24px, 3vw, 32px); font-weight: 500; color: var(--tone); display: flex; align-items: baseline; gap: 8px; line-height: 1.15; white-space: nowrap; }
 .vel-unit { font-size: 12px; color: var(--text-3); letter-spacing: 0; white-space: nowrap; }
 .vel-eg { font-size: 13px; color: var(--text-2); }
+.vel-ratio { color: var(--text-3); }
 .vel-eg b { color: var(--text); }
 .vel-meter { display: flex; align-items: center; gap: 16px; min-width: 230px; }
 .vel-spark { width: 110px; }
@@ -864,6 +892,7 @@ body {
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
 /* ============================================================
    Unión Austral · P2P Monitor — CONFIGURACIÓN
@@ -887,7 +916,7 @@ window.P2P_CONFIG = {
   mode: "live",
   baseUrl: "",
   pollMs: 30000,
-  intervaloMin: 5,   // debe coincidir con INTERVALO_MIN del backend (para la velocidad)
+  intervaloMin: 2,   // debe coincidir con INTERVALO_MIN del backend (para la velocidad)
 };
 
 </script>
@@ -1132,12 +1161,15 @@ window.P2P_CONFIG = {
   function computeVel(vel, hist) {
     const usdt_min = Math.round(vel);
     const vol_15m = Math.round(vel * 15);
+    // base demo fija para simular el ratio contra ritmo normal
+    const base = 165;
+    const ratio = Math.round((vel / base) * 100) / 100;
     let nivel, tone;
-    if (vel < 110) { nivel = "LENTO"; tone = "warn-low"; }
-    else if (vel < 200) { nivel = "NORMAL"; tone = "warn"; }
-    else if (vel < 300) { nivel = "ACTIVO"; tone = "buy"; }
-    else { nivel = "FRENÉTICO"; tone = "sell"; }
-    return { usdt_min, vol_15m, nivel, tone, history: hist.slice(), pct: Math.min(1, vel / 420) };
+    if (ratio < 0.5) { nivel = "TRANQUILO"; tone = "warn-low"; }
+    else if (ratio < 1.3) { nivel = "NORMAL"; tone = "warn"; }
+    else if (ratio < 2.2) { nivel = "ACTIVO"; tone = "buy"; }
+    else { nivel = "MUY ACTIVO"; tone = "sell"; }
+    return { usdt_min, vol_15m, nivel, tone, history: hist.slice(), pct: Math.min(1, ratio / 3), ratio };
   }
 
   function liteSnap(s, ts) {
@@ -1166,26 +1198,55 @@ window.P2P_CONFIG = {
 
   const num = (v, d = 0) => (v == null || isNaN(+v) ? d : +v);
 
-  // Velocidad de mercado aproximada a partir del historial:
-  // cuánta liquidez rota por minuto entre snapshots consecutivos.
+  // Velocidad de mercado: cuánta liquidez se absorbe por minuto.
+  // Se promedia sobre una ventana para evitar el ruido de un solo ciclo
+  // (un anunciante publicando/retirando un anuncio grande no debe disparar
+  // el indicador). Los umbrales se calibran sobre la mediana reciente para
+  // que "rápido/lento" sea relativo al propio mercado, no a un número fijo.
   function calcVelocidad(history, intervaloMin) {
-    if (!history || history.length < 2) return null;
+    if (!history || history.length < 3) return null;
     const serie = [];
     for (let i = 1; i < history.length; i++) {
       const a = history[i - 1], b = history[i];
-      const dLiq = Math.abs((b.liq_tab_compra + b.liq_tab_venta) - (a.liq_tab_compra + a.liq_tab_venta));
-      // proxy de absorción: mitad del cambio de liquidez / minutos del ciclo
-      serie.push(Math.max(0, dLiq * 0.5) / Math.max(1, intervaloMin));
+      // Solo contamos las CAÍDAS de liquidez (absorción real), no las subidas
+      // (que son anunciantes agregando oferta). Cap para descartar outliers
+      // extremos de alguien publicando/retirando un anuncio gigante.
+      const dCompra = Math.max(0, a.liq_tab_compra - b.liq_tab_compra);
+      const dVenta = Math.max(0, a.liq_tab_venta - b.liq_tab_venta);
+      const absorbido = (dCompra + dVenta) / Math.max(1, intervaloMin);
+      serie.push(absorbido);
     }
-    const hist = serie.slice(-48);
-    const vel = hist.length ? hist[hist.length - 1] : 0;
-    const usdt_min = Math.round(vel);
+    if (!serie.length) return null;
+
+    // Velocidad actual: promedio de los últimos 3 ciclos (suaviza el ruido)
+    const recientes = serie.slice(-3);
+    const velActual = recientes.reduce((a, b) => a + b, 0) / recientes.length;
+
+    // Línea base: mediana de la última hora-y-media (~45 ciclos a 2 min),
+    // descartando outliers, para comparar contra el ritmo habitual.
+    const ventana = serie.slice(-45).filter((v) => v < 8000).sort((a, b) => a - b);
+    const mediana = ventana.length ? ventana[Math.floor(ventana.length / 2)] : velActual;
+    const base = Math.max(40, mediana); // piso para evitar divisiones raras
+
+    // Ratio respecto a la base: 1.0 = ritmo normal del mercado
+    const ratio = velActual / base;
     let nivel, tone;
-    if (vel < 110) { nivel = "LENTO"; tone = "warn-low"; }
-    else if (vel < 200) { nivel = "NORMAL"; tone = "warn"; }
-    else if (vel < 300) { nivel = "ACTIVO"; tone = "buy"; }
-    else { nivel = "FRENÉTICO"; tone = "sell"; }
-    return { usdt_min, vol_15m: Math.round(vel * 15), nivel, tone, history: hist, pct: Math.min(1, vel / 420) };
+    if (ratio < 0.5) { nivel = "TRANQUILO"; tone = "warn-low"; }
+    else if (ratio < 1.3) { nivel = "NORMAL"; tone = "warn"; }
+    else if (ratio < 2.2) { nivel = "ACTIVO"; tone = "buy"; }
+    else { nivel = "MUY ACTIVO"; tone = "sell"; }
+
+    const usdt_min = Math.round(velActual);
+    // La barra muestra el ratio (0 a ~3x), no un absoluto
+    const pct = Math.min(1, ratio / 3);
+    return {
+      usdt_min,
+      vol_15m: Math.round(velActual * 15),
+      nivel, tone,
+      history: serie.slice(-48),
+      pct,
+      ratio: Math.round(ratio * 100) / 100,
+    };
   }
 
   // Normaliza un row del historial al shape liviano que usan los gráficos
@@ -2026,7 +2087,7 @@ function TopBar({ snap, secondsLeft, cycleMs }) {
 
 /* ---------- Tab bar ---------- */
 function Tabs({ tab, setTab }) {
-  const items = [["tr", "Tiempo Real"], ["hist", "Histórico"], ["heat", "Mapa de Calor"]];
+  const items = [["tr", "Tiempo Real"], ["hist", "Histórico"], ["precio", "Precio"], ["heat", "Mapa de Calor"]];
   return (
     <nav className="tabbar" role="tablist">
       {items.map(([k, label]) => (
@@ -2330,6 +2391,9 @@ function VelocityStrip({ vel }) {
       </div>
       <div className="vel-eg">
         ≈ <b className="tnum">{fN(vel.vol_15m)} USDT</b> absorbidos cada <b>15 min</b>
+        {vel.ratio != null && (
+          <span className="vel-ratio"> · <b className="tnum">{vel.ratio}×</b> vs. ritmo normal</span>
+        )}
       </div>
       <div className="vel-meter">
         <div className="vel-spark"><Sparkline data={vel.history} tone={vel.tone} height={34} strokeW={1.8} /></div>
@@ -2354,7 +2418,7 @@ const C = window.P2PCore;
 const fP2 = window.P2P.fmtPrice, fN2 = window.P2P.fmtNum;
 
 /* ---------- Gráfico de líneas con ejes, umbrales y hover ---------- */
-function TimeChart({ series, thresholds = [], yUnit = "", height = 240, xLabels }) {
+function TimeChart({ series, thresholds = [], yUnit = "", height = 240, xLabels, times, decimals = 2 }) {
   const wrapRef = vR(null);
   const [w, setW] = vS(720);
   const [hover, setHover] = vS(null);
@@ -2365,7 +2429,7 @@ function TimeChart({ series, thresholds = [], yUnit = "", height = 240, xLabels 
     return () => ro.disconnect();
   }, []);
 
-  const pad = { l: 46, r: 14, t: 14, b: 26 };
+  const pad = { l: decimals === 1 ? 52 : 46, r: 14, t: 14, b: 26 };
   const iw = Math.max(10, w - pad.l - pad.r);
   const ih = height - pad.t - pad.b;
   const all = series.flatMap((s) => s.data);
@@ -2408,7 +2472,7 @@ function TimeChart({ series, thresholds = [], yUnit = "", height = 240, xLabels 
         {gridY.map((v, i) => (
           <g key={i}>
             <line x1={pad.l} x2={w - pad.r} y1={yAt(v)} y2={yAt(v)} stroke="var(--line-soft)" />
-            <text x={pad.l - 8} y={yAt(v) + 3} textAnchor="end" className="ax">{v.toFixed(2)}{yUnit}</text>
+            <text x={pad.l - 8} y={yAt(v) + 3} textAnchor="end" className="ax">{v.toFixed(decimals)}{yUnit}</text>
           </g>
         ))}
         {thresholds.map((t, i) => (
@@ -2439,11 +2503,14 @@ function TimeChart({ series, thresholds = [], yUnit = "", height = 240, xLabels 
       </svg>
       {hover != null && (
         <div className="chart-tip" style={{ left: Math.min(w - 150, Math.max(0, xAt(hover) + 8)) }}>
+          {times && times[hover] && (
+            <div className="ct-time tnum">{times[hover]}</div>
+          )}
           {series.map((s, i) => (
             <div key={i} className="ct-row">
               <span className="ct-dot" style={{ background: `var(--${s.tone})` }} />
               <span className="ct-lab">{s.label}</span>
-              <span className="ct-val tnum">{s.data[hover].toFixed(2)}{yUnit}</span>
+              <span className="ct-val tnum">{s.data[hover].toFixed(decimals)}{yUnit}</span>
             </div>
           ))}
         </div>
@@ -2488,11 +2555,12 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel }) {
         <section className="chart-card">
           <div className="card-head">
             <h3>Spread ponderado · últimas {history.length} muestras</h3>
-            <span className="card-sub">cada punto = 1 ciclo (5 min)</span>
+            <span className="card-sub">pasá el dedo para ver la hora</span>
           </div>
           <TimeChart
             height={220}
             yUnit="%"
+            times={history.map((h) => h.timestamp.slice(5, 16).replace("T", " "))}
             series={[
               { data: history.map((h) => h.spread_pond_pct), tone: "warn", label: "Spread ponderado", fill: true },
               { data: history.map((h) => h.spread_pct), tone: "accent", label: "Spread puntual", dashed: true },
@@ -2549,6 +2617,7 @@ function Historico({ history }) {
     for (let i = 0; i < history.length; i += step) out.push({ i, t: history[i].timestamp.slice(11, 16) });
     return out;
   }, [history]);
+  const times = vM(() => history.map((h) => h.timestamp.slice(5, 16).replace("T", " ")), [history]);
   const spp = history.map((h) => h.spread_pond_pct);
   const avg = (spp.reduce((a, b) => a + b, 0) / spp.length);
   const mx = Math.max(...spp), mn = Math.min(...spp);
@@ -2561,8 +2630,16 @@ function Historico({ history }) {
         <StatCard label="Muestras" value={history.length} tone="accent" />
       </div>
       <section className="chart-card">
+        <div className="card-head"><h3>Precio ponderado · compra vs venta</h3><span className="card-sub">cómo se mueve el precio</span></div>
+        <TimeChart height={240} yUnit="" xLabels={labels} times={times} decimals={1}
+          series={[
+            { data: history.map((h) => h.precio_pond_tab_compra), tone: "buy", label: "Compra (vendedores)", fill: false },
+            { data: history.map((h) => h.precio_pond_tab_venta), tone: "sell", label: "Venta (compradores)", fill: false },
+          ]} />
+      </section>
+      <section className="chart-card">
         <div className="card-head"><h3>Spread ponderado vs. puntual</h3><span className="card-sub">% sobre el tiempo</span></div>
-        <TimeChart height={240} yUnit="%" xLabels={labels}
+        <TimeChart height={240} yUnit="%" xLabels={labels} times={times}
           series={[
             { data: spp, tone: "warn", label: "Ponderado", fill: true },
             { data: history.map((h) => h.spread_pct), tone: "accent", label: "Puntual", dashed: true },
@@ -2571,7 +2648,7 @@ function Historico({ history }) {
       </section>
       <section className="chart-card">
         <div className="card-head"><h3>Liquidez por lado</h3><span className="card-sub">USDT disponible</span></div>
-        <TimeChart height={220} xLabels={labels}
+        <TimeChart height={220} xLabels={labels} times={times}
           series={[
             { data: history.map((h) => h.liq_tab_compra), tone: "buy", label: "Compra", fill: true },
             { data: history.map((h) => h.liq_tab_venta), tone: "sell", label: "Venta", fill: true },
@@ -2639,7 +2716,146 @@ function Heatmap({ heatmap }) {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap };
+/* ---------- Precio (gráfico interactivo Lightweight Charts) ---------- */
+function PrecioChart() {
+  const wrapRef = vR(null);
+  const chartRef = vR(null);
+  const [estado, setEstado] = vS("cargando"); // cargando | ok | vacio | sinlib | error
+  const [meta, setMeta] = vS({ puntos: 0, ultCompra: null, ultVenta: null });
+  const [rango, setRango] = vS("todo"); // 24h | 7d | todo
+
+  vE(() => {
+    let chart = null, serieCompra = null, serieVenta = null, ro = null, cancelado = false;
+
+    if (typeof LightweightCharts === "undefined") {
+      setEstado("sinlib");
+      return;
+    }
+
+    async function init() {
+      try {
+        const base = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+        const r = await fetch(base + "/api/precios");
+        const data = await r.json();
+        if (cancelado) return;
+        const compra = data.compra || [], venta = data.venta || [];
+        if (!compra.length && !venta.length) { setEstado("vacio"); return; }
+
+        const el = wrapRef.current;
+        if (!el) return;
+        chart = LightweightCharts.createChart(el, {
+          layout: {
+            background: { color: "transparent" },
+            textColor: "rgba(220,226,238,0.7)",
+            fontFamily: "Inter, system-ui, sans-serif",
+          },
+          grid: {
+            vertLines: { color: "rgba(255,255,255,0.05)" },
+            horzLines: { color: "rgba(255,255,255,0.05)" },
+          },
+          rightPriceScale: { borderColor: "rgba(255,255,255,0.1)" },
+          timeScale: {
+            borderColor: "rgba(255,255,255,0.1)",
+            timeVisible: true,
+            secondsVisible: false,
+          },
+          crosshair: {
+            mode: LightweightCharts.CrosshairMode.Normal,
+            vertLine: { labelBackgroundColor: "#2a2a40" },
+            horzLine: { labelBackgroundColor: "#2a2a40" },
+          },
+          handleScroll: true,
+          handleScale: true,
+          height: 420,
+        });
+
+        serieCompra = chart.addLineSeries({
+          color: "#35e07a", lineWidth: 2, title: "Compra",
+          priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+        });
+        serieVenta = chart.addLineSeries({
+          color: "#ff5d6c", lineWidth: 2, title: "Venta",
+          priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+        });
+        serieCompra.setData(compra);
+        serieVenta.setData(venta);
+        chart.timeScale().fitContent();
+
+        chartRef.current = { chart, serieCompra, serieVenta, compra, venta };
+        setMeta({
+          puntos: compra.length,
+          ultCompra: compra.length ? compra[compra.length - 1].value : null,
+          ultVenta: venta.length ? venta[venta.length - 1].value : null,
+        });
+        setEstado("ok");
+
+        ro = new ResizeObserver((ents) => {
+          if (chart && ents[0]) chart.applyOptions({ width: ents[0].contentRect.width });
+        });
+        ro.observe(el);
+        chart.applyOptions({ width: el.clientWidth });
+      } catch (e) {
+        if (!cancelado) setEstado("error");
+      }
+    }
+    init();
+
+    return () => {
+      cancelado = true;
+      if (ro) ro.disconnect();
+      if (chart) chart.remove();
+      chartRef.current = null;
+    };
+  }, []);
+
+  // Botones de rango rápido
+  function aplicarRango(cual) {
+    setRango(cual);
+    const ref = chartRef.current;
+    if (!ref) return;
+    const { chart, compra } = ref;
+    if (!compra.length) return;
+    if (cual === "todo") { chart.timeScale().fitContent(); return; }
+    const ahora = compra[compra.length - 1].time;
+    const desde = cual === "24h" ? ahora - 86400 : ahora - 7 * 86400;
+    chart.timeScale().setVisibleRange({ from: desde, to: ahora });
+  }
+
+  return (
+    <div className="view">
+      <section className="chart-card">
+        <div className="card-head">
+          <h3>Precio ponderado · histórico interactivo</h3>
+          <span className="card-sub">pellizcá para zoom · arrastrá para mover</span>
+        </div>
+
+        {estado === "ok" && (
+          <div className="precio-top">
+            <div className="precio-leg">
+              <span className="pl-item"><span className="pl-dot" style={{ background: "#35e07a" }} />Compra {meta.ultCompra ? "$" + meta.ultCompra.toFixed(2) : ""}</span>
+              <span className="pl-item"><span className="pl-dot" style={{ background: "#ff5d6c" }} />Venta {meta.ultVenta ? "$" + meta.ultVenta.toFixed(2) : ""}</span>
+            </div>
+            <div className="precio-rangos">
+              {[["24h", "24h"], ["7d", "7 días"], ["todo", "Todo"]].map(([k, lbl]) => (
+                <button key={k} className={"pr-btn" + (rango === k ? " on" : "")} onClick={() => aplicarRango(k)}>{lbl}</button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div ref={wrapRef} className="precio-chart" style={{ width: "100%", height: 420 }} />
+
+        {estado === "cargando" && <div className="precio-msg">Cargando histórico de precios…</div>}
+        {estado === "vacio" && <div className="precio-msg">Todavía no hay datos de precio acumulados. Esperá unos ciclos.</div>}
+        {estado === "sinlib" && <div className="precio-msg">No se pudo cargar la librería del gráfico. Revisá tu conexión y recargá.</div>}
+        {estado === "error" && <div className="precio-msg">Error al cargar los precios. Recargá la página.</div>}
+        {estado === "ok" && <div className="precio-foot tnum">{window.P2P.fmtNum(meta.puntos)} puntos · doble toque para volver a la vista completa</div>}
+      </section>
+    </div>
+  );
+}
+
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart };
 
 </script>
 <script type="text/babel">
@@ -2719,6 +2935,7 @@ function App() {
         {tab === "tr" && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
           filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} />}
         {tab === "hist" && <V.Historico history={history} />}
+        {tab === "precio" && <V.PrecioChart />}
         {tab === "heat" && <V.Heatmap heatmap={heatmap} />}
       </main>
       <footer className="foot">
@@ -2792,6 +3009,42 @@ def api_estado():
 @app.route("/api/historial")
 def api_historial():
     return jsonify([clean(r) for r in obtener_historial()])
+
+@app.route("/api/precios")
+def api_precios():
+    """Serie completa de precios para el gráfico interactivo.
+    Devuelve tiempo en Unix (segundos, hora local Santiago) + ambos precios."""
+    from datetime import datetime as _dt
+    rows = obtener_precios_historico()
+    out_compra, out_venta = [], []
+    seen = set()
+    for r in rows:
+        ts = r["timestamp"]
+        if isinstance(ts, str):
+            try:
+                ts = _dt.fromisoformat(ts.replace(" ", "T"))
+            except Exception:
+                continue
+        # Lightweight Charts: tiempo en segundos. Ajustamos a hora local
+        # sumando el offset de Santiago para que el eje muestre hora local.
+        try:
+            unix = int(ts.timestamp())
+            offset = SANTIAGO_TZ.utcoffset(ts)
+            if offset is not None:
+                unix += int(offset.total_seconds())
+        except Exception:
+            continue
+        # Lightweight Charts exige tiempos estrictamente crecientes y únicos
+        if unix in seen:
+            continue
+        seen.add(unix)
+        pc = r.get("precio_pond_tab_compra")
+        pv = r.get("precio_pond_tab_venta")
+        if pc is not None:
+            out_compra.append({"time": unix, "value": float(pc)})
+        if pv is not None:
+            out_venta.append({"time": unix, "value": float(pv)})
+    return jsonify({"compra": out_compra, "venta": out_venta})
 
 @app.route("/api/heatmap")
 def api_heatmap():
