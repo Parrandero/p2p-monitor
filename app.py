@@ -2758,6 +2758,23 @@ function PrecioChart() {
             borderColor: "rgba(255,255,255,0.1)",
             timeVisible: true,
             secondsVisible: false,
+            tickMarkFormatter: (time) => {
+              const d = new Date(time * 1000);
+              // Mostrar hora Santiago (UTC-4)
+              const h = String(d.getUTCHours()).padStart(2,"0");
+              const m = String(d.getUTCMinutes()).padStart(2,"0");
+              return h + ":" + m;
+            },
+          },
+          localization: {
+            timeFormatter: (time) => {
+              const d = new Date(time * 1000);
+              const dd = String(d.getUTCDate()).padStart(2,"0");
+              const mm = String(d.getUTCMonth()+1).padStart(2,"0");
+              const h = String(d.getUTCHours()).padStart(2,"0");
+              const min = String(d.getUTCMinutes()).padStart(2,"0");
+              return dd + "/" + mm + " " + h + ":" + min;
+            },
           },
           crosshair: {
             mode: LightweightCharts.CrosshairMode.Normal,
@@ -2780,6 +2797,9 @@ function PrecioChart() {
         serieCompra.setData(compra);
         serieVenta.setData(venta);
         chart.timeScale().fitContent();
+
+        // Doble toque en móvil → volver a vista completa
+        el.addEventListener("dblclick", () => chart.timeScale().fitContent());
 
         chartRef.current = { chart, serieCompra, serieVenta, compra, venta };
         setMeta({
@@ -2815,10 +2835,13 @@ function PrecioChart() {
     if (!ref) return;
     const { chart, compra } = ref;
     if (!compra.length) return;
-    if (cual === "todo") { chart.timeScale().fitContent(); return; }
+    if (cual === "todo") {
+      chart.timeScale().fitContent();
+      return;
+    }
     const ahora = compra[compra.length - 1].time;
     const desde = cual === "24h" ? ahora - 86400 : ahora - 7 * 86400;
-    chart.timeScale().setVisibleRange({ from: desde, to: ahora });
+    chart.timeScale().setVisibleRange({ from: desde, to: ahora + 3600 });
   }
 
   return (
@@ -3013,37 +3036,36 @@ def api_historial():
 @app.route("/api/precios")
 def api_precios():
     """Serie completa de precios para el gráfico interactivo.
-    Devuelve tiempo en Unix (segundos, hora local Santiago) + ambos precios."""
-    from datetime import datetime as _dt
+    Devuelve tiempo en Unix UTC (segundos) + ambos precios ponderados.
+    Lightweight Charts v4 requiere timestamps estrictamente crecientes — se garantiza."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    # Santiago en invierno (junio) = UTC-4. Offset fijo, sin DST en junio.
+    SANTIAGO_OFFSET = _td(hours=-4)
     rows = obtener_precios_historico()
     out_compra, out_venta = [], []
-    seen = set()
+    prev_unix = 0
     for r in rows:
         ts = r["timestamp"]
-        if isinstance(ts, str):
-            try:
-                ts = _dt.fromisoformat(ts.replace(" ", "T"))
-            except Exception:
-                continue
-        # Lightweight Charts: tiempo en segundos. Ajustamos a hora local
-        # sumando el offset de Santiago para que el eje muestre hora local.
+        # Normalizar a string "YYYY-MM-DDTHH:MM:SS"
+        ts_str = str(ts)[:19].replace(" ", "T")
         try:
-            unix = int(ts.timestamp())
-            offset = SANTIAGO_TZ.utcoffset(ts)
-            if offset is not None:
-                unix += int(offset.total_seconds())
+            # Parsear como naive datetime (hora Santiago local almacenada en DB)
+            dt_naive = _dt.fromisoformat(ts_str)
+            # Tratar como Santiago local → convertir a UTC → Unix
+            dt_utc = (dt_naive - SANTIAGO_OFFSET).replace(tzinfo=_tz.utc)
+            unix = int(dt_utc.timestamp())
         except Exception:
             continue
-        # Lightweight Charts exige tiempos estrictamente crecientes y únicos
-        if unix in seen:
-            continue
-        seen.add(unix)
+        # Garantizar estrictamente creciente (Lightweight Charts lo exige)
+        if unix <= prev_unix:
+            unix = prev_unix + 1
+        prev_unix = unix
         pc = r.get("precio_pond_tab_compra")
         pv = r.get("precio_pond_tab_venta")
         if pc is not None:
-            out_compra.append({"time": unix, "value": float(pc)})
+            out_compra.append({"time": unix, "value": round(float(pc), 2)})
         if pv is not None:
-            out_venta.append({"time": unix, "value": float(pv)})
+            out_venta.append({"time": unix, "value": round(float(pv), 2)})
     return jsonify({"compra": out_compra, "venta": out_venta})
 
 @app.route("/api/heatmap")
