@@ -2188,7 +2188,7 @@ function DecisionHero({ snap }) {
             <div className={"hm-val " + (snap.ganancia_neta_pct > 0 ? "pos" : "neg")}>
               <AnimatedNumber value={snap.ganancia_neta_pct} suffix="%" />
             </div>
-            <div className="hm-foot">descontada comisión 0,4%</div>
+            <div className="hm-foot">descontada comisión 0,36%</div>
           </div>
         </div>
       </div>
@@ -2965,6 +2965,8 @@ function Inteligencia() {
   const [traders, setTraders] = vS(null);
   const [fill, setFill] = vS(null);
   const [patron, setPatron] = vS(null);
+  const [profundidad, setProfundidad] = vS(null);
+  const [precioFill, setPrecioFill] = vS(null);
   const [loading, setLoading] = vS(true);
   const [seccion, setSeccion] = vS("horario");
 
@@ -2976,8 +2978,11 @@ function Inteligencia() {
       fetch(B+"/api/inteligencia/top_traders").then(r=>r.json()),
       fetch(B+"/api/inteligencia/fill").then(r=>r.json()),
       fetch(B+"/api/inteligencia/precio_patron").then(r=>r.json()),
-    ]).then(([h,a,t,f,p]) => {
+      fetch(B+"/api/inteligencia/profundidad").then(r=>r.json()),
+      fetch(B+"/api/inteligencia/precio_vs_fill").then(r=>r.json()),
+    ]).then(([h,a,t,f,p,prof,pvf]) => {
       setHorario(h); setAnunciantes(a); setTraders(t); setFill(f); setPatron(p);
+      setProfundidad(prof); setPrecioFill(pvf);
       setLoading(false);
     }).catch(()=>setLoading(false));
   }, []);
@@ -2987,7 +2992,8 @@ function Inteligencia() {
 
   const SECS = [
     ["horario","⏰ Horario"],["anunciantes","👥 Pares"],
-    ["traders","🏆 Top traders"],["fill","⚡ Fill"],["patron","📅 Patrones"]
+    ["traders","🏆 Top traders"],["fill","⚡ Fill"],["patron","📅 Patrones"],
+    ["profundidad","📊 Profundidad"],["preciofill","💡 Precio vs Fill"]
   ];
 
   if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
@@ -3002,12 +3008,12 @@ function Inteligencia() {
 
       {seccion==="horario" && horario && (
         <section className="chart-card">
-          <div className="card-head"><h3>Ventanas operativas por hora</h3><span className="card-sub">últimos 7 días · spread neto Bronze (−0.32%)</span></div>
+          <div className="card-head"><h3>Ventanas operativas por hora</h3><span className="card-sub">últimos 7 días · spread neto merchant verificado (−0.36%)</span></div>
           <div className="intel-scroll">
             <table className="intel-table">
               <thead><tr>
                 <th title="Hora del día en horario Santiago (Chile)">Hora</th>
-                <th title="Ganancia neta estimada por vuelta: diferencia entre precio compra y venta, descontando la comisión Bronze de 0.32%. Ej: +1.2% significa que por cada 1.000 USDT ganás $12.">Spread neto</th>
+                <th title="Ganancia neta estimada por vuelta: diferencia entre precio compra y venta, descontando la comisión merchant verificado de 0.36% (0.18% × 2 lados). Ej: +1.2% significa que por cada 1.000 USDT ganás $12.">Spread neto</th>
                 <th title="USDT disponibles en el lado de compra (Tab Compra). Cuánto hay para vender. Mayor número = más fácil llenar tu orden de venta.">Liq. Compra</th>
                 <th title="USDT disponibles en el lado de venta (Tab Venta). Cuánto hay para comprar. Mayor número = más fácil reponerte de USDT.">Liq. Venta</th>
                 <th title="Cantidad de snapshots tomados en esa hora. Más muestras = dato más confiable.">Muestras</th>
@@ -3168,8 +3174,78 @@ function Inteligencia() {
           </div>
           <div className="intel-explain">
             <b>Cómo leer esta tabla:</b> muestra el precio promedio y el spread disponible para cada combinación de día y hora. Te permite ver si hay días sistemáticamente mejores que otros.<br/>
-            <b>P. Compra vs P. Venta:</b> la diferencia entre ambos es la brecha que el mercado ofrece. Si P. Compra = $922 y P. Venta = $916, el spread bruto es ~0.65% — de ahí se descuenta tu comisión (0.32% Bronze) y te queda tu ganancia neta.<br/>
+            <b>P. Compra vs P. Venta:</b> la diferencia entre ambos es la brecha que el mercado ofrece. Si P. Compra = $922 y P. Venta = $916, el spread bruto es ~0.65% — de ahí se descuenta tu comisión (0.36% merchant verificado) y te queda tu ganancia neta.<br/>
             <b>Qué hacer:</b> buscá las combinaciones día+hora con spread verde (>+0.5%) — esas son tus ventanas óptimas según el día de la semana. Si el lunes a las 05h siempre tiene +2%, priorizá operar a esa hora cuando tenés el lunes libre.
+          </div>
+        </section>
+      )}
+
+      {seccion==="profundidad" && profundidad && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Profundidad del libro de órdenes</h3><span className="card-sub">USDT disponible y consumo por posición · últimos 7 días</span></div>
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr>
+                <th title="Posición en el libro de órdenes: top1-3 = los primeros que ve el usuario, mid4-6 = zona media, back7+ = posiciones alejadas del top.">Posición</th>
+                <th title="USDT acumulados disponibles hasta esa posición. Cuánta liquidez existe con prioridad sobre ti si estás en esa posición.">Liq. acumulada (USDT)</th>
+                <th title="USDT consumidos (órdenes recibidas) en esa posición en el período. Cuánto del capital en esa zona rotó.">Consumo acum. (USDT)</th>
+                <th title="Porcentaje de la liquidez disponible que fue consumida. 100% = toda la liquidez rotó. Bajo = posición 'muerta'.">Ratio consumo</th>
+                <th title="Número de snapshots con datos para esa posición.">Muestras</th>
+              </tr></thead>
+              <tbody>{profundidad.map((r,i)=>{
+                const ratio=parseFloat(r.ratio_consumo||0);
+                const c=ratio>=60?"#35e07a":ratio>=30?"#ffd740":ratio>=10?"#ff9100":"var(--text-3)";
+                const label=ratio>=60?"🔥 Alta":ratio>=30?"✅ Media":ratio>=10?"⚠️ Baja":"❌ Nula";
+                return <tr key={i}>
+                  <td style={{fontWeight:600,color:"var(--accent)"}}>{r.rango_pos}</td>
+                  <td className="tnum">{fN(r.liq_disponible_acum)} U</td>
+                  <td className="tnum">{fN(r.consumo_acum)} U</td>
+                  <td className="tnum" style={{color:c,fontWeight:600}}>{ratio.toFixed(1)}% <span style={{fontSize:11,fontWeight:400}}>{label}</span></td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.muestras}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+          <div className="intel-explain">
+            <b>Qué muestra:</b> para cada zona del libro (top, medio, atrás), cuánta liquidez total había y cuánto de eso realmente rotó como órdenes recibidas.<br/>
+            <b>Ratio consumo:</b> es la métrica clave. Un ratio alto (verde, 🔥) significa que esa zona del libro tiene demanda real — los compradores llegan hasta ahí. Un ratio bajo (❌) significa que casi nadie llega a esa profundidad, no vale la pena estar tan atrás.<br/>
+            <b>Estrategia:</b> si el ratio de top1-3 es 60% pero el de back7+ es 5%, estar en posición 7+ es básicamente invisible. Calcula el costo de bajar tu precio para entrar al top.
+          </div>
+        </section>
+      )}
+
+      {seccion==="preciofill" && precioFill && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Precio relativo vs tasa de llenado</h3><span className="card-sub">trade-off entre precio competitivo y volumen recibido · últimos 7 días</span></div>
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr>
+                <th title="Posición en el libro: top1-3 = más barato/competitivo, back7+ = más caro/alejado del mejor precio.">Posición</th>
+                <th title="Precio promedio de esta posición relativo al mejor precio del mercado. Negativo = más barato que el líder, positivo = más caro.">Precio relativo al líder</th>
+                <th title="% de ciclos en que esta posición tenía al menos una orden activa. 100% = siempre presente, 0% = nunca.">% Fill (presencia)</th>
+                <th title="Cuántos USDT recibe esta posición por cada 1 USDT de diferencia de precio contra el líder. Más alto = más eficiente.">Eficiencia (U por CLP)</th>
+                <th title="Número de muestras.">Muestras</th>
+              </tr></thead>
+              <tbody>{precioFill.map((r,i)=>{
+                const ef=parseFloat(r.eficiencia||0);
+                const pct=parseFloat(r.pct_fill||0);
+                const precio_rel=parseFloat(r.precio_relativo_pct||0);
+                const c=ef>=50?"#35e07a":ef>=20?"#ffd740":ef>=5?"#ff9100":"var(--text-3)";
+                return <tr key={i}>
+                  <td style={{fontWeight:600,color:"var(--accent)"}}>{r.rango_pos}</td>
+                  <td className="tnum" style={{color:precio_rel<=0?"#35e07a":"#ff5d6c",fontWeight:600}}>{precio_rel>=0?"+":""}{precio_rel.toFixed(3)}%</td>
+                  <td className="tnum" style={{color:pct>=70?"#35e07a":pct>=40?"#ffd740":"var(--text-3)",fontWeight:600}}>{pct.toFixed(1)}%</td>
+                  <td className="tnum" style={{color:c,fontWeight:600}}>{ef.toFixed(1)}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.muestras}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+          <div className="intel-explain">
+            <b>Qué muestra:</b> si bajo mi precio para quedar en el top, ¿cuánto más volumen recibo a cambio? Eso es la eficiencia: órdenes ganadas por cada peso de precio sacrificado.<br/>
+            <b>Precio relativo negativo:</b> esa posición cotiza más barato que el líder actual. Si estás en top1-3 generalmente tenés precio relativo negativo porque ofrecés más barato que los de atrás.<br/>
+            <b>% Fill (presencia):</b> cuántas veces del total esa posición tenía anuncios activos. Un fill alto + precio relativo bajo = zona competitiva con alta demanda.<br/>
+            <b>Decisión práctica:</b> si la eficiencia del top1-3 es 80 y la de mid4-6 es 15, el salto de precio que se necesita para estar en el top genera 5x más volumen — suele valer la pena.
           </div>
         </section>
       )}
@@ -3702,8 +3778,6 @@ def api_intel_precio_vs_fill():
     eficiencia = pct_fill / |precio_relativo_pct|. Cuanto fill obtienes por
     cada 0.1% de precio que resignas. Posicion con mayor eficiencia = mejor
     tradeoff precio vs probabilidad de llenarse.
-    Ejemplo: posicion 2 con -0.15% precio y 25% fill tiene eficiencia 166.
-    Posicion 4 con -0.40% y 8% fill tiene eficiencia 20. Posicion 2 domina.
     """
     dias = int(request.args.get("dias", 7))
     with get_conn() as conn:
@@ -3779,6 +3853,7 @@ def api_heatmap():
             if hasattr(v, "__float__"): r[k] = float(v)
     return jsonify(rows)
 
+
 @app.route("/api/velocidad")
 def api_velocidad():
     anunciante = request.args.get("anunciante", "")
@@ -3800,9 +3875,11 @@ def api_velocidad():
         })
     return jsonify(out)
 
+
 @app.route("/api/count")
 def api_count():
     return jsonify({"count": obtener_count()})
+
 
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
@@ -3826,12 +3903,13 @@ def api_config():
                     try:
                         config[k] = cast(data[k])
                     except (ValueError, TypeError):
-                        errores[k] = f"valor invalido: {data[k]}"
+                        errores[k] = "valor invalido"
         if errores:
             return jsonify({"ok": False, "errores": errores}), 400
         return jsonify({"ok": True})
     with config_lock:
         return jsonify(dict(config))
+
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
@@ -3840,6 +3918,7 @@ def api_reset():
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 # ──────────────────────────────────────────────
 #  INICIO
