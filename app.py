@@ -644,6 +644,16 @@ body {
 .precio-chart { border-radius: 8px; overflow: hidden; }
 .precio-msg { padding: 40px 16px; text-align: center; color: var(--text-3); font-size: 13px; }
 .precio-foot { margin-top: 10px; font-size: 11px; color: var(--text-3); text-align: center; }
+.intel-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
+.intel-tab { font-size:12px; padding:6px 13px; border-radius:8px; border:1px solid var(--line); background:var(--bg-2); color:var(--text-2); cursor:pointer; }
+.intel-tab.active { border-color:var(--accent); color:var(--accent); background:var(--accent-soft); font-weight:600; }
+.intel-scroll { overflow-x:auto; }
+.intel-table { width:100%; border-collapse:collapse; font-size:12px; min-width:500px; }
+.intel-table th { font-size:10.5px; color:var(--text-3); font-weight:500; padding:7px 10px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
+.intel-table td { padding:7px 10px; border-bottom:0.5px solid var(--line-soft,rgba(255,255,255,0.05)); white-space:nowrap; }
+.intel-table tr:hover td { background:var(--bg-2); }
+.intel-nota { font-size:11px; color:var(--text-3); margin-top:10px; padding:8px 12px; border-left:2px solid var(--line); line-height:1.5; }
+.intel-loading { padding:60px; text-align:center; color:var(--text-3); font-size:13px; }
 
 /* chart */
 .chart { position: relative; width: 100%; }
@@ -2088,7 +2098,7 @@ function TopBar({ snap, secondsLeft, cycleMs }) {
 
 /* ---------- Tab bar ---------- */
 function Tabs({ tab, setTab }) {
-  const items = [["tr", "Tiempo Real"], ["hist", "Histórico"], ["precio", "Precio"], ["heat", "Mapa de Calor"]];
+  const items = [["tr", "Tiempo Real"], ["hist", "Histórico"], ["precio", "Precio"], ["intel", "Inteligencia"], ["heat", "Mapa de Calor"]];
   return (
     <nav className="tabbar" role="tablist">
       {items.map(([k, label]) => (
@@ -2899,7 +2909,168 @@ function PrecioChart() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart };
+/* ─────────── INTELIGENCIA DE MERCADO ─────────── */
+function Inteligencia() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [horario, setHorario] = vS(null);
+  const [anunciantes, setAnunciantes] = vS(null);
+  const [traders, setTraders] = vS(null);
+  const [fill, setFill] = vS(null);
+  const [patron, setPatron] = vS(null);
+  const [loading, setLoading] = vS(true);
+  const [seccion, setSeccion] = vS("horario");
+
+  vE(() => {
+    setLoading(true);
+    Promise.all([
+      fetch(B+"/api/inteligencia/horario").then(r=>r.json()),
+      fetch(B+"/api/inteligencia/anunciantes").then(r=>r.json()),
+      fetch(B+"/api/inteligencia/top_traders").then(r=>r.json()),
+      fetch(B+"/api/inteligencia/fill").then(r=>r.json()),
+      fetch(B+"/api/inteligencia/precio_patron").then(r=>r.json()),
+    ]).then(([h,a,t,f,p]) => {
+      setHorario(h); setAnunciantes(a); setTraders(t); setFill(f); setPatron(p);
+      setLoading(false);
+    }).catch(()=>setLoading(false));
+  }, []);
+
+  const fP = (v) => v != null ? parseFloat(v).toFixed(2)+"%" : "—";
+  const fN = (v) => v != null ? Number(v).toLocaleString("es-CL") : "—";
+  const fC = (v) => v != null ? "$"+parseFloat(v).toFixed(2) : "—";
+
+  const SECS = [
+    ["horario","⏰ Horario"],["anunciantes","👥 Pares"],
+    ["traders","🏆 Top traders"],["fill","⚡ Fill"],["patron","📅 Patrones"]
+  ];
+
+  if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
+
+  return (
+    <div className="view">
+      <div className="intel-tabs">
+        {SECS.map(([k,lbl])=>(
+          <button key={k} className={"intel-tab"+(seccion===k?" active":"")} onClick={()=>setSeccion(k)}>{lbl}</button>
+        ))}
+      </div>
+
+      {seccion==="horario" && horario && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Ventanas operativas por hora</h3><span className="card-sub">últimos 7 días · spread neto Bronze (−0.32%)</span></div>
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr><th>Hora</th><th>Spread neto</th><th>Liq. Compra</th><th>Liq. Venta</th><th>Muestras</th><th>Semáforo</th></tr></thead>
+              <tbody>{horario.map(r=>{
+                const sn=parseFloat(r.spread_neto||0);
+                const color=sn>=1.0?"#35e07a":sn>=0.5?"#ffd740":sn>=0.35?"#ff9100":"#ff5d6c";
+                const label=sn>=1.0?"🔥 PICO":sn>=0.5?"✅ BUENO":sn>=0.35?"⚠️ MARG.":"❌";
+                return <tr key={r.hora} style={{borderLeft:`3px solid ${color}`}}>
+                  <td><b className="tnum">{String(r.hora).padStart(2,"0")}h</b></td>
+                  <td style={{color,fontWeight:600}} className="tnum">{sn>=0?"+":""}{sn.toFixed(3)}%</td>
+                  <td className="tnum">{fN(r.liq_compra)}</td>
+                  <td className="tnum">{fN(r.liq_venta)}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.muestras}</td>
+                  <td style={{fontSize:12}}>{label}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {seccion==="anunciantes" && anunciantes && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Merchants con capital similar al tuyo</h3><span className="card-sub">500–8.000 USDT · tasa ≥90% · 7 días</span></div>
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr><th>Anunciante</th><th>Capital</th><th>Órdenes</th><th>Tasa</th><th>H. pico</th><th>Hrs activas</th><th>Apariciones</th></tr></thead>
+              <tbody>{anunciantes.map(r=>(
+                <tr key={r.anunciante}>
+                  <td style={{fontWeight:600}}>{r.anunciante}</td>
+                  <td className="tnum">{fN(r.capital)} U</td>
+                  <td className="tnum">{fN(r.ordenes)}</td>
+                  <td className="tnum" style={{color:"#35e07a"}}>{parseFloat(r.tasa_exito||0).toFixed(1)}%</td>
+                  <td className="tnum">{String(r.hora_pico||0).padStart(2,"0")}h</td>
+                  <td className="tnum">{r.horas_activas}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{fN(r.total_apariciones)}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {seccion==="traders" && traders && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Top traders más activos</h3><span className="card-sub">estrategia de precio y posicionamiento · 7 días</span></div>
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr><th>Anunciante</th><th>Lado</th><th>Capital</th><th>Precio rango</th><th>Rango $</th><th>Pos.</th><th>Órdenes</th><th>Hrs</th></tr></thead>
+              <tbody>{traders.map((r,i)=>(
+                <tr key={i}>
+                  <td style={{fontWeight:600,fontSize:12}}>{r.anunciante}</td>
+                  <td><span style={{color:r.tipo==="BUY"?"#35e07a":"#ff5d6c",fontWeight:600,fontSize:11}}>{r.tipo}</span></td>
+                  <td className="tnum">{fN(r.capital_med)} U</td>
+                  <td className="tnum" style={{fontSize:11}}>{fC(r.precio_min)} – {fC(r.precio_max)}</td>
+                  <td className="tnum">{r.rango_precio!=null?`$${parseFloat(r.rango_precio).toFixed(2)}`:"—"}</td>
+                  <td className="tnum">{r.pos_med!=null?parseFloat(r.pos_med).toFixed(1):"—"}</td>
+                  <td className="tnum">{fN(r.ordenes)}</td>
+                  <td className="tnum">{r.horas_activas}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+          <div className="intel-nota">Rango precio bajo = precio fijo. Rango alto = ajuste dinámico. Posición alta = compite por el tope.</div>
+        </section>
+      )}
+
+      {seccion==="fill" && fill && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Velocidad de fill por posición y hora</h3><span className="card-sub">USDT vendidos por evento según dónde estés en el libro</span></div>
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr><th>Hora</th><th>Top 1–3</th><th>Mid 4–6</th><th>Back 7+</th></tr></thead>
+              <tbody>{Array.from({length:24},(_,h)=>{
+                const get=(rp)=>{const r=fill.find(f=>parseInt(f.hora)===h&&f.rango_pos===rp); return r?`${fN(r.consumo_med)} U`:"—";};
+                return <tr key={h}>
+                  <td className="tnum"><b>{String(h).padStart(2,"0")}h</b></td>
+                  <td className="tnum" style={{color:"#35e07a"}}>{get("top1-3")}</td>
+                  <td className="tnum">{get("mid4-6")}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{get("back7+")}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+          <div className="intel-nota">USDT consumidos por evento en esa posición. Mayor número = más te compran cuando estás ahí.</div>
+        </section>
+      )}
+
+      {seccion==="patron" && patron && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Patrones de precio y spread por día de semana</h3><span className="card-sub">promedios últimos 7 días</span></div>
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr><th>Día</th><th>Hora</th><th>P. Compra</th><th>P. Venta</th><th>Spread</th><th>n</th></tr></thead>
+              <tbody>{patron.map((r,i)=>{
+                const sp=parseFloat(r.spread||0);
+                const c=sp>=1?"#35e07a":sp>=0.5?"#ffd740":sp>=0.35?"#ff9100":"var(--text-3)";
+                return <tr key={i}>
+                  <td style={{fontSize:11}}>{(r.dia_semana||"").trim().slice(0,3)}</td>
+                  <td className="tnum"><b>{String(r.hora).padStart(2,"0")}h</b></td>
+                  <td className="tnum">{fC(r.precio_compra)}</td>
+                  <td className="tnum">{fC(r.precio_venta)}</td>
+                  <td className="tnum" style={{color:c,fontWeight:600}}>{sp>=0?"+":""}{sp.toFixed(3)}%</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.muestras}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia };
 
 </script>
 <script type="text/babel">
@@ -2980,6 +3151,7 @@ function App() {
           filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} />}
         {tab === "hist" && <V.Historico history={history} />}
         {tab === "precio" && <V.PrecioChart />}
+        {tab === "intel" && <V.Inteligencia />}
         {tab === "heat" && <V.Heatmap heatmap={heatmap} />}
       </main>
       <footer className="foot">
@@ -3089,8 +3261,160 @@ def api_precios():
             out_venta.append({"time": unix, "value": round(float(pv), 2)})
     return jsonify({"compra": out_compra, "venta": out_venta})
 
-@app.route("/api/heatmap")
-def api_heatmap():
+@app.route("/api/inteligencia/horario")
+def api_intel_horario():
+    """Spread neto + liquidez + fill por hora — últimos 7 días"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT hora,
+                    ROUND(AVG(spread_pond_pct)::numeric,3)      AS spread_bruto,
+                    ROUND((AVG(spread_pond_pct)-0.32)::numeric,3) AS spread_neto,
+                    ROUND(AVG(liq_tab_compra)::numeric,0)        AS liq_compra,
+                    ROUND(AVG(liq_tab_venta)::numeric,0)         AS liq_venta,
+                    COUNT(*)                                      AS muestras
+                FROM snapshots
+                WHERE timestamp >= NOW() - INTERVAL '7 days'
+                GROUP BY hora ORDER BY hora
+            """)
+            rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/inteligencia/anunciantes")
+def api_intel_anunciantes():
+    """Merchants con capital 500-8000 USDT: rotación, horario, fill rate — últimos 7 días"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                WITH base AS (
+                    SELECT anunciante,
+                        hora,
+                        AVG(disponible)          AS disp_med,
+                        COUNT(*)                 AS apariciones,
+                        MAX(completadas)         AS ordenes_hist,
+                        AVG(tasa_exito)          AS tasa,
+                        BOOL_OR(es_merchant)     AS merchant
+                    FROM snapshots_detalle
+                    WHERE snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                      AND tipo = 'BUY'
+                    GROUP BY anunciante, hora
+                ),
+                perfil AS (
+                    SELECT anunciante,
+                        ROUND(AVG(disp_med)::numeric,0)     AS capital,
+                        ROUND(AVG(tasa)::numeric,1)         AS tasa_exito,
+                        MAX(ordenes_hist)                   AS ordenes,
+                        BOOL_OR(merchant)                   AS merchant,
+                        COUNT(DISTINCT hora)                AS horas_activas,
+                        (array_agg(hora ORDER BY apariciones DESC))[1] AS hora_pico,
+                        SUM(apariciones)                    AS total_apariciones
+                    FROM base
+                    GROUP BY anunciante
+                )
+                SELECT * FROM perfil
+                WHERE merchant = true
+                  AND capital BETWEEN 500 AND 8000
+                  AND tasa_exito >= 90
+                  AND total_apariciones >= 50
+                ORDER BY total_apariciones DESC
+                LIMIT 20
+            """)
+            rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/inteligencia/fill")
+def api_intel_fill():
+    """Velocidad de fill por posición y hora — últimos 7 días"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                WITH consumos AS (
+                    SELECT
+                        a.anunciante, a.hora, a.posicion,
+                        a.disponible - b.disponible AS consumo,
+                        EXTRACT(EPOCH FROM (b.snapshot_timestamp - a.snapshot_timestamp))/60 AS delta_min
+                    FROM snapshots_detalle a
+                    JOIN snapshots_detalle b
+                      ON a.anunciante = b.anunciante
+                     AND a.tipo = b.tipo
+                     AND b.snapshot_timestamp = (
+                         SELECT MIN(c.snapshot_timestamp)
+                         FROM snapshots_detalle c
+                         WHERE c.anunciante = a.anunciante
+                           AND c.tipo = a.tipo
+                           AND c.snapshot_timestamp > a.snapshot_timestamp
+                     )
+                    WHERE a.tipo = 'BUY'
+                      AND a.es_merchant = true
+                      AND a.snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                )
+                SELECT
+                    hora,
+                    CASE WHEN posicion <= 3 THEN 'top1-3'
+                         WHEN posicion <= 6 THEN 'mid4-6'
+                         ELSE 'back7+' END AS rango_pos,
+                    ROUND(AVG(CASE WHEN consumo > 10 AND delta_min BETWEEN 1 AND 6
+                                   THEN consumo END)::numeric, 0) AS consumo_med,
+                    COUNT(CASE WHEN consumo > 10 AND delta_min BETWEEN 1 AND 6
+                               THEN 1 END)                        AS eventos
+                FROM consumos
+                GROUP BY hora, rango_pos
+                ORDER BY hora, rango_pos
+            """)
+            rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/inteligencia/top_traders")
+def api_intel_top_traders():
+    """Top 10 traders más activos con su estrategia de precios — últimos 7 días"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    anunciante,
+                    tipo,
+                    ROUND(AVG(disponible)::numeric,0)       AS capital_med,
+                    ROUND(MIN(precio)::numeric,2)           AS precio_min,
+                    ROUND(MAX(precio)::numeric,2)           AS precio_max,
+                    ROUND(AVG(precio)::numeric,2)           AS precio_med,
+                    ROUND(MAX(precio)-MIN(precio),2)        AS rango_precio,
+                    MAX(completadas)                        AS ordenes,
+                    ROUND(AVG(tasa_exito)::numeric,1)       AS tasa_exito,
+                    ROUND(AVG(posicion)::numeric,1)         AS pos_med,
+                    COUNT(DISTINCT DATE_TRUNC('hour', snapshot_timestamp)) AS horas_activas,
+                    COUNT(*)                                AS apariciones
+                FROM snapshots_detalle
+                WHERE snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                  AND es_merchant = true
+                GROUP BY anunciante, tipo
+                HAVING COUNT(*) >= 100
+                ORDER BY apariciones DESC
+                LIMIT 20
+            """)
+            rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/inteligencia/precio_patron")
+def api_intel_precio_patron():
+    """Precio ponderado promedio y spread por hora y día de semana"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    hora,
+                    TO_CHAR(timestamp, 'Day') AS dia_semana,
+                    EXTRACT(DOW FROM timestamp) AS dow,
+                    ROUND(AVG(precio_pond_tab_compra)::numeric,2) AS precio_compra,
+                    ROUND(AVG(precio_pond_tab_venta)::numeric,2)  AS precio_venta,
+                    ROUND(AVG(spread_pond_pct)::numeric,3)        AS spread,
+                    COUNT(*)                                       AS muestras
+                FROM snapshots
+                WHERE timestamp >= NOW() - INTERVAL '7 days'
+                GROUP BY hora, dia_semana, dow
+                ORDER BY dow, hora
+            """)
+            rows = cur.fetchall()
+    return jsonify([dict(r) for r in rows])
     rows = obtener_heatmap()
     for r in rows:
         for k, v in r.items():
