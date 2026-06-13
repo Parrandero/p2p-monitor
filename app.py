@@ -2934,7 +2934,6 @@ function Inteligencia() {
     }).catch(()=>setLoading(false));
   }, []);
 
-  const fP = (v) => v != null ? parseFloat(v).toFixed(2)+"%" : "—";
   const fN = (v) => v != null ? Number(v).toLocaleString("es-CL") : "—";
   const fC = (v) => v != null ? "$"+parseFloat(v).toFixed(2) : "—";
 
@@ -2958,7 +2957,14 @@ function Inteligencia() {
           <div className="card-head"><h3>Ventanas operativas por hora</h3><span className="card-sub">últimos 7 días · spread neto Bronze (−0.32%)</span></div>
           <div className="intel-scroll">
             <table className="intel-table">
-              <thead><tr><th>Hora</th><th>Spread neto</th><th>Liq. Compra</th><th>Liq. Venta</th><th>Muestras</th><th>Semáforo</th></tr></thead>
+              <thead><tr>
+                <th title="Hora del día en horario Santiago (Chile)">Hora</th>
+                <th title="Ganancia neta estimada por vuelta: diferencia entre precio compra y venta, descontando la comisión Bronze de 0.32%. Ej: +1.2% significa que por cada 1.000 USDT ganás $12.">Spread neto</th>
+                <th title="USDT disponibles en el lado de compra (Tab Compra). Cuánto hay para vender. Mayor número = más fácil llenar tu orden de venta.">Liq. Compra</th>
+                <th title="USDT disponibles en el lado de venta (Tab Venta). Cuánto hay para comprar. Mayor número = más fácil reponerte de USDT.">Liq. Venta</th>
+                <th title="Cantidad de snapshots tomados en esa hora. Más muestras = dato más confiable.">Muestras</th>
+                <th title="Verde 🔥 = muy rentable (>1%). Amarillo ✅ = rentable (>0.5%). Naranja ⚠️ = marginal (>0.35%). Rojo ❌ = no vale la pena.">Semáforo</th>
+              </tr></thead>
               <tbody>{horario.map(r=>{
                 const sn=parseFloat(r.spread_neto||0);
                 const color=sn>=1.0?"#35e07a":sn>=0.5?"#ffd740":sn>=0.35?"#ff9100":"#ff5d6c";
@@ -2974,6 +2980,10 @@ function Inteligencia() {
               })}</tbody>
             </table>
           </div>
+          <div className="intel-explain">
+            <b>Cómo leer esta tabla:</b> buscá las horas con semáforo 🔥 o ✅ — ahí es donde conviene operar porque la diferencia entre lo que te pagan por vender USDT y lo que pagás por comprarlos es suficiente para cubrir la comisión y ganar. Las horas ❌ tienen spread casi cero: mover capital ahí es trabajar para no ganar nada.<br/>
+            <b>Qué hacer:</b> si tu turno libre empieza a las 04h, mirá si el spread neto supera +0.5% antes de publicar tu anuncio. Si está en rojo, esperá una hora.
+          </div>
         </section>
       )}
 
@@ -2982,7 +2992,15 @@ function Inteligencia() {
           <div className="card-head"><h3>Merchants con capital similar al tuyo</h3><span className="card-sub">500–8.000 USDT · tasa ≥90% · 7 días</span></div>
           <div className="intel-scroll">
             <table className="intel-table">
-              <thead><tr><th>Anunciante</th><th>Capital</th><th>Órdenes</th><th>Tasa</th><th>H. pico</th><th>Hrs activas</th><th>Apariciones</th></tr></thead>
+              <thead><tr>
+                <th title="Nombre del anunciante en Binance P2P">Anunciante</th>
+                <th title="Capital típico que mantiene disponible en su anuncio (mediana de la última semana). Es cuánto dinero está moviendo.">Capital</th>
+                <th title="Total de órdenes completadas en toda su historia en Binance. Más órdenes = más experiencia y confianza.">Órdenes</th>
+                <th title="Porcentaje de órdenes que completó exitosamente. 100% = nunca canceló. Fundamental para mantener el badge Merchant.">Tasa</th>
+                <th title="La hora del día en que más aparece en el libro. Su ventana operativa principal — podés copiarla.">H. pico</th>
+                <th title="Cuántas horas distintas del día estuvo activo en el libro durante la última semana. 24 = activo todo el día, 8 = opera en una ventana.">Hrs activas</th>
+                <th title="Cuántas veces apareció en el top 20 del libro durante la última semana. Más apariciones = más tiempo operando = más ingresos.">Apariciones</th>
+              </tr></thead>
               <tbody>{anunciantes.map(r=>(
                 <tr key={r.anunciante}>
                   <td style={{fontWeight:600}}>{r.anunciante}</td>
@@ -2996,6 +3014,10 @@ function Inteligencia() {
               ))}</tbody>
             </table>
           </div>
+          <div className="intel-explain">
+            <b>Cómo leer esta tabla:</b> estos son merchants que operan con un capital parecido al tuyo (entre 500 y 8.000 USDT) y tienen buena tasa de éxito. Son tu competencia directa y también tu mejor referencia.<br/>
+            <b>Qué hacer:</b> fijate en la columna <b>H. pico</b> — si varios de ellos tienen su hora pico en las 05h, ahí es cuando más actividad hay y más probable que tus órdenes se llenen. La columna <b>Apariciones</b> te dice quién opera más horas: un número alto significa que está muy activo y gana más. Mirá sus patrones y copiá lo que funciona.
+          </div>
         </section>
       )}
 
@@ -3004,7 +3026,16 @@ function Inteligencia() {
           <div className="card-head"><h3>Top traders más activos</h3><span className="card-sub">estrategia de precio y posicionamiento · 7 días</span></div>
           <div className="intel-scroll">
             <table className="intel-table">
-              <thead><tr><th>Anunciante</th><th>Lado</th><th>Capital</th><th>Precio rango</th><th>Rango $</th><th>Pos.</th><th>Órdenes</th><th>Hrs</th></tr></thead>
+              <thead><tr>
+                <th title="Nombre del anunciante">Anunciante</th>
+                <th title="BUY = publica en Tab Compra (vende USDT a usuarios). SELL = publica en Tab Venta (compra USDT de usuarios).">Lado</th>
+                <th title="Capital típico disponible en su anuncio">Capital</th>
+                <th title="Rango de precios que publicó durante la semana. Si el rango es chico (ej $906-$907) usa precio FIJO. Si es grande (ej $900-$930) ajusta dinámicamente.">Rango precios</th>
+                <th title="Diferencia en pesos entre su precio mínimo y máximo. Bajo = precio fijo (estrategia simple y efectiva). Alto = ajusta constantemente.">Amplitud $</th>
+                <th title="Posición promedio en el libro. 1.0 = siempre primero. 5.0 = siempre en posición 5. No hace falta ser primero para llenar órdenes.">Pos. media</th>
+                <th title="Total de órdenes completadas en toda su historia">Órdenes</th>
+                <th title="Cuántas horas distintas estuvo activo durante la semana">Hrs</th>
+              </tr></thead>
               <tbody>{traders.map((r,i)=>(
                 <tr key={i}>
                   <td style={{fontWeight:600,fontSize:12}}>{r.anunciante}</td>
@@ -3019,28 +3050,44 @@ function Inteligencia() {
               ))}</tbody>
             </table>
           </div>
-          <div className="intel-nota">Rango precio bajo = precio fijo. Rango alto = ajuste dinámico. Posición alta = compite por el tope.</div>
+          <div className="intel-explain">
+            <b>Cómo leer esta tabla:</b> son los anunciantes que más horas estuvieron en el libro durante la semana — los más activos y probablemente los que más ganan.<br/>
+            <b>El dato clave es "Amplitud $":</b> si la amplitud es menor a $1, ese trader usa <b>precio fijo</b> — publica un precio y no lo toca. Si es mayor a $5, ajusta constantemente. Los estudios de SpaMaig y cambiosaular1 confirmaron que el precio fijo funciona igual de bien y ahorra tiempo.<br/>
+            <b>Qué hacer:</b> fijate en los traders con posición media 2-4 y amplitud baja — esa es la estrategia a copiar: precio fijo, posición media, sin pelear por el primer puesto.
+          </div>
         </section>
       )}
 
       {seccion==="fill" && fill && (
         <section className="chart-card">
-          <div className="card-head"><h3>Velocidad de fill por posición y hora</h3><span className="card-sub">USDT vendidos por evento según dónde estés en el libro</span></div>
+          <div className="card-head"><h3>¿Cuánto te compran según dónde estés en el libro?</h3><span className="card-sub">USDT por orden recibida · posiciones 1-3 vs 4-6 vs 7+ · últimos 7 días</span></div>
           <div className="intel-scroll">
             <table className="intel-table">
-              <thead><tr><th>Hora</th><th>Top 1–3</th><th>Mid 4–6</th><th>Back 7+</th></tr></thead>
+              <thead><tr>
+                <th title="Hora del día en horario Santiago">Hora</th>
+                <th title="Si publicás tu anuncio en las posiciones 1, 2 o 3 del libro (los primeros que ve el usuario), cuántos USDT te compran por orden recibida en promedio. Mayor número = mejor." style={{color:"#35e07a"}}>📍 Posición 1-3 (primero)</th>
+                <th title="Si estás en posiciones 4, 5 o 6, cuántos USDT te compran por orden. A veces similar al top, a veces menos.">📍 Posición 4-6 (medio)</th>
+                <th title="Si estás en posiciones 7 o más atrás, cuántos USDT te compran por orden. En horas de baja liquidez suele ser muy poco." style={{color:"var(--text-3)"}}>📍 Posición 7+ (atrás)</th>
+              </tr></thead>
               <tbody>{Array.from({length:24},(_,h)=>{
-                const get=(rp)=>{const r=fill.find(f=>parseInt(f.hora)===h&&f.rango_pos===rp); return r?`${fN(r.consumo_med)} U`:"—";};
-                return <tr key={h}>
+                const get=(rp)=>{const r=fill.find(f=>parseInt(f.hora)===h&&f.rango_pos===rp); return r&&r.consumo_med?`${fN(r.consumo_med)} U`:"–";};
+                const top=fill.find(f=>parseInt(f.hora)===h&&f.rango_pos==="top1-3");
+                const topVal=top&&top.consumo_med?parseFloat(top.consumo_med):0;
+                const rowColor=topVal>=1500?"rgba(53,224,122,0.05)":topVal>=800?"rgba(255,215,64,0.04)":"transparent";
+                return <tr key={h} style={{background:rowColor}}>
                   <td className="tnum"><b>{String(h).padStart(2,"0")}h</b></td>
-                  <td className="tnum" style={{color:"#35e07a"}}>{get("top1-3")}</td>
+                  <td className="tnum" style={{color:"#35e07a",fontWeight:topVal>=1500?700:400}}>{get("top1-3")}</td>
                   <td className="tnum">{get("mid4-6")}</td>
                   <td className="tnum" style={{color:"var(--text-3)"}}>{get("back7+")}</td>
                 </tr>;
               })}</tbody>
             </table>
           </div>
-          <div className="intel-nota">USDT consumidos por evento en esa posición. Mayor número = más te compran cuando estás ahí.</div>
+          <div className="intel-explain">
+            <b>Qué significa este número:</b> cuando alguien hace una orden contra tu anuncio, ¿cuántos USDT te compra de una vez? Un número alto (ej: 2.500 U) significa que las órdenes son grandes — llenan tu anuncio rápido. Un número bajo (ej: 200 U) significa órdenes chicas — tardás más en vaciar el stock.<br/>
+            <b>Cómo usarlo:</b> las filas verdes (fondo verde suave) son las mejores horas para estar en posición 1-3. Fijate que de <b>07h a 14h</b> las órdenes top son de 2.000+ USDT — el mercado es activo y los pedidos son grandes. En madrugada (02h-06h) el spread es alto pero las órdenes son más chicas.<br/>
+            <b>Conclusión práctica:</b> para llenarte rápido, estás en posición 1-3 en horas de alta liquidez (07h-14h). Para capturar spread alto, estás en madrugada aunque las órdenes sean más lentas.
+          </div>
         </section>
       )}
 
@@ -3049,12 +3096,19 @@ function Inteligencia() {
           <div className="card-head"><h3>Patrones de precio y spread por día de semana</h3><span className="card-sub">promedios últimos 7 días</span></div>
           <div className="intel-scroll">
             <table className="intel-table">
-              <thead><tr><th>Día</th><th>Hora</th><th>P. Compra</th><th>P. Venta</th><th>Spread</th><th>n</th></tr></thead>
+              <thead><tr>
+                <th title="Día de la semana en inglés abreviado: Mon=Lunes, Tue=Martes, Wed=Miércoles, Thu=Jueves, Fri=Viernes, Sat=Sábado, Sun=Domingo">Día</th>
+                <th title="Hora del día en horario Santiago">Hora</th>
+                <th title="Precio ponderado promedio al que los vendedores de USDT ofrecen su stock. Es cuánto tendrías que pagar para comprar USDT en ese momento.">P. Compra</th>
+                <th title="Precio ponderado promedio al que los compradores de USDT están dispuestos a pagar. Es cuánto recibirías al vender USDT.">P. Venta</th>
+                <th title="Diferencia porcentual entre precio de compra y venta, sin descontar comisión. Es el margen bruto disponible en el mercado en ese momento.">Spread bruto</th>
+                <th title="Cantidad de snapshots que forman este promedio. Con menos de 10 muestras el dato puede no ser representativo.">n</th>
+              </tr></thead>
               <tbody>{patron.map((r,i)=>{
                 const sp=parseFloat(r.spread||0);
                 const c=sp>=1?"#35e07a":sp>=0.5?"#ffd740":sp>=0.35?"#ff9100":"var(--text-3)";
                 return <tr key={i}>
-                  <td style={{fontSize:11}}>{(r.dia_semana||"").trim().slice(0,3)}</td>
+                  <td style={{fontSize:11,fontWeight:600}}>{(r.dia_semana||"").trim().slice(0,3)}</td>
                   <td className="tnum"><b>{String(r.hora).padStart(2,"0")}h</b></td>
                   <td className="tnum">{fC(r.precio_compra)}</td>
                   <td className="tnum">{fC(r.precio_venta)}</td>
@@ -3064,12 +3118,16 @@ function Inteligencia() {
               })}</tbody>
             </table>
           </div>
+          <div className="intel-explain">
+            <b>Cómo leer esta tabla:</b> muestra el precio promedio y el spread disponible para cada combinación de día y hora. Te permite ver si hay días sistemáticamente mejores que otros.<br/>
+            <b>P. Compra vs P. Venta:</b> la diferencia entre ambos es la brecha que el mercado ofrece. Si P. Compra = $922 y P. Venta = $916, el spread bruto es ~0.65% — de ahí se descuenta tu comisión (0.32% Bronze) y te queda tu ganancia neta.<br/>
+            <b>Qué hacer:</b> buscá las combinaciones día+hora con spread verde (>+0.5%) — esas son tus ventanas óptimas según el día de la semana. Si el lunes a las 05h siempre tiene +2%, priorizá operar a esa hora cuando tenés el lunes libre.
+          </div>
         </section>
       )}
     </div>
   );
 }
-
 window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia };
 
 </script>
