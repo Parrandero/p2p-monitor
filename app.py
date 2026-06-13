@@ -636,6 +636,7 @@ body {
 .precio-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
 .precio-leg { display: flex; gap: 16px; flex-wrap: wrap; }
 .pl-item { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+.pl-brecha { font-size: 12px; color: var(--color-warn, #ffd740); background: rgba(255,215,64,0.1); border: 1px solid rgba(255,215,64,0.25); border-radius: 6px; padding: 2px 10px; margin-left: 4px; }
 .pl-dot { width: 10px; height: 10px; border-radius: 3px; }
 .precio-rangos { display: flex; gap: 6px; }
 .pr-btn { font-size: 12px; padding: 5px 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg-2); color: var(--text-2); cursor: pointer; }
@@ -2723,6 +2724,7 @@ function PrecioChart() {
   const [estado, setEstado] = vS("cargando"); // cargando | ok | vacio | sinlib | error
   const [meta, setMeta] = vS({ puntos: 0, ultCompra: null, ultVenta: null });
   const [rango, setRango] = vS("todo"); // 24h | 7d | todo
+  const [brecha, setBrecha] = vS(null); // { abs, pct } al hover
 
   vE(() => {
     let chart = null, serieCompra = null, serieVenta = null, ro = null, cancelado = false;
@@ -2809,6 +2811,20 @@ function PrecioChart() {
         });
         setEstado("ok");
 
+        // Brecha en tiempo real al mover el crosshair
+        chart.subscribeCrosshairMove((param) => {
+          if (!param.time || !param.seriesData) { setBrecha(null); return; }
+          const pc = param.seriesData.get(serieCompra);
+          const pv = param.seriesData.get(serieVenta);
+          if (pc && pv) {
+            const abs = pc.value - pv.value;
+            const pct = (abs / pv.value) * 100;
+            setBrecha({ abs: abs.toFixed(2), pct: pct.toFixed(3) });
+          } else {
+            setBrecha(null);
+          }
+        });
+
         ro = new ResizeObserver((ents) => {
           if (chart && ents[0]) chart.applyOptions({ width: ents[0].contentRect.width });
         });
@@ -2857,6 +2873,11 @@ function PrecioChart() {
             <div className="precio-leg">
               <span className="pl-item"><span className="pl-dot" style={{ background: "#35e07a" }} />Compra {meta.ultCompra ? "$" + meta.ultCompra.toFixed(2) : ""}</span>
               <span className="pl-item"><span className="pl-dot" style={{ background: "#ff5d6c" }} />Venta {meta.ultVenta ? "$" + meta.ultVenta.toFixed(2) : ""}</span>
+              {brecha && (
+                <span className="pl-brecha tnum">
+                  Brecha <b>${brecha.abs}</b> · <b>{brecha.pct}%</b>
+                </span>
+              )}
             </div>
             <div className="precio-rangos">
               {[["24h", "24h"], ["7d", "7 días"], ["todo", "Todo"]].map(([k, lbl]) => (
