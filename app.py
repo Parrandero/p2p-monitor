@@ -2982,7 +2982,8 @@ function Inteligencia() {
       fetch(B+"/api/inteligencia/precio_vs_fill").then(r=>r.json()),
     ]).then(([h,a,t,f,p,prof,pvf]) => {
       setHorario(h); setAnunciantes(a); setTraders(t); setFill(f); setPatron(p);
-      setProfundidad(prof); setPrecioFill(pvf);
+      setProfundidad(Array.isArray(prof) ? prof : (prof.datos || []));
+      setPrecioFill(Array.isArray(pvf) ? pvf : (pvf.datos || []));
       setLoading(false);
     }).catch(()=>setLoading(false));
   }, []);
@@ -3196,8 +3197,9 @@ function Inteligencia() {
                 const ratio=parseFloat(r.ratio_consumo||0);
                 const c=ratio>=60?"#35e07a":ratio>=30?"#ffd740":ratio>=10?"#ff9100":"var(--text-3)";
                 const label=ratio>=60?"🔥 Alta":ratio>=30?"✅ Media":ratio>=10?"⚠️ Baja":"❌ Nula";
+                const pos=r.rango_pos||("P"+r.posicion);
                 return <tr key={i}>
-                  <td style={{fontWeight:600,color:"var(--accent)"}}>{r.rango_pos}</td>
+                  <td style={{fontWeight:600,color:"var(--accent)"}}>{pos}</td>
                   <td className="tnum">{fN(r.liq_disponible_acum)} U</td>
                   <td className="tnum">{fN(r.consumo_acum)} U</td>
                   <td className="tnum" style={{color:c,fontWeight:600}}>{ratio.toFixed(1)}% <span style={{fontSize:11,fontWeight:400}}>{label}</span></td>
@@ -3231,8 +3233,9 @@ function Inteligencia() {
                 const pct=parseFloat(r.pct_fill||0);
                 const precio_rel=parseFloat(r.precio_relativo_pct||0);
                 const c=ef>=50?"#35e07a":ef>=20?"#ffd740":ef>=5?"#ff9100":"var(--text-3)";
+                const pos=r.rango_pos||(r.tipo+" P"+r.posicion);
                 return <tr key={i}>
-                  <td style={{fontWeight:600,color:"var(--accent)"}}>{r.rango_pos}</td>
+                  <td style={{fontWeight:600,color:"var(--accent)"}}>{pos}</td>
                   <td className="tnum" style={{color:precio_rel<=0?"#35e07a":"#ff5d6c",fontWeight:600}}>{precio_rel>=0?"+":""}{precio_rel.toFixed(3)}%</td>
                   <td className="tnum" style={{color:pct>=70?"#35e07a":pct>=40?"#ffd740":"var(--text-3)",fontWeight:600}}>{pct.toFixed(1)}%</td>
                   <td className="tnum" style={{color:c,fontWeight:600}}>{ef.toFixed(1)}</td>
