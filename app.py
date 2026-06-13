@@ -17,16 +17,21 @@ app = Flask(__name__)
 SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 config = {
-    "MONEDA":           "USDT",
-    "FIAT":             "CLP",
-    "INTERVALO_MIN":    2,
-    "FILTRO_MIN_USDT":  200,
-    "FILTRO_MIN_ORD":   100,
-    "FILTRO_MIN_TASA":  90.0,
-    "ALERTA_SPREAD":    0.8,
-    "SPREAD_MINIMO":    0.2,
-    "COMISION_BN":      0.002,
-    "TOP_ANUNCIOS":     20,
+    "MONEDA":               "USDT",
+    "FIAT":                 "CLP",
+    "INTERVALO_MIN":        2,
+    "FILTRO_MIN_USDT":      200,
+    "FILTRO_MIN_ORD":       100,
+    "FILTRO_MIN_TASA":      90.0,
+    "ALERTA_SPREAD":        0.8,
+    "SPREAD_MINIMO":        0.2,
+    # Comisión Binance P2P por operación (cada lado).
+    # Usuario regular: ~0.35% por lado.
+    # Merchant verificado LATAM: ~0.18% por lado → 0.36% total round-trip.
+    "COMISION_BN":          0.0018,
+    # Spread neto mínimo (después de comisiones) para considerar operable.
+    "SPREAD_MIN_OPERATIVO": 0.35,
+    "TOP_ANUNCIOS":         20,
 }
 config_lock = threading.Lock()
 
@@ -60,11 +65,8 @@ def get_conn():
         _pool.putconn(conn)
 
 # ──────────────────────────────────────────────
-#  BASE DE DATOS  (sin cambios respecto al Railway actual)
+#  BASE DE DATOS
 # ──────────────────────────────────────────────
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
-
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -134,6 +136,7 @@ def reset_db():
     init_db()
     with data_lock:
         ultimo_estado.clear()
+        prev_detalle_raw.clear()
     print("\u2705 Base de datos reseteada")
 
 def guardar_snapshot(m):
@@ -332,7 +335,9 @@ def analizar(tab_compra, tab_venta):
     liq_tv = sum(a["disponible"] for a in tab_venta)
     precio_maker_vender  = round(lider_tc["precio"] - 0.01, 2)
     precio_maker_comprar = round(lider_tv["precio"] + 0.01, 2)
-    ganancia = round(spread_pond_pct - (c["COMISION_BN"] * 2 * 100), 4)
+    comision_total_pct = c["COMISION_BN"] * 2 * 100
+    ganancia = round(spread_pond_pct - comision_total_pct, 4)
+    brecha_ok = ganancia >= c["SPREAD_MIN_OPERATIVO"]
     if spread_pond_pct >= c["ALERTA_SPREAD"]:
         estado, color = "MUY APTO", "green"
     elif spread_pond_pct >= c["SPREAD_MINIMO"]:
@@ -341,10 +346,11 @@ def analizar(tab_compra, tab_venta):
         estado, color = "ESTRECHO", "orange"
     else:
         estado, color = "NO APTO", "red"
+    now = datetime.now(SANTIAGO_TZ)
     return {
-        "timestamp":                  datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-        "hora":                       datetime.now(SANTIAGO_TZ).hour,
-        "dia":                        datetime.now(SANTIAGO_TZ).strftime("%A"),
+        "timestamp":                  now.strftime("%Y-%m-%d %H:%M:%S"),
+        "hora":                       now.hour,
+        "dia":                        now.strftime("%A"),
         "mejor_vendedor_tab_compra":  lider_tc["precio"],
         "peor_vendedor_tab_compra":   mas_caro_tc["precio"],
         "precio_pond_tab_compra":     pond_tc,
@@ -364,6 +370,9 @@ def analizar(tab_compra, tab_venta):
         "precio_maker_vender":        precio_maker_vender,
         "precio_maker_comprar":       precio_maker_comprar,
         "ganancia_neta_pct":          ganancia,
+        "comision_total_pct":         round(comision_total_pct, 4),
+        "spread_min_operativo":       c["SPREAD_MIN_OPERATIVO"],
+        "brecha_ok":                  brecha_ok,
         "estado":                     estado,
         "color":                      color,
     }
@@ -419,11 +428,11 @@ def ciclo_colector():
             estado = analizar(tab_compra, tab_venta)
             if estado:
                 guardar_snapshot(estado)
-                ts   = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                hora = datetime.now(SANTIAGO_TZ).hour
+                # Reutilizar el mismo timestamp que generó analizar() → consistencia DB
+                ts     = estado["timestamp"]
+                hora   = estado["hora"]
+                now_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SANTIAGO_TZ)
                 guardar_detalle(ts, hora, raw_compra, raw_venta)
-                # Detalle en memoria para el nuevo frontend (no va a DB)
-                now_dt = datetime.now(SANTIAGO_TZ)
                 estado["detalle_compra"] = build_detalle_memory(raw_compra, "BUY",  now_dt)
                 estado["detalle_venta"]  = build_detalle_memory(raw_venta,  "SELL", now_dt)
                 with data_lock:
@@ -3359,22 +3368,37 @@ def api_precios():
 
 @app.route("/api/inteligencia/horario")
 def api_intel_horario():
-    """Spread neto + liquidez + fill por hora — últimos 7 días"""
+    """Spread neto + liquidez por hora — últimos 7 días.
+    spread_neto = spread_bruto - comision_total (dinámica desde config)."""
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT hora,
-                    ROUND(AVG(spread_pond_pct)::numeric,3)      AS spread_bruto,
-                    ROUND((AVG(spread_pond_pct)-0.32)::numeric,3) AS spread_neto,
-                    ROUND(AVG(liq_tab_compra)::numeric,0)        AS liq_compra,
-                    ROUND(AVG(liq_tab_venta)::numeric,0)         AS liq_venta,
-                    COUNT(*)                                      AS muestras
+                    ROUND(AVG(spread_pond_pct)::numeric,3) AS spread_bruto,
+                    ROUND(AVG(liq_tab_compra)::numeric,0)  AS liq_compra,
+                    ROUND(AVG(liq_tab_venta)::numeric,0)   AS liq_venta,
+                    COUNT(*)                               AS muestras
                 FROM snapshots
                 WHERE timestamp >= NOW() - INTERVAL '7 days'
                 GROUP BY hora ORDER BY hora
             """)
             rows = cur.fetchall()
-    return jsonify([dict(r) for r in rows])
+    with config_lock:
+        comision_total = config["COMISION_BN"] * 2 * 100
+        spread_min_op  = config["SPREAD_MIN_OPERATIVO"]
+    result = []
+    for r in rows:
+        d = dict(r)
+        bruto = float(d["spread_bruto"]) if d["spread_bruto"] is not None else None
+        if bruto is not None:
+            neto = round(bruto - comision_total, 3)
+            d["spread_neto"]  = neto
+            d["brecha_ok"]    = neto >= spread_min_op
+        else:
+            d["spread_neto"] = None
+            d["brecha_ok"]   = False
+        result.append(d)
+    return jsonify(result)
 
 @app.route("/api/inteligencia/anunciantes")
 def api_intel_anunciantes():
@@ -3528,17 +3552,25 @@ def api_heatmap():
             if hasattr(v, "__float__"): r[k] = float(v)
     return jsonify(rows)
 
-@app.route("/api/velocidad/<anunciante>/<tipo>")
-def api_velocidad(anunciante, tipo):
-    """Histórico de disponible para un anunciante — para graficar su curva de consumo."""
-    limit = int(request.args.get("limit", 50))
-    rows = obtener_velocidad_anunciante(anunciante, tipo.upper(), limit)
+@app.route("/api/velocidad")
+def api_velocidad():
+    """Histórico de disponible para un anunciante — para graficar su curva de consumo.
+    Params: anunciante (str), tipo (BUY|SELL), limit (int, default 50)"""
+    anunciante = request.args.get("anunciante", "")
+    tipo       = request.args.get("tipo", "BUY").upper()
+    try:
+        limit = int(request.args.get("limit", 50))
+    except ValueError:
+        limit = 50
+    if not anunciante:
+        return jsonify({"error": "anunciante requerido"}), 400
+    rows = obtener_velocidad_anunciante(anunciante, tipo, limit)
     out = []
     for r in rows:
-        ts = r["snapshot_timestamp"]
+        ts   = r["snapshot_timestamp"]
         disp = r["disponible"]
         out.append({
-            "timestamp": str(ts)[:19],
+            "timestamp":  str(ts)[:19],
             "disponible": float(disp) if disp is not None else None,
         })
     return jsonify(out)
@@ -3551,12 +3583,27 @@ def api_count():
 def api_config():
     global config
     if request.method == "POST":
-        data = request.get_json()
-        allowed = ["FILTRO_MIN_USDT", "FILTRO_MIN_ORD", "FILTRO_MIN_TASA", "INTERVALO_MIN"]
+        data = request.get_json() or {}
+        type_map = {
+            "FILTRO_MIN_USDT":      float,
+            "FILTRO_MIN_ORD":       int,
+            "FILTRO_MIN_TASA":      float,
+            "INTERVALO_MIN":        int,
+            "COMISION_BN":          float,
+            "SPREAD_MIN_OPERATIVO": float,
+            "ALERTA_SPREAD":        float,
+            "SPREAD_MINIMO":        float,
+        }
+        errores = {}
         with config_lock:
-            for k in allowed:
+            for k, cast in type_map.items():
                 if k in data:
-                    config[k] = data[k]
+                    try:
+                        config[k] = cast(data[k])
+                    except (ValueError, TypeError):
+                        errores[k] = f"valor inválido: {data[k]}"
+        if errores:
+            return jsonify({"ok": False, "errores": errores}), 400
         return jsonify({"ok": True})
     with config_lock:
         return jsonify(dict(config))
