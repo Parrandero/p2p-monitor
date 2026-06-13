@@ -3550,6 +3550,227 @@ def api_intel_precio_patron():
             rows = cur.fetchall()
     return jsonify([dict(r) for r in rows])
 
+@app.route("/api/inteligencia/fill_por_posicion")
+def api_intel_fill_por_posicion():
+    """
+    TASA DE FILL POR POSICION DEL LIBRO
+    Para cada posicion 1-20 (BUY y SELL) calcula cuantos ciclos tuvieron
+    una orden completada (delta completadas > 0) y cuanta liquidez se consumio.
+    pct_fill = % de ciclos con actividad real confirmada en ese slot.
+    Si posicion 3 muestra 12%, 1 de cada 8 snapshots tuvo fill ahi.
+    ordenes_por_fill = promedio de ordenes completadas por evento de fill.
+    usdt_consumido_med = USDT promedio que desaparece del disponible cuando hay fill.
+    Usa esto para decidir en que posicion poner tu anuncio: mayor fill pero
+    menor spread (posicion 1) vs menor fill pero mayor spread (posicion 4+).
+    """
+    dias = int(request.args.get("dias", 7))
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                WITH deltas AS (
+                    SELECT
+                        posicion,
+                        tipo,
+                        completadas - LAG(completadas) OVER (
+                            PARTITION BY anunciante, tipo
+                            ORDER BY snapshot_timestamp
+                        ) AS delta_completadas,
+                        LAG(disponible) OVER (
+                            PARTITION BY anunciante, tipo
+                            ORDER BY snapshot_timestamp
+                        ) - disponible AS usdt_consumido
+                    FROM snapshots_detalle
+                    WHERE snapshot_timestamp >= NOW() - (%(dias)s || ' days')::INTERVAL
+                )
+                SELECT
+                    tipo,
+                    posicion,
+                    COUNT(*) AS observaciones,
+                    COUNT(CASE WHEN delta_completadas > 0 THEN 1 END) AS ciclos_con_fill,
+                    ROUND(100.0 * COUNT(CASE WHEN delta_completadas > 0 THEN 1 END)
+                          / NULLIF(COUNT(*), 0), 1) AS pct_fill,
+                    ROUND(AVG(CASE WHEN delta_completadas > 0
+                                   THEN delta_completadas END)::numeric, 1) AS ordenes_por_fill,
+                    ROUND(AVG(CASE WHEN usdt_consumido > 0
+                                   THEN usdt_consumido END)::numeric, 0) AS usdt_consumido_med
+                FROM deltas
+                WHERE delta_completadas IS NOT NULL
+                GROUP BY tipo, posicion
+                ORDER BY tipo, posicion
+            """, {"dias": dias})
+            rows = cur.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        for k, v in d.items():
+            if hasattr(v, "__float__"): d[k] = float(v)
+        result.append(d)
+    return jsonify({
+        "descripcion": (
+            "Tasa de fill real por posicion del libro. "
+            "pct_fill = % ciclos con fill confirmado (delta completadas > 0). "
+            "usdt_consumido_med = liquidez absorbida por evento."
+        ),
+        "dias_analizados": dias,
+        "datos": result,
+    })
+
+
+@app.route("/api/inteligencia/profundidad")
+def api_intel_profundidad():
+    """
+    PROFUNDIDAD DEL LIBRO Y CONSUMO REAL DE LIQUIDEZ
+    Para cada posicion: liquidez disponible promedio vs liquidez consumida.
+    liq_disponible_acum = USDT acumulados desde posicion 1 hasta aqui.
+    Si en posicion 6 el acum es 18.000 USDT, hay 18.000 USDT con prioridad
+    sobre ti si pones en posicion 7.
+    consumo_acum = cuanto absorbe el mercado por ciclo (2 min) hasta esa prof.
+    ratio_consumo = consumo_med / liq_disponible_med: que % de su capital
+    rota esa posicion por ciclo. Alta rotacion = alta demanda en ese nivel.
+    pct_ciclos_activos = % ciclos donde esa posicion tuvo cualquier consumo
+    de disponible (mas amplio que fill confirmado).
+    """
+    dias = int(request.args.get("dias", 7))
+    tipo = request.args.get("tipo", "BUY").upper()
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                WITH base AS (
+                    SELECT
+                        posicion,
+                        disponible,
+                        LAG(disponible) OVER (
+                            PARTITION BY anunciante, tipo
+                            ORDER BY snapshot_timestamp
+                        ) - disponible AS consumo
+                    FROM snapshots_detalle
+                    WHERE snapshot_timestamp >= NOW() - (%(dias)s || ' days')::INTERVAL
+                      AND tipo = %(tipo)s
+                ),
+                por_posicion AS (
+                    SELECT
+                        posicion,
+                        ROUND(AVG(disponible)::numeric, 0) AS liq_disponible_med,
+                        ROUND(AVG(CASE WHEN consumo > 0 THEN consumo END)::numeric, 0) AS consumo_med,
+                        ROUND(100.0 * COUNT(CASE WHEN consumo > 0 THEN 1 END)
+                              / NULLIF(COUNT(*), 0), 1) AS pct_ciclos_activos,
+                        COUNT(*) AS observaciones
+                    FROM base
+                    GROUP BY posicion
+                )
+                SELECT
+                    posicion,
+                    liq_disponible_med,
+                    SUM(liq_disponible_med) OVER (ORDER BY posicion) AS liq_disponible_acum,
+                    consumo_med,
+                    SUM(COALESCE(consumo_med, 0)) OVER (ORDER BY posicion) AS consumo_acum,
+                    ROUND(100.0 * consumo_med / NULLIF(liq_disponible_med, 0), 2) AS ratio_consumo,
+                    pct_ciclos_activos,
+                    observaciones
+                FROM por_posicion
+                ORDER BY posicion
+            """, {"dias": dias, "tipo": tipo})
+            rows = cur.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        for k, v in d.items():
+            if hasattr(v, "__float__"): d[k] = float(v)
+        result.append(d)
+    return jsonify({
+        "descripcion": (
+            "Profundidad del libro y consumo real por posicion. "
+            "liq_disponible_acum = USDT con prioridad sobre la siguiente posicion. "
+            "ratio_consumo = % del capital de ese slot que rota por ciclo de 2 min."
+        ),
+        "tipo": tipo,
+        "dias_analizados": dias,
+        "datos": result,
+    })
+
+
+@app.route("/api/inteligencia/precio_vs_fill")
+def api_intel_precio_vs_fill():
+    """
+    PRECIO RELATIVO VS TASA DE FILL
+    Cuanto precio sacrifico por estar fuera de la cabeza del libro,
+    y como afecta eso a que me llenen?
+    precio_relativo_pct = diferencia % vs el mejor precio del libro en ese
+    snapshot. En BUY: cuanto menos paga esa posicion vs el lider. En SELL:
+    cuanto mas cobra vs el lider.
+    pct_fill = % ciclos con fill confirmado en esa posicion.
+    eficiencia = pct_fill / |precio_relativo_pct|. Cuanto fill obtienes por
+    cada 0.1% de precio que resignas. Posicion con mayor eficiencia = mejor
+    tradeoff precio vs probabilidad de llenarse.
+    Ejemplo: posicion 2 con -0.15% precio y 25% fill tiene eficiencia 166.
+    Posicion 4 con -0.40% y 8% fill tiene eficiencia 20. Posicion 2 domina.
+    """
+    dias = int(request.args.get("dias", 7))
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                WITH con_lider AS (
+                    SELECT
+                        d.posicion,
+                        d.tipo,
+                        d.precio,
+                        d.completadas - LAG(d.completadas) OVER (
+                            PARTITION BY d.anunciante, d.tipo
+                            ORDER BY d.snapshot_timestamp
+                        ) AS delta_completadas,
+                        FIRST_VALUE(d.precio) OVER (
+                            PARTITION BY d.tipo, d.snapshot_timestamp
+                            ORDER BY CASE WHEN d.tipo = 'BUY' THEN -d.precio
+                                          ELSE d.precio END
+                        ) AS precio_lider
+                    FROM snapshots_detalle d
+                    WHERE d.snapshot_timestamp >= NOW() - (%(dias)s || ' days')::INTERVAL
+                ),
+                relativo AS (
+                    SELECT
+                        posicion,
+                        tipo,
+                        precio - precio_lider AS diff_precio,
+                        CASE WHEN precio_lider > 0
+                             THEN (precio - precio_lider) / precio_lider * 100
+                             ELSE NULL END AS diff_pct,
+                        CASE WHEN delta_completadas > 0 THEN 1 ELSE 0 END AS tuvo_fill
+                    FROM con_lider
+                    WHERE delta_completadas IS NOT NULL
+                )
+                SELECT
+                    tipo,
+                    posicion,
+                    COUNT(*) AS observaciones,
+                    ROUND(AVG(diff_precio)::numeric, 2) AS precio_relativo_med,
+                    ROUND(AVG(diff_pct)::numeric, 4) AS precio_relativo_pct,
+                    ROUND(100.0 * SUM(tuvo_fill) / NULLIF(COUNT(*), 0), 1) AS pct_fill,
+                    ROUND(
+                        (100.0 * SUM(tuvo_fill) / NULLIF(COUNT(*), 0))
+                        / NULLIF(ABS(AVG(diff_pct)), 0),
+                    2) AS eficiencia
+                FROM relativo
+                GROUP BY tipo, posicion
+                ORDER BY tipo, posicion
+            """, {"dias": dias})
+            rows = cur.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        for k, v in d.items():
+            if hasattr(v, "__float__"): d[k] = float(v)
+        result.append(d)
+    return jsonify({
+        "descripcion": (
+            "Precio relativo vs tasa de fill por posicion. "
+            "precio_relativo_pct = diferencia % vs mejor precio del libro en ese snapshot. "
+            "eficiencia = pct_fill / |precio_relativo_pct|: fill por cada % de precio resignado."
+        ),
+        "dias_analizados": dias,
+        "datos": result,
+    })
+
+
 @app.route("/api/heatmap")
 def api_heatmap():
     rows = obtener_heatmap()
@@ -3560,8 +3781,6 @@ def api_heatmap():
 
 @app.route("/api/velocidad")
 def api_velocidad():
-    """Histórico de disponible para un anunciante — para graficar su curva de consumo.
-    Params: anunciante (str), tipo (BUY|SELL), limit (int, default 50)"""
     anunciante = request.args.get("anunciante", "")
     tipo       = request.args.get("tipo", "BUY").upper()
     try:
@@ -3607,7 +3826,7 @@ def api_config():
                     try:
                         config[k] = cast(data[k])
                     except (ValueError, TypeError):
-                        errores[k] = f"valor inválido: {data[k]}"
+                        errores[k] = f"valor invalido: {data[k]}"
         if errores:
             return jsonify({"ok": False, "errores": errores}), 400
         return jsonify({"ok": True})
