@@ -9,7 +9,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, Response, request
 import psycopg2
+from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
 
 app = Flask(__name__)
 SANTIAGO_TZ = ZoneInfo("America/Santiago")
@@ -33,7 +35,29 @@ URL     = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 HEADERS = {"Content-Type": "application/json"}
 
 ultimo_estado = {}
+prev_detalle_raw = {}   # {tipo: {anunciante: (disponible, datetime)}}
 data_lock = threading.Lock()
+
+# ──────────────────────────────────────────────
+#  CONNECTION POOL
+# ──────────────────────────────────────────────
+_pool = None
+
+def init_pool():
+    global _pool
+    _pool = pg_pool.ThreadedConnectionPool(2, 10, DATABASE_URL)
+    print("✅ Connection pool listo (2-10 conexiones)")
+
+@contextmanager
+def get_conn():
+    conn = _pool.getconn()
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _pool.putconn(conn)
 
 # ──────────────────────────────────────────────
 #  BASE DE DATOS  (sin cambios respecto al Railway actual)
@@ -259,7 +283,8 @@ def obtener_anuncios(tipo):
         r = requests.post(URL, json=payload, headers=HEADERS, timeout=10)
         r.raise_for_status()
         return r.json().get("data", [])
-    except:
+    except Exception as e:
+        print(f"[ERROR obtener_anuncios {tipo}] {e}")
         return []
 
 def parsear_y_filtrar(anuncios, tipo):
@@ -343,23 +368,36 @@ def analizar(tab_compra, tab_venta):
         "color":                      color,
     }
 
-def build_detalle_memory(raw_anuncios, tipo):
-    """Construye el array detalle desde raw para el frontend (no va a DB)."""
-    side = "buy" if tipo == "BUY" else "sell"
+def build_detalle_memory(raw_anuncios, tipo, now_dt):
+    """Construye el array detalle desde raw para el frontend (no va a DB).
+    Calcula velocidad de consumo USDT/min comparando con el ciclo anterior."""
+    global prev_detalle_raw
+    prev = prev_detalle_raw.get(tipo, {})
     rows = []
+    nuevo_prev = {}
     for pos, item in enumerate(raw_anuncios[:20], 1):
-        adv   = item.get("adv", {})
-        trade = item.get("advertiser", {})
+        adv        = item.get("adv", {})
+        trade      = item.get("advertiser", {})
+        nombre     = trade.get("nickName", "")
+        disp       = float(adv.get("tradableQuantity", 0))
+        velocidad  = 0.0
+        if nombre in prev:
+            prev_disp, prev_dt = prev[nombre]
+            delta_min = (now_dt - prev_dt).total_seconds() / 60
+            if delta_min > 0 and prev_disp > disp:
+                velocidad = round((prev_disp - disp) / delta_min, 1)
+        nuevo_prev[nombre] = (disp, now_dt)
         rows.append({
             "posicion":    pos,
-            "anunciante":  trade.get("nickName", ""),
+            "anunciante":  nombre,
             "precio":      float(adv.get("price", 0)),
-            "disponible":  float(adv.get("tradableQuantity", 0)),
+            "disponible":  disp,
             "completadas": int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0),
             "tasa_exito":  round(float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100, 1),
             "es_merchant": trade.get("userType") == "merchant",
-            "velocidad":   0,
+            "velocidad":   velocidad,
         })
+    prev_detalle_raw[tipo] = nuevo_prev
     return rows
 
 def ciclo_colector():
@@ -385,8 +423,9 @@ def ciclo_colector():
                 hora = datetime.now(SANTIAGO_TZ).hour
                 guardar_detalle(ts, hora, raw_compra, raw_venta)
                 # Detalle en memoria para el nuevo frontend (no va a DB)
-                estado["detalle_compra"] = build_detalle_memory(raw_compra, "BUY")
-                estado["detalle_venta"]  = build_detalle_memory(raw_venta,  "SELL")
+                now_dt = datetime.now(SANTIAGO_TZ)
+                estado["detalle_compra"] = build_detalle_memory(raw_compra, "BUY",  now_dt)
+                estado["detalle_venta"]  = build_detalle_memory(raw_venta,  "SELL", now_dt)
                 with data_lock:
                     ultimo_estado.update(estado)
                 print(f"[{estado['timestamp']}] Spread pond: {estado['spread_pond_pct']}% — {estado['estado']} | Detalle: {len(raw_compra)+len(raw_venta)} anunciantes guardados")
@@ -3289,22 +3328,21 @@ def api_precios():
     """Serie completa de precios para el gráfico interactivo.
     Devuelve tiempo en Unix UTC (segundos) + ambos precios ponderados.
     Lightweight Charts v4 requiere timestamps estrictamente crecientes — se garantiza."""
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-    # Santiago en invierno (junio) = UTC-4. Offset fijo, sin DST en junio.
-    SANTIAGO_OFFSET = _td(hours=-4)
+    from datetime import datetime as _dt, timezone as _tz
     rows = obtener_precios_historico()
     out_compra, out_venta = [], []
     prev_unix = 0
     for r in rows:
         ts = r["timestamp"]
-        # Normalizar a string "YYYY-MM-DDTHH:MM:SS"
-        ts_str = str(ts)[:19].replace(" ", "T")
         try:
-            # Parsear como naive datetime (hora Santiago local almacenada en DB)
-            dt_naive = _dt.fromisoformat(ts_str)
-            # Tratar como Santiago local → convertir a UTC → Unix
-            dt_utc = (dt_naive - SANTIAGO_OFFSET).replace(tzinfo=_tz.utc)
-            unix = int(dt_utc.timestamp())
+            # Si el timestamp ya tiene tzinfo, usarlo directo; si no, asumir Santiago
+            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                dt_aware = ts
+            else:
+                ts_str = str(ts)[:19].replace(" ", "T")
+                dt_naive = _dt.fromisoformat(ts_str)
+                dt_aware = dt_naive.replace(tzinfo=SANTIAGO_TZ)
+            unix = int(dt_aware.astimezone(_tz.utc).timestamp())
         except Exception:
             continue
         # Garantizar estrictamente creciente (Lightweight Charts lo exige)
@@ -3382,40 +3420,48 @@ def api_intel_anunciantes():
 
 @app.route("/api/inteligencia/fill")
 def api_intel_fill():
-    """Velocidad de fill por posición y hora — últimos 7 días"""
+    """Velocidad de fill por posición y hora — últimos 7 días.
+    Usa LAG() en lugar de subquery correlacionada (O(n) vs O(n²))."""
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                WITH consumos AS (
+                WITH lagged AS (
                     SELECT
-                        a.anunciante, a.hora, a.posicion,
-                        a.disponible - b.disponible AS consumo,
-                        EXTRACT(EPOCH FROM (b.snapshot_timestamp - a.snapshot_timestamp))/60 AS delta_min
-                    FROM snapshots_detalle a
-                    JOIN snapshots_detalle b
-                      ON a.anunciante = b.anunciante
-                     AND a.tipo = b.tipo
-                     AND b.snapshot_timestamp = (
-                         SELECT MIN(c.snapshot_timestamp)
-                         FROM snapshots_detalle c
-                         WHERE c.anunciante = a.anunciante
-                           AND c.tipo = a.tipo
-                           AND c.snapshot_timestamp > a.snapshot_timestamp
-                     )
-                    WHERE a.tipo = 'BUY'
-                      AND a.es_merchant = true
-                      AND a.snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                        hora, posicion,
+                        disponible,
+                        LAG(disponible) OVER (
+                            PARTITION BY anunciante, tipo
+                            ORDER BY snapshot_timestamp
+                        ) AS disp_prev,
+                        EXTRACT(EPOCH FROM (
+                            snapshot_timestamp -
+                            LAG(snapshot_timestamp) OVER (
+                                PARTITION BY anunciante, tipo
+                                ORDER BY snapshot_timestamp
+                            )
+                        )) / 60 AS delta_min
+                    FROM snapshots_detalle
+                    WHERE snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                      AND es_merchant = true
+                      AND tipo = 'BUY'
                 )
                 SELECT
                     hora,
                     CASE WHEN posicion <= 3 THEN 'top1-3'
                          WHEN posicion <= 6 THEN 'mid4-6'
                          ELSE 'back7+' END AS rango_pos,
-                    ROUND(AVG(CASE WHEN consumo > 10 AND delta_min BETWEEN 1 AND 6
-                                   THEN consumo END)::numeric, 0) AS consumo_med,
-                    COUNT(CASE WHEN consumo > 10 AND delta_min BETWEEN 1 AND 6
-                               THEN 1 END)                        AS eventos
-                FROM consumos
+                    ROUND(AVG(
+                        CASE WHEN disp_prev - disponible > 10
+                              AND delta_min BETWEEN 1 AND 6
+                             THEN disp_prev - disponible END
+                    )::numeric, 0) AS consumo_med,
+                    COUNT(
+                        CASE WHEN disp_prev - disponible > 10
+                              AND delta_min BETWEEN 1 AND 6
+                             THEN 1 END
+                    ) AS eventos
+                FROM lagged
+                WHERE disp_prev IS NOT NULL
                 GROUP BY hora, rango_pos
                 ORDER BY hora, rango_pos
             """)
@@ -3473,11 +3519,29 @@ def api_intel_precio_patron():
             """)
             rows = cur.fetchall()
     return jsonify([dict(r) for r in rows])
+
+@app.route("/api/heatmap")
+def api_heatmap():
     rows = obtener_heatmap()
     for r in rows:
         for k, v in r.items():
             if hasattr(v, "__float__"): r[k] = float(v)
     return jsonify(rows)
+
+@app.route("/api/velocidad/<anunciante>/<tipo>")
+def api_velocidad(anunciante, tipo):
+    """Histórico de disponible para un anunciante — para graficar su curva de consumo."""
+    limit = int(request.args.get("limit", 50))
+    rows = obtener_velocidad_anunciante(anunciante, tipo.upper(), limit)
+    out = []
+    for r in rows:
+        ts = r["snapshot_timestamp"]
+        disp = r["disponible"]
+        out.append({
+            "timestamp": str(ts)[:19],
+            "disponible": float(disp) if disp is not None else None,
+        })
+    return jsonify(out)
 
 @app.route("/api/count")
 def api_count():
@@ -3509,10 +3573,12 @@ def api_reset():
 #  INICIO
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
+    init_pool()
     init_db()
     threading.Thread(target=ciclo_colector, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 else:
+    init_pool()
     init_db()
     threading.Thread(target=ciclo_colector, daemon=True).start()
