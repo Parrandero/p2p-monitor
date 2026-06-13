@@ -3309,9 +3309,15 @@ def clean(data):
     for k, v in data.items():
         if k in ("detalle_compra", "detalle_venta"):
             out[k] = v
-        elif hasattr(v, "__float__"):
+        elif isinstance(v, bool):
+            out[k] = v
+        elif isinstance(v, int):
+            out[k] = v
+        elif isinstance(v, float):
+            out[k] = v
+        elif hasattr(v, "__float__"):   # Decimal de psycopg2
             out[k] = float(v)
-        elif hasattr(v, "isoformat"):
+        elif hasattr(v, "isoformat"):   # datetime
             out[k] = str(v)
         else:
             out[k] = v
