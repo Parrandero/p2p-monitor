@@ -3203,7 +3203,7 @@ function Inteligencia() {
                   <td className="tnum">{fN(r.liq_disponible_acum)} U</td>
                   <td className="tnum">{fN(r.consumo_acum)} U</td>
                   <td className="tnum" style={{color:c,fontWeight:600}}>{ratio.toFixed(1)}% <span style={{fontSize:11,fontWeight:400}}>{label}</span></td>
-                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.muestras}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.observaciones||r.muestras||"—"}</td>
                 </tr>;
               })}</tbody>
             </table>
@@ -3232,14 +3232,15 @@ function Inteligencia() {
                 const ef=parseFloat(r.eficiencia||0);
                 const pct=parseFloat(r.pct_fill||0);
                 const precio_rel=parseFloat(r.precio_relativo_pct||0);
-                const c=ef>=50?"#35e07a":ef>=20?"#ffd740":ef>=5?"#ff9100":"var(--text-3)";
+                const efOk=Math.abs(precio_rel)>=0.001;
+                const c=!efOk?"var(--text-3)":ef>=50?"#35e07a":ef>=20?"#ffd740":ef>=5?"#ff9100":"var(--text-3)";
                 const pos=r.rango_pos||(r.tipo+" P"+r.posicion);
                 return <tr key={i}>
                   <td style={{fontWeight:600,color:"var(--accent)"}}>{pos}</td>
                   <td className="tnum" style={{color:precio_rel<=0?"#35e07a":"#ff5d6c",fontWeight:600}}>{precio_rel>=0?"+":""}{precio_rel.toFixed(3)}%</td>
                   <td className="tnum" style={{color:pct>=70?"#35e07a":pct>=40?"#ffd740":"var(--text-3)",fontWeight:600}}>{pct.toFixed(1)}%</td>
-                  <td className="tnum" style={{color:c,fontWeight:600}}>{ef.toFixed(1)}</td>
-                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.muestras}</td>
+                  <td className="tnum" style={{color:c,fontWeight:600}}>{efOk?ef.toFixed(1):"—"}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.observaciones||r.muestras||"—"}</td>
                 </tr>;
               })}</tbody>
             </table>
