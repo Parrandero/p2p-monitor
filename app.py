@@ -31,7 +31,8 @@ config = {
     "COMISION_BN":          0.0018,
     # Spread neto mínimo (después de comisiones) para considerar operable.
     "SPREAD_MIN_OPERATIVO": 0.35,
-    "TOP_ANUNCIOS":         20,
+    "TOP_ANUNCIOS":         80,   # 4 páginas × 20 = 80 por lado (detalle/profundidad)
+    "ANALISIS_TOP":         20,   # cabecera del libro p/ spread y liquidez (mantiene baseline)
 }
 config_lock = threading.Lock()
 
@@ -124,6 +125,10 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_detalle_anunciante
                 ON snapshots_detalle(anunciante, tipo)
             """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_detalle_posicion
+                ON snapshots_detalle(posicion, tipo, snapshot_timestamp)
+            """)
         conn.commit()
     print("\u2705 Base de datos lista (snapshots + snapshots_detalle)")
 
@@ -172,9 +177,11 @@ def guardar_snapshot(m):
         conn.commit()
 
 def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
-    """Guarda los top 20 anunciantes de cada lado SIN filtros de mínimos"""
+    """Guarda los top 80 anunciantes de cada lado SIN filtros de mínimos"""
+    with config_lock:
+        top = config["TOP_ANUNCIOS"]
     rows = []
-    for pos, item in enumerate(anuncios_raw_compra[:20], 1):
+    for pos, item in enumerate(anuncios_raw_compra[:top], 1):
         adv   = item.get("adv", {})
         trade = item.get("advertiser", {})
         rows.append((
@@ -186,7 +193,7 @@ def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
             float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100,
             bool(trade.get("userType") == "merchant"),
         ))
-    for pos, item in enumerate(anuncios_raw_venta[:20], 1):
+    for pos, item in enumerate(anuncios_raw_venta[:top], 1):
         adv   = item.get("adv", {})
         trade = item.get("advertiser", {})
         rows.append((
@@ -274,21 +281,36 @@ def obtener_velocidad_anunciante(anunciante, tipo, limit=50):
 #  COLECTOR  (sin cambios respecto al Railway actual)
 # ──────────────────────────────────────────────
 def obtener_anuncios(tipo):
+    """Trae los top TOP_ANUNCIOS anuncios paginando el libro de Binance.
+    Binance topa 'rows' en 20 por pagina -> hay que recorrer varias paginas."""
     with config_lock:
         c = dict(config)
-    payload = {
-        "asset": c["MONEDA"], "fiat": c["FIAT"],
-        "merchantCheck": False, "page": 1,
-        "publisherType": None, "rows": c["TOP_ANUNCIOS"],
-        "tradeType": tipo,
-    }
-    try:
-        r = requests.post(URL, json=payload, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        return r.json().get("data", [])
-    except Exception as e:
-        print(f"[ERROR obtener_anuncios {tipo}] {e}")
-        return []
+    top        = c["TOP_ANUNCIOS"]
+    POR_PAGINA = 20                       # limite duro del endpoint P2P de Binance
+    n_paginas  = (top + POR_PAGINA - 1) // POR_PAGINA
+    resultados = []
+    for page in range(1, n_paginas + 1):
+        payload = {
+            "asset": c["MONEDA"], "fiat": c["FIAT"],
+            "merchantCheck": False, "page": page,
+            "publisherType": None, "rows": POR_PAGINA,
+            "tradeType": tipo,
+        }
+        try:
+            r = requests.post(URL, json=payload, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            data = r.json().get("data", []) or []
+        except Exception as e:
+            print(f"[ERROR obtener_anuncios {tipo} p{page}] {e}")
+            break
+        if not data:
+            break                         # el libro no tiene mas anuncios
+        resultados.extend(data)
+        if len(data) < POR_PAGINA:
+            break                         # ultima pagina real del libro
+        if page < n_paginas:
+            time.sleep(0.3)               # respetar rate-limit de Binance
+    return resultados[:top]
 
 def parsear_y_filtrar(anuncios, tipo):
     with config_lock:
@@ -381,10 +403,12 @@ def build_detalle_memory(raw_anuncios, tipo, now_dt):
     """Construye el array detalle desde raw para el frontend (no va a DB).
     Calcula velocidad de consumo USDT/min comparando con el ciclo anterior."""
     global prev_detalle_raw
+    with config_lock:
+        top = config["TOP_ANUNCIOS"]
     prev = prev_detalle_raw.get(tipo, {})
     rows = []
     nuevo_prev = {}
-    for pos, item in enumerate(raw_anuncios[:20], 1):
+    for pos, item in enumerate(raw_anuncios[:top], 1):
         adv        = item.get("adv", {})
         trade      = item.get("advertiser", {})
         nombre     = trade.get("nickName", "")
@@ -409,12 +433,32 @@ def build_detalle_memory(raw_anuncios, tipo, now_dt):
     prev_detalle_raw[tipo] = nuevo_prev
     return rows
 
+def purgar_detalle_antiguo(dias=30):
+    """Borra filas de snapshots_detalle con más de N días. Se ejecuta 1x/día."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM snapshots_detalle
+                WHERE snapshot_timestamp < NOW() - (%s || ' days')::INTERVAL
+            """, (dias,))
+            eliminadas = cur.rowcount
+        conn.commit()
+    if eliminadas > 0:
+        print(f"[PURGA] {eliminadas:,} filas eliminadas (>{dias} días)")
+    return eliminadas
+
 def ciclo_colector():
     print("[COLECTOR] Iniciando thread...")
     time.sleep(5)
     print("[COLECTOR] Primer ciclo comenzando")
+    _ultima_purga = None   # controla que la purga se ejecute 1x/día
     while True:
         try:
+            # ── Purga diaria ──────────────────────────────────
+            hoy = datetime.now(SANTIAGO_TZ).date()
+            if _ultima_purga != hoy:
+                purgar_detalle_antiguo(dias=30)
+                _ultima_purga = hoy
             print("[COLECTOR] Consultando Binance BUY...")
             raw_compra = obtener_anuncios("BUY")
             print(f"[COLECTOR] BUY raw: {len(raw_compra)} anuncios")
@@ -422,8 +466,12 @@ def ciclo_colector():
             raw_venta = obtener_anuncios("SELL")
             print(f"[COLECTOR] SELL raw: {len(raw_venta)} anuncios")
 
-            tab_compra = parsear_y_filtrar(raw_compra, "BUY")
-            tab_venta  = parsear_y_filtrar(raw_venta,  "SELL")
+            with config_lock:
+                anal_top = config["ANALISIS_TOP"]
+            # Spread/liquidez de cabecera: solo el top del libro (baseline comparable).
+            # El detalle/profundidad si usa las 80 posiciones (guardar_detalle).
+            tab_compra = parsear_y_filtrar(raw_compra[:anal_top], "BUY")
+            tab_venta  = parsear_y_filtrar(raw_venta[:anal_top],  "SELL")
 
             estado = analizar(tab_compra, tab_venta)
             if estado:
@@ -943,6 +991,24 @@ body {
   .velocity { grid-template-columns: 1fr; gap: 14px; }
   .vel-meter { min-width: 0; justify-content: space-between; }
 }
+
+/* ---------- Intel explain + rotación ---------- */
+.intel-explain { font-size:12px; color:var(--text-2); line-height:1.6; margin-top:14px; padding:12px 14px; border-radius:10px; background:var(--bg-2); border:1px solid var(--line-soft); }
+.intel-explain b { color:var(--text); }
+
+/* ---------- Backup banner & panel ---------- */
+.backup-banner { display:flex; align-items:center; gap:12px; margin:10px 0 0; padding:11px 16px; border-radius:12px; background:var(--warn-soft); border:1px solid var(--warn); font-size:13px; color:var(--text); }
+.bb-dot { width:9px; height:9px; border-radius:50%; background:var(--warn); flex:none; box-shadow:0 0 0 0 var(--warn); animation:pulse 1.6s infinite; }
+.bb-txt { flex:1; }
+.bb-go { font-family:var(--font); font-size:12.5px; font-weight:600; color:var(--bg); background:var(--warn); border:none; padding:7px 14px; border-radius:8px; cursor:pointer; }
+.bb-x { background:transparent; border:none; color:var(--text-3); cursor:pointer; font-size:14px; line-height:1; }
+.backup-wrap { max-width:680px; }
+.backup-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:16px 0 4px; }
+.backup-actions { display:flex; align-items:center; gap:14px; margin-top:12px; flex-wrap:wrap; }
+.backup-msg { font-size:12.5px; color:var(--buy); margin-top:12px; }
+.backup-last { font-size:12px; color:var(--text-3); }
+.backup-help { font-size:12px; color:var(--text-2); line-height:1.65; margin-top:20px; padding:14px 16px; border-radius:10px; background:var(--bg-2); border:1px solid var(--line-soft); }
+.backup-help code { font-family:var(--mono); background:var(--bg-3); padding:1px 6px; border-radius:5px; font-size:11.5px; color:var(--text); }
 
 </style>
 </head>
@@ -2146,7 +2212,7 @@ function TopBar({ snap, secondsLeft, cycleMs }) {
 
 /* ---------- Tab bar ---------- */
 function Tabs({ tab, setTab }) {
-  const items = [["tr", "Tiempo Real"], ["hist", "Histórico"], ["precio", "Precio"], ["intel", "Inteligencia"], ["heat", "Mapa de Calor"]];
+  const items = [["tr", "Tiempo Real"], ["hist", "Histórico"], ["precio", "Precio"], ["intel", "Inteligencia"], ["heat", "Mapa de Calor"], ["rot", "Rotación"], ["backup", "Backup"]];
   return (
     <nav className="tabbar" role="tablist">
       {items.map(([k, label]) => (
@@ -3115,25 +3181,29 @@ function Inteligencia() {
 
       {seccion==="fill" && fill && (
         <section className="chart-card">
-          <div className="card-head"><h3>¿Cuánto te compran según dónde estés en el libro?</h3><span className="card-sub">USDT por orden recibida · posiciones 1-3 vs 4-6 vs 7+ · últimos 7 días</span></div>
+          <div className="card-head"><h3>¿Cuánto te compran según dónde estés en el libro?</h3><span className="card-sub">USDT por orden recibida · por rango de posición (libro top80) · últimos 7 días</span></div>
           <div className="intel-scroll">
             <table className="intel-table">
               <thead><tr>
                 <th title="Hora del día en horario Santiago">Hora</th>
-                <th title="Si publicás tu anuncio en las posiciones 1, 2 o 3 del libro (los primeros que ve el usuario), cuántos USDT te compran por orden recibida en promedio. Mayor número = mejor." style={{color:"#35e07a"}}>📍 Posición 1-3 (primero)</th>
-                <th title="Si estás en posiciones 4, 5 o 6, cuántos USDT te compran por orden. A veces similar al top, a veces menos.">📍 Posición 4-6 (medio)</th>
-                <th title="Si estás en posiciones 7 o más atrás, cuántos USDT te compran por orden. En horas de baja liquidez suele ser muy poco." style={{color:"var(--text-3)"}}>📍 Posición 7+ (atrás)</th>
+                <th title="Posiciones 1-3: la cabeza del libro, los primeros que ve el usuario. USDT por orden recibida." style={{color:"#35e07a"}}>📍 1-3 (cabeza)</th>
+                <th title="Posiciones 4 a 10: zona alta-media del libro.">4-10</th>
+                <th title="Posiciones 11 a 20: zona media.">11-20</th>
+                <th title="Posiciones 21 a 40: zona profunda (visible recién con top80).">21-40</th>
+                <th title="Posiciones 41 en adelante: la cola del libro." style={{color:"var(--text-3)"}}>41+</th>
               </tr></thead>
               <tbody>{Array.from({length:24},(_,h)=>{
                 const get=(rp)=>{const r=fill.find(f=>parseInt(f.hora)===h&&f.rango_pos===rp); return r&&r.consumo_med?`${fN(r.consumo_med)} U`:"–";};
-                const top=fill.find(f=>parseInt(f.hora)===h&&f.rango_pos==="top1-3");
+                const top=fill.find(f=>parseInt(f.hora)===h&&f.rango_pos==="p01-03");
                 const topVal=top&&top.consumo_med?parseFloat(top.consumo_med):0;
                 const rowColor=topVal>=1500?"rgba(53,224,122,0.05)":topVal>=800?"rgba(255,215,64,0.04)":"transparent";
                 return <tr key={h} style={{background:rowColor}}>
                   <td className="tnum"><b>{String(h).padStart(2,"0")}h</b></td>
-                  <td className="tnum" style={{color:"#35e07a",fontWeight:topVal>=1500?700:400}}>{get("top1-3")}</td>
-                  <td className="tnum">{get("mid4-6")}</td>
-                  <td className="tnum" style={{color:"var(--text-3)"}}>{get("back7+")}</td>
+                  <td className="tnum" style={{color:"#35e07a",fontWeight:topVal>=1500?700:400}}>{get("p01-03")}</td>
+                  <td className="tnum">{get("p04-10")}</td>
+                  <td className="tnum">{get("p11-20")}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{get("p21-40")}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{get("p41+")}</td>
                 </tr>;
               })}</tbody>
             </table>
@@ -3187,7 +3257,7 @@ function Inteligencia() {
           <div className="intel-scroll">
             <table className="intel-table">
               <thead><tr>
-                <th title="Posición en el libro de órdenes: top1-3 = los primeros que ve el usuario, mid4-6 = zona media, back7+ = posiciones alejadas del top.">Posición</th>
+                <th title="Posición individual en el libro (1 = mejor precio). Con el libro ampliado a 80 ves toda la profundidad real.">Posición</th>
                 <th title="USDT acumulados disponibles hasta esa posición. Cuánta liquidez existe con prioridad sobre ti si estás en esa posición.">Liq. acumulada (USDT)</th>
                 <th title="USDT consumidos (órdenes recibidas) en esa posición en el período. Cuánto del capital en esa zona rotó.">Consumo acum. (USDT)</th>
                 <th title="Porcentaje de la liquidez disponible que fue consumida. 100% = toda la liquidez rotó. Bajo = posición 'muerta'.">Ratio consumo</th>
@@ -3211,7 +3281,7 @@ function Inteligencia() {
           <div className="intel-explain">
             <b>Qué muestra:</b> para cada zona del libro (top, medio, atrás), cuánta liquidez total había y cuánto de eso realmente rotó como órdenes recibidas.<br/>
             <b>Ratio consumo:</b> es la métrica clave. Un ratio alto (verde, 🔥) significa que esa zona del libro tiene demanda real — los compradores llegan hasta ahí. Un ratio bajo (❌) significa que casi nadie llega a esa profundidad, no vale la pena estar tan atrás.<br/>
-            <b>Estrategia:</b> si el ratio de top1-3 es 60% pero el de back7+ es 5%, estar en posición 7+ es básicamente invisible. Calcula el costo de bajar tu precio para entrar al top.
+            <b>Estrategia:</b> mirá hasta qué posición el ratio se mantiene alto: esa es la profundidad hasta donde llega la demanda real. Más allá, estar en el libro es casi invisible. Con 80 posiciones ahora ves dónde está el verdadero corte.
           </div>
         </section>
       )}
@@ -3256,7 +3326,217 @@ function Inteligencia() {
     </div>
   );
 }
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia };
+function Backup() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [dias, setDias] = React.useState(30);
+  const [tipo, setTipo] = React.useState("ALL");
+  const [fmt, setFmt]   = React.useState("csv");
+  const [msg, setMsg]   = React.useState("");
+  const last = (() => { try { return parseInt(localStorage.getItem("ua_p2p_last_backup") || "0"); } catch (e) { return 0; } })();
+  const lastTxt = last ? new Date(last).toLocaleString("es-CL") : "nunca";
+  const diasDesde = last ? Math.floor((Date.now() - last) / 86400000) : null;
+  const descargar = () => {
+    const url = B + "/api/export/detalle?dias=" + dias + "&tipo=" + tipo + "&fmt=" + fmt;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "detalle_" + tipo + "_" + dias + "d." + fmt;
+    document.body.appendChild(a); a.click(); a.remove();
+    try { localStorage.setItem("ua_p2p_last_backup", String(Date.now())); } catch (e) {}
+    setMsg("✅ Descarga iniciada. Guardá el archivo en Drive o un disco externo para tener tu copia.");
+  };
+  return (
+    <div className="view">
+      <section className="chart-card backup-wrap">
+        <div className="card-head"><h3>Backup / Exportar base de datos</h3><span className="card-sub">descarga el detalle por anunciante</span></div>
+        <p className="backup-last">Última copia registrada en este navegador: <b>{lastTxt}</b>{diasDesde !== null ? " (hace " + diasDesde + " días)" : ""}.</p>
+        <div className="backup-grid">
+          <div className="f-item"><label>Días de datos</label>
+            <input type="number" min="1" max="365" value={dias} onChange={e => setDias(parseInt(e.target.value) || 1)} /></div>
+          <div className="f-item"><label>Lado</label>
+            <select value={tipo} onChange={e => setTipo(e.target.value)}>
+              <option value="ALL">Ambos (BUY+SELL)</option>
+              <option value="BUY">Solo BUY</option>
+              <option value="SELL">Solo SELL</option>
+            </select></div>
+          <div className="f-item"><label>Formato</label>
+            <select value={fmt} onChange={e => setFmt(e.target.value)}>
+              <option value="csv">CSV (Excel)</option>
+              <option value="json">JSON</option>
+            </select></div>
+        </div>
+        <div className="backup-actions">
+          <button className="btn-apply dirty" onClick={descargar}>⬇ Descargar {fmt.toUpperCase()}</button>
+          <span className="backup-last">Genera: <code>detalle_{tipo}_{dias}d.{fmt}</code></span>
+        </div>
+        {msg && <div className="backup-msg">{msg}</div>}
+        <div className="backup-help">
+          <b>Cómo hacerlo vos mismo sin esta página:</b> abrí en el navegador la dirección de tu monitor seguida de:<br/>
+          <code>/api/export/detalle?dias=30&tipo=ALL&fmt=csv</code><br/>
+          Cambiá <code>dias</code> por los que quieras, <code>tipo</code> por BUY/SELL/ALL y <code>fmt</code> por csv/json. El archivo se descarga solo.<br/><br/>
+          <b>Recomendación:</b> exportá al menos una vez por semana y guardá el CSV en Drive o disco externo. La base se purga automáticamente a los 30 días, así que un backup mensual conserva tu historia completa.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function BackupBanner({ onGo }) {
+  const [dismissed, setDismissed] = React.useState(false);
+  const last = (() => { try { return parseInt(localStorage.getItem("ua_p2p_last_backup") || "0"); } catch (e) { return 0; } })();
+  const diasDesde = last ? Math.floor((Date.now() - last) / 86400000) : null;
+  const vencido = diasDesde === null || diasDesde >= 7;
+  if (dismissed || !vencido) return null;
+  return (
+    <div className="backup-banner">
+      <span className="bb-dot"></span>
+      <span className="bb-txt">{diasDesde === null ? "Todavía no registraste ninguna copia de la base de datos." : ("Tu última copia fue hace " + diasDesde + " días.")} Conviene exportar un backup.</span>
+      <button className="bb-go" onClick={onGo}>Hacer backup</button>
+      <button className="bb-x" onClick={() => setDismissed(true)} aria-label="cerrar">✕</button>
+    </div>
+  );
+}
+
+function RotNumIn({ lbl, val, set, step }) {
+  return (
+    <div className="f-item"><label>{lbl}</label>
+      <input type="number" step={step || 1} value={val} onChange={e => set(parseFloat(e.target.value) || 0)} /></div>
+  );
+}
+
+function RotacionCalc() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [tipo, setTipo] = React.useState("BUY");
+  const [data, setData] = React.useState(null);
+  const [loading, setLoading] = React.useState(true);
+  const [modo, setModo] = React.useState("precio");
+  const [capital, setCapital] = React.useState(10000);
+  const [orden, setOrden] = React.useState(2000);
+  const [dist, setDist] = React.useState(0.3);
+  const [pos, setPos] = React.useState(8);
+  const [horas, setHoras] = React.useState(8);
+  const [spreadBase, setSpreadBase] = React.useState(0.5);
+  const [comision, setComision] = React.useState(0.36);
+  const [overhead, setOverhead] = React.useState(10);
+
+  React.useEffect(() => {
+    setLoading(true);
+    fetch(B + "/api/inteligencia/rotacion?tipo=" + tipo + "&dias=7")
+      .then(r => r.json()).then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [tipo]);
+
+  const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("es-CL", { maximumFractionDigits: d });
+
+  if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
+  if (!data || !data.por_precio) return <div className="intel-loading">Sin datos suficientes todavía.</div>;
+
+  const nivel = (() => {
+    if (modo === "posicion") {
+      const arr = data.por_posicion || [];
+      let row = arr.find(r => parseInt(r.posicion) === parseInt(pos));
+      if (!row && arr.length) row = arr.reduce((a, b) => Math.abs(b.posicion - pos) < Math.abs(a.posicion - pos) ? b : a);
+      return row ? { caudal: row.caudal_min, distancia: row.distancia_med || 0, pct: row.pct_presencia } : null;
+    }
+    const arr = data.por_precio || [];
+    const row = arr.reduce((a, b) => a == null ? b : (Math.abs(b.banda_pct - dist) < Math.abs(a.banda_pct - dist) ? b : a), null);
+    return row ? { caudal: row.caudal_min, distancia: dist, pct: row.pct_presencia } : null;
+  })();
+
+  const proyectar = (caudal, distancia) => {
+    const tLleno = caudal > 0 ? orden / caudal : Infinity;
+    const tVuelta = 2 * tLleno + overhead;
+    const rotDia = (isFinite(tVuelta) && tVuelta > 0) ? (horas * 60) / tVuelta : 0;
+    const spreadVuelta = spreadBase + 2 * distancia - comision;
+    const ganDia = rotDia * orden * spreadVuelta / 100;
+    return { tLleno, tVuelta, rotDia, spreadVuelta, ganDia };
+  };
+  const p = nivel ? proyectar(nivel.caudal, nivel.distancia) : null;
+
+  const sweep = (data.por_precio || []).map(r => {
+    const pr = proyectar(r.caudal_min, r.banda_pct);
+    return { banda: r.banda_pct, caudal: r.caudal_min, pct: r.pct_presencia, tVuelta: pr.tVuelta, rotDia: pr.rotDia, spreadVuelta: pr.spreadVuelta, ganDia: pr.ganDia };
+  });
+  const mejor = sweep.reduce((a, b) => (b.ganDia > (a ? a.ganDia : -1) ? b : a), null);
+
+  return (
+    <div className="view tone-accent">
+      <section className="chart-card">
+        <div className="card-head"><h3>Calculadora de rotación de capital</h3><span className="card-sub">proyección: velocidad de llenado, rotaciones/día y $/día · datos {data.dias}d</span></div>
+
+        <div className="rank-toggle" style={{ marginBottom: 14, display: "inline-flex", flexWrap: "wrap" }}>
+          <button className={tipo === "BUY" ? "on" : ""} onClick={() => setTipo("BUY")}>Lado BUY</button>
+          <button className={tipo === "SELL" ? "on" : ""} onClick={() => setTipo("SELL")}>Lado SELL</button>
+          <button className={modo === "precio" ? "on" : ""} onClick={() => setModo("precio")}>Por % al líder</button>
+          <button className={modo === "posicion" ? "on" : ""} onClick={() => setModo("posicion")}>Por posición</button>
+        </div>
+
+        <div className="filters-grid">
+          <RotNumIn lbl="Capital total (USDT)" val={capital} set={setCapital} step={500} />
+          <RotNumIn lbl="Tamaño por orden (USDT)" val={orden} set={setOrden} step={100} />
+          {modo === "precio"
+            ? <RotNumIn lbl="Distancia al líder (%)" val={dist} set={setDist} step={0.1} />
+            : <RotNumIn lbl="Posición en el libro" val={pos} set={setPos} step={1} />}
+          <RotNumIn lbl="Horas operables/día" val={horas} set={setHoras} step={1} />
+          <RotNumIn lbl="Spread base cabeza (%)" val={spreadBase} set={setSpreadBase} step={0.1} />
+          <RotNumIn lbl="Comisión total ida+vuelta (%)" val={comision} set={setComision} step={0.01} />
+          <RotNumIn lbl="Overhead por vuelta (min)" val={overhead} set={setOverhead} step={1} />
+        </div>
+
+        {p && nivel ? (
+          <div className="stat-cards" style={{ marginTop: 16 }}>
+            <div className="statcard"><div className="statcard-label">Caudal del nivel</div><div className="statcard-val">{fmt(nivel.caudal, 0)} <span style={{ fontSize: 13 }}>U/min</span></div></div>
+            <div className="statcard"><div className="statcard-label">Llenado de una orden</div><div className="statcard-val">{fmt(p.tLleno, 0)} <span style={{ fontSize: 13 }}>min</span></div></div>
+            <div className="statcard"><div className="statcard-label">Rotaciones/día</div><div className="statcard-val">{fmt(p.rotDia, 1)}</div></div>
+            <div className="statcard"><div className="statcard-label">Spread por vuelta</div><div className="statcard-val">{fmt(p.spreadVuelta, 2)}%</div></div>
+            <div className="statcard"><div className="statcard-label">Ganancia/día</div><div className="statcard-val">${fmt(p.ganDia, 0)}</div></div>
+            <div className="statcard"><div className="statcard-label">Ganancia/mes</div><div className="statcard-val">${fmt(p.ganDia * 30, 0)}</div></div>
+            <div className="statcard"><div className="statcard-label">ROI mensual s/capital</div><div className="statcard-val">{capital > 0 ? fmt(p.ganDia * 30 / capital * 100, 1) : "—"}%</div></div>
+            <div className="statcard"><div className="statcard-label">Presencia del nivel</div><div className="statcard-val">{fmt(nivel.pct, 0)}%</div></div>
+          </div>
+        ) : <div className="intel-loading">No hay caudal medible en ese nivel.</div>}
+
+        <div className="intel-explain">
+          <b>Cómo leerlo:</b> el <b>caudal</b> es cuántos USDT/min absorbe ese nivel del libro según tus datos reales. El <b>llenado</b> es cuánto tarda en venderse/comprarse una orden de tu tamaño. La <b>vuelta</b> = llenar la compra + llenar la venta + overhead (transferencias). Más lejos del líder = más spread por vuelta pero menos rotaciones.<br/>
+          <b>Ojo:</b> el caudal mide a los que hoy ocupan cada nivel (merchants con reputación). Como Bronze tu llenado real puede ser más lento al mismo precio: tomalo como mejor caso.
+        </div>
+      </section>
+
+      <section className="chart-card">
+        <div className="card-head"><h3>Punto óptimo: spread vs velocidad</h3><span className="card-sub">$/día por distancia al líder · resaltado el mejor</span></div>
+        <div className="intel-scroll">
+          <table className="intel-table">
+            <thead><tr>
+              <th title="Qué tan lejos del mejor precio te colocás.">Distancia al líder</th>
+              <th title="USDT por minuto que absorbe ese nivel.">Caudal (U/min)</th>
+              <th title="% de ciclos en que ese nivel recibió órdenes.">Presencia</th>
+              <th title="Minutos para una vuelta completa (compra+venta+overhead).">T. vuelta</th>
+              <th title="Cuántas vueltas completás al día con tus horas.">Rotaciones/día</th>
+              <th title="Spread neto que capturás por vuelta a esa distancia.">Spread/vuelta</th>
+              <th title="Ganancia neta diaria estimada.">Ganancia/día</th>
+            </tr></thead>
+            <tbody>{sweep.map((r, i) => {
+              const best = mejor && r.banda === mejor.banda;
+              return <tr key={i} style={{ background: best ? "rgba(53,224,122,0.10)" : "transparent" }}>
+                <td className="tnum"><b>{r.banda.toFixed(1)}%</b>{best ? " ⭐" : ""}</td>
+                <td className="tnum">{fmt(r.caudal, 0)}</td>
+                <td className="tnum" style={{ color: "var(--text-3)" }}>{fmt(r.pct, 0)}%</td>
+                <td className="tnum">{fmt(r.tVuelta, 0)} min</td>
+                <td className="tnum">{fmt(r.rotDia, 1)}</td>
+                <td className="tnum" style={{ color: r.spreadVuelta >= 0 ? "#35e07a" : "#ff5d6c" }}>{r.spreadVuelta.toFixed(2)}%</td>
+                <td className="tnum" style={{ color: best ? "#35e07a" : "var(--text)", fontWeight: best ? 700 : 400 }}>${fmt(r.ganDia, 0)}</td>
+              </tr>;
+            })}</tbody>
+          </table>
+        </div>
+        <div className="intel-explain">
+          <b>La fila ⭐</b> es la distancia que maximiza tu ganancia diaria con los parámetros de arriba: el equilibrio entre cobrar más spread y rotar más veces. Ajustá capital, tamaño y horas para ver cómo se mueve el óptimo.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc };
 
 </script>
 <script type="text/babel">
@@ -3332,6 +3612,7 @@ function App() {
     <div className="app" data-animate={t.animatePrices ? "on" : "off"}>
       <Core.TopBar snap={viewSnap} secondsLeft={secondsLeft} cycleMs={state.cycleMs} />
       <Core.Tabs tab={tab} setTab={setTab} />
+      {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
       <main className="content">
         {tab === "tr" && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
           filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} />}
@@ -3339,6 +3620,8 @@ function App() {
         {tab === "precio" && <V.PrecioChart />}
         {tab === "intel" && <V.Inteligencia />}
         {tab === "heat" && <V.Heatmap heatmap={heatmap} />}
+        {tab === "rot" && <V.RotacionCalc />}
+        {tab === "backup" && <V.Backup />}
       </main>
       <footer className="foot">
         <span className="foot-snap tnum">{window.P2P.fmtNum(count)}</span> snapshots guardados
@@ -3557,9 +3840,11 @@ def api_intel_fill():
                 )
                 SELECT
                     hora,
-                    CASE WHEN posicion <= 3 THEN 'top1-3'
-                         WHEN posicion <= 6 THEN 'mid4-6'
-                         ELSE 'back7+' END AS rango_pos,
+                    CASE WHEN posicion <= 3  THEN 'p01-03'
+                         WHEN posicion <= 10 THEN 'p04-10'
+                         WHEN posicion <= 20 THEN 'p11-20'
+                         WHEN posicion <= 40 THEN 'p21-40'
+                         ELSE 'p41+' END AS rango_pos,
                     ROUND(AVG(
                         CASE WHEN disp_prev - disponible > 10
                               AND delta_min BETWEEN 1 AND 6
@@ -3798,8 +4083,7 @@ def api_intel_precio_vs_fill():
                         ) AS delta_completadas,
                         FIRST_VALUE(d.precio) OVER (
                             PARTITION BY d.tipo, d.snapshot_timestamp
-                            ORDER BY CASE WHEN d.tipo = 'BUY' THEN -d.precio
-                                          ELSE d.precio END
+                            ORDER BY d.posicion
                         ) AS precio_lider
                     FROM snapshots_detalle d
                     WHERE d.snapshot_timestamp >= NOW() - (%(dias)s || ' days')::INTERVAL
@@ -3846,6 +4130,96 @@ def api_intel_precio_vs_fill():
         ),
         "dias_analizados": dias,
         "datos": result,
+    })
+
+
+@app.route("/api/inteligencia/rotacion")
+def api_intel_rotacion():
+    """Caudal de llenado (USDT/min) por posicion y por banda de % vs lider.
+    Base para estimar tiempo de llenado y rotaciones/dia.
+    Params: ?dias=N&tipo=BUY|SELL"""
+    try:
+        dias = int(request.args.get("dias", 7))
+    except (ValueError, TypeError):
+        dias = 7
+    tipo = (request.args.get("tipo", "BUY") or "BUY").upper()
+    if tipo not in ("BUY", "SELL"):
+        tipo = "BUY"
+    with config_lock:
+        intervalo = config["INTERVALO_MIN"]
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                WITH cl AS (
+                    SELECT d.posicion, d.precio,
+                        FIRST_VALUE(d.precio) OVER (
+                            PARTITION BY d.tipo, d.snapshot_timestamp
+                            ORDER BY d.posicion
+                        ) AS precio_lider,
+                        LAG(d.disponible) OVER (
+                            PARTITION BY d.anunciante, d.tipo
+                            ORDER BY d.snapshot_timestamp
+                        ) - d.disponible AS consumo
+                    FROM snapshots_detalle d
+                    WHERE d.snapshot_timestamp >= NOW() - (%(dias)s || ' days')::INTERVAL
+                      AND d.tipo = %(tipo)s
+                )
+                SELECT posicion,
+                    COUNT(*) AS obs,
+                    ROUND(AVG(GREATEST(consumo,0))::numeric,1) AS caudal_ciclo,
+                    ROUND((100.0*COUNT(CASE WHEN consumo>0 THEN 1 END)/NULLIF(COUNT(*),0))::numeric,1) AS pct_presencia,
+                    ROUND(AVG(CASE WHEN precio_lider>0 THEN ABS((precio-precio_lider)/precio_lider*100) END)::numeric,3) AS distancia_med
+                FROM cl WHERE consumo IS NOT NULL
+                GROUP BY posicion ORDER BY posicion
+            """, {"dias": dias, "tipo": tipo})
+            por_pos = [dict(r) for r in cur.fetchall()]
+
+            cur.execute("""
+                WITH cl AS (
+                    SELECT d.precio,
+                        FIRST_VALUE(d.precio) OVER (
+                            PARTITION BY d.tipo, d.snapshot_timestamp
+                            ORDER BY d.posicion
+                        ) AS precio_lider,
+                        LAG(d.disponible) OVER (
+                            PARTITION BY d.anunciante, d.tipo
+                            ORDER BY d.snapshot_timestamp
+                        ) - d.disponible AS consumo
+                    FROM snapshots_detalle d
+                    WHERE d.snapshot_timestamp >= NOW() - (%(dias)s || ' days')::INTERVAL
+                      AND d.tipo = %(tipo)s
+                ),
+                banda AS (
+                    SELECT consumo,
+                        LEAST(FLOOR(ABS((precio-precio_lider)/NULLIF(precio_lider,0)*100)/0.1)*0.1, 1.5) AS banda_pct
+                    FROM cl WHERE consumo IS NOT NULL AND precio_lider>0
+                )
+                SELECT banda_pct,
+                    COUNT(*) AS obs,
+                    ROUND(AVG(GREATEST(consumo,0))::numeric,1) AS caudal_ciclo,
+                    ROUND((100.0*COUNT(CASE WHEN consumo>0 THEN 1 END)/NULLIF(COUNT(*),0))::numeric,1) AS pct_presencia
+                FROM banda GROUP BY banda_pct ORDER BY banda_pct
+            """, {"dias": dias, "tipo": tipo})
+            por_precio = [dict(r) for r in cur.fetchall()]
+
+    def floatify(rows):
+        out = []
+        for r in rows:
+            d = dict(r)
+            for k, v in d.items():
+                if hasattr(v, "__float__"):
+                    d[k] = float(v)
+            cc = d.get("caudal_ciclo")
+            d["caudal_min"] = round(cc / intervalo, 1) if (cc is not None and intervalo) else None
+            out.append(d)
+        return out
+
+    return jsonify({
+        "intervalo_min": intervalo,
+        "dias": dias,
+        "tipo": tipo,
+        "por_posicion": floatify(por_pos),
+        "por_precio": floatify(por_precio),
     })
 
 
@@ -3924,105 +4298,74 @@ def api_reset():
         return jsonify({"error": str(e)}), 500
 
 
-# ──────────────────────────────────────────────
-#  EXPORTACIÓN DE DATOS — snapshots_detalle
-# ──────────────────────────────────────────────
 @app.route("/api/export/detalle")
 def api_export_detalle():
-    """Exporta snapshots_detalle en CSV o JSON.
+    """Exporta snapshots_detalle como CSV o JSON.
+    Params: ?dias=N&tipo=BUY|SELL|ALL&fmt=csv|json&limit=N
+    Ej: /api/export/detalle?dias=7&tipo=ALL"""
+    try:
+        dias = int(request.args.get("dias", 7))
+    except (ValueError, TypeError):
+        dias = 7
+    tipo = (request.args.get("tipo", "ALL") or "ALL").upper()
+    fmt  = (request.args.get("fmt", "csv") or "csv").lower()
+    limit_arg = request.args.get("limit")
 
-    Query params:
-      dias   (int, default 1)   — ventana de tiempo hacia atrás
-      tipo   (BUY|SELL|ALL, default ALL)
-      fmt    (csv|json, default csv)
-      limit  (int, default 50000) — techo de filas por seguridad
-
-    Ejemplos:
-      /api/export/detalle                       → CSV último día, ambos lados
-      /api/export/detalle?dias=3&tipo=BUY       → 3 días, solo compradores
-      /api/export/detalle?dias=7&fmt=json       → 7 días en JSON
-    """
-    import csv as csv_mod
-    import io
-
-    dias  = max(1, min(int(request.args.get("dias",  1)),  30))
-    tipo  = request.args.get("tipo", "ALL").upper()
-    fmt   = request.args.get("fmt",  "csv").lower()
-    limit = max(1, min(int(request.args.get("limit", 50000)), 200000))
-
-    tipo_filter = ""
+    where  = ["snapshot_timestamp >= NOW() - (%s || ' days')::INTERVAL"]
+    params = [dias]
     if tipo in ("BUY", "SELL"):
-        tipo_filter = "AND tipo = %(tipo)s"
-
-    query = f"""
-        SELECT
-            snapshot_timestamp,
-            hora,
-            tipo,
-            posicion,
-            anunciante,
-            precio,
-            disponible,
-            completadas,
-            tasa_exito,
-            es_merchant
+        where.append("tipo = %s")
+        params.append(tipo)
+    sql = """
+        SELECT snapshot_timestamp, hora, tipo, posicion, anunciante,
+               precio, disponible, completadas, tasa_exito, es_merchant
         FROM snapshots_detalle
-        WHERE snapshot_timestamp >= NOW() - (%(dias)s || ' days')::INTERVAL
-          {tipo_filter}
-        ORDER BY snapshot_timestamp ASC, tipo ASC, posicion ASC
-        LIMIT %(limit)s
+        WHERE """ + " AND ".join(where) + """
+        ORDER BY snapshot_timestamp DESC, tipo, posicion
     """
+    if limit_arg:
+        try:
+            params.append(int(limit_arg))
+            sql += " LIMIT %s"
+        except (ValueError, TypeError):
+            pass
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(query, {"dias": dias, "tipo": tipo, "limit": limit})
+            cur.execute(sql, params)
             rows = cur.fetchall()
 
-    if not rows:
-        return jsonify({"ok": False, "mensaje": "Sin datos en el rango solicitado."}), 404
-
-    COLS = ["snapshot_timestamp", "hora", "tipo", "posicion", "anunciante",
-            "precio", "disponible", "completadas", "tasa_exito", "es_merchant"]
-
     if fmt == "json":
-        result = []
+        out = []
         for r in rows:
-            d = {}
-            for k in COLS:
-                v = r[k]
-                if hasattr(v, "isoformat"):
-                    d[k] = v.isoformat()
-                elif hasattr(v, "__float__"):
-                    d[k] = float(v)
-                else:
-                    d[k] = v
-            result.append(d)
-        return jsonify({"filas": len(result), "datos": result})
+            d = dict(r)
+            d["snapshot_timestamp"] = str(d["snapshot_timestamp"])[:19]
+            for k in ("precio", "disponible", "tasa_exito"):
+                if d.get(k) is not None:
+                    d[k] = float(d[k])
+            out.append(d)
+        return jsonify(out)
 
-    # — CSV (default) —
+    import csv, io
     buf = io.StringIO()
-    w = csv_mod.writer(buf)
-    w.writerow(COLS)
+    campos = ["snapshot_timestamp", "hora", "tipo", "posicion", "anunciante",
+              "precio", "disponible", "completadas", "tasa_exito", "es_merchant"]
+    w = csv.writer(buf)
+    w.writerow(campos)
     for r in rows:
         w.writerow([
-            str(r["snapshot_timestamp"]),
-            r["hora"],
-            r["tipo"],
-            r["posicion"],
+            str(r["snapshot_timestamp"])[:19], r["hora"], r["tipo"], r["posicion"],
             r["anunciante"],
-            float(r["precio"])      if r["precio"]      is not None else "",
-            float(r["disponible"])  if r["disponible"]  is not None else "",
+            float(r["precio"])     if r["precio"]     is not None else "",
+            float(r["disponible"]) if r["disponible"] is not None else "",
             r["completadas"],
-            float(r["tasa_exito"])  if r["tasa_exito"]  is not None else "",
+            float(r["tasa_exito"]) if r["tasa_exito"] is not None else "",
             r["es_merchant"],
         ])
-
-    from datetime import date
-    filename = f"detalle_{tipo.lower()}_{dias}d_{date.today().isoformat()}.csv"
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f"attachment; filename=detalle_{tipo}_{dias}d.csv"},
     )
 
 
