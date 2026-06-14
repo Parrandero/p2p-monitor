@@ -3925,6 +3925,108 @@ def api_reset():
 
 
 # ──────────────────────────────────────────────
+#  EXPORTACIÓN DE DATOS — snapshots_detalle
+# ──────────────────────────────────────────────
+@app.route("/api/export/detalle")
+def api_export_detalle():
+    """Exporta snapshots_detalle en CSV o JSON.
+
+    Query params:
+      dias   (int, default 1)   — ventana de tiempo hacia atrás
+      tipo   (BUY|SELL|ALL, default ALL)
+      fmt    (csv|json, default csv)
+      limit  (int, default 50000) — techo de filas por seguridad
+
+    Ejemplos:
+      /api/export/detalle                       → CSV último día, ambos lados
+      /api/export/detalle?dias=3&tipo=BUY       → 3 días, solo compradores
+      /api/export/detalle?dias=7&fmt=json       → 7 días en JSON
+    """
+    import csv as csv_mod
+    import io
+
+    dias  = max(1, min(int(request.args.get("dias",  1)),  30))
+    tipo  = request.args.get("tipo", "ALL").upper()
+    fmt   = request.args.get("fmt",  "csv").lower()
+    limit = max(1, min(int(request.args.get("limit", 50000)), 200000))
+
+    tipo_filter = ""
+    if tipo in ("BUY", "SELL"):
+        tipo_filter = "AND tipo = %(tipo)s"
+
+    query = f"""
+        SELECT
+            snapshot_timestamp,
+            hora,
+            tipo,
+            posicion,
+            anunciante,
+            precio,
+            disponible,
+            completadas,
+            tasa_exito,
+            es_merchant
+        FROM snapshots_detalle
+        WHERE snapshot_timestamp >= NOW() - (%(dias)s || ' days')::INTERVAL
+          {tipo_filter}
+        ORDER BY snapshot_timestamp ASC, tipo ASC, posicion ASC
+        LIMIT %(limit)s
+    """
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, {"dias": dias, "tipo": tipo, "limit": limit})
+            rows = cur.fetchall()
+
+    if not rows:
+        return jsonify({"ok": False, "mensaje": "Sin datos en el rango solicitado."}), 404
+
+    COLS = ["snapshot_timestamp", "hora", "tipo", "posicion", "anunciante",
+            "precio", "disponible", "completadas", "tasa_exito", "es_merchant"]
+
+    if fmt == "json":
+        result = []
+        for r in rows:
+            d = {}
+            for k in COLS:
+                v = r[k]
+                if hasattr(v, "isoformat"):
+                    d[k] = v.isoformat()
+                elif hasattr(v, "__float__"):
+                    d[k] = float(v)
+                else:
+                    d[k] = v
+            result.append(d)
+        return jsonify({"filas": len(result), "datos": result})
+
+    # — CSV (default) —
+    buf = io.StringIO()
+    w = csv_mod.writer(buf)
+    w.writerow(COLS)
+    for r in rows:
+        w.writerow([
+            str(r["snapshot_timestamp"]),
+            r["hora"],
+            r["tipo"],
+            r["posicion"],
+            r["anunciante"],
+            float(r["precio"])      if r["precio"]      is not None else "",
+            float(r["disponible"])  if r["disponible"]  is not None else "",
+            r["completadas"],
+            float(r["tasa_exito"])  if r["tasa_exito"]  is not None else "",
+            r["es_merchant"],
+        ])
+
+    from datetime import date
+    filename = f"detalle_{tipo.lower()}_{dias}d_{date.today().isoformat()}.csv"
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+# ──────────────────────────────────────────────
 #  INICIO
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
