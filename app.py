@@ -394,6 +394,7 @@ def analizar(tab_compra, tab_venta):
         "ganancia_neta_pct":          ganancia,
         "comision_total_pct":         round(comision_total_pct, 4),
         "spread_min_operativo":       c["SPREAD_MIN_OPERATIVO"],
+        "analisis_top":               c["ANALISIS_TOP"],
         "brecha_ok":                  brecha_ok,
         "estado":                     estado,
         "color":                      color,
@@ -1203,26 +1204,32 @@ window.P2P_CONFIG = {
 
     const pond = (rows) => { let v = 0, w = 0; rows.forEach((r) => { v += r.precio * r.disponible; w += r.disponible; }); return w ? v / w : 0; };
     const r2 = (n) => Math.round(n * 100) / 100;
-    const pond_tc = r2(pond(dc)), pond_tv = r2(pond(dv));
-    const lider_tc = dc[0], lider_tv = dv[0];
+    // Cabecera del libro: el ponderado, el spread y la liquidez se miden SOLO
+    // sobre las primeras CAB posiciones (igual que el backend, ANALISIS_TOP),
+    // para no diluir el spread con los precios profundos del top80.
+    const CAB = parseInt(snap.analisis_top) || 20;
+    const cabC = dc.slice(0, CAB);
+    const cabV = dv.slice(0, CAB);
+    const pond_tc = r2(pond(cabC)), pond_tv = r2(pond(cabV));
+    const lider_tc = cabC[0], lider_tv = cabV[0];
     const spread_abs = r2(lider_tc.precio - lider_tv.precio);
     const spread_pct = Math.round((spread_abs / lider_tv.precio) * 10000) / 100;
     const spread_pond_abs = r2(pond_tc - pond_tv);
     const spread_pond_pct = Math.round((spread_pond_abs / pond_tv) * 10000) / 100;
     const ganancia_neta_pct = r2(spread_pond_pct - COMISION_BN * 2 * 100);
-    const liq_tc = dc.reduce((s, r) => s + r.disponible, 0);
-    const liq_tv = dv.reduce((s, r) => s + r.disponible, 0);
+    const liq_tc = cabC.reduce((s, r) => s + r.disponible, 0);
+    const liq_tv = cabV.reduce((s, r) => s + r.disponible, 0);
     const cls = clasificar(spread_pond_pct);
 
     return {
       ...snap,
       precio_pond_tab_compra: pond_tc, precio_pond_tab_venta: pond_tv,
-      mejor_vendedor_tab_compra: lider_tc.precio, peor_vendedor_tab_compra: dc[dc.length - 1].precio,
-      mejor_comprador_tab_venta: lider_tv.precio, peor_comprador_tab_venta: dv[dv.length - 1].precio,
+      mejor_vendedor_tab_compra: lider_tc.precio, peor_vendedor_tab_compra: cabC[cabC.length - 1].precio,
+      mejor_comprador_tab_venta: lider_tv.precio, peor_comprador_tab_venta: cabV[cabV.length - 1].precio,
       lider_tab_compra: lider_tc.anunciante, lider_tab_venta: lider_tv.anunciante,
       spread_abs, spread_pct, spread_pond_abs, spread_pond_pct, ganancia_neta_pct,
       liq_tab_compra: liq_tc, liq_tab_venta: liq_tv,
-      n_tab_compra: dc.length, n_tab_venta: dv.length,
+      n_tab_compra: cabC.length, n_tab_venta: cabV.length,
       precio_maker_vender: r2(lider_tc.precio - 0.01), precio_maker_comprar: r2(lider_tv.precio + 0.01),
       estado: cls.estado, color: cls.color,
       detalle_compra: dc, detalle_venta: dv,
@@ -1425,9 +1432,29 @@ window.P2P_CONFIG = {
     return res.json();
   }
 
+  // Velocidad real de mercado: suma del consumo por anunciante (campo velocidad,
+  // ya en USDT/min). Excluye el ruido de reposicionamiento del proxy de liquidez.
+  function marketVelNow(snap) {
+    const sumVel = (rows) => (rows || []).reduce((s, r) => s + (Number(r.velocidad) > 0 ? Number(r.velocidad) : 0), 0);
+    return sumVel(snap.detalle_compra) + sumVel(snap.detalle_venta);
+  }
+  function computeVelReal(vNow, hist) {
+    const usdt_min = Math.round(vNow);
+    const ventana = hist.slice(-45).filter((v) => v > 0 && v < 50000).sort((a, b) => a - b);
+    const mediana = ventana.length ? ventana[Math.floor(ventana.length / 2)] : vNow;
+    const base = Math.max(40, mediana);
+    const ratio = base ? vNow / base : 1;
+    let nivel, tone;
+    if (ratio < 0.5) { nivel = "TRANQUILO"; tone = "warn-low"; }
+    else if (ratio < 1.3) { nivel = "NORMAL"; tone = "warn"; }
+    else if (ratio < 2.2) { nivel = "ACTIVO"; tone = "buy"; }
+    else { nivel = "MUY ACTIVO"; tone = "sell"; }
+    return { usdt_min, vol_15m: Math.round(vNow * 15), nivel, tone, history: hist.slice(-48), pct: Math.min(1, ratio / 3), ratio: Math.round(ratio * 100) / 100 };
+  }
+
   function createLiveEngine({ baseUrl = "", pollMs = 30000, intervaloMin = 5 } = {}) {
     const B = baseUrl.replace(/\/$/, "");
-    let snap = null, history = [], heatmap = [], count = 0, vel = null;
+    let snap = null, history = [], heatmap = [], count = 0, vel = null, velHist = [], lastVelTs = null;
     let cycleStart = Date.now();
     const subs = new Set();
     let stopped = false;
@@ -1453,7 +1480,15 @@ window.P2P_CONFIG = {
           hora: num(h.hora), dia: h.dia, avg_spread: num(h.avg_spread), muestras: num(h.muestras),
         }));
         count = num(cnt && cnt.count, count);
-        vel = calcVelocidad(history, intervaloMin) || vel;
+        if (snap) {
+          const vNow = marketVelNow(snap);              // USDT/min absorbidos (consumo real por anunciante)
+          if (snap.timestamp && snap.timestamp !== lastVelTs) {
+            velHist.push(vNow);
+            if (velHist.length > 60) velHist.shift();
+            lastVelTs = snap.timestamp;
+          }
+          vel = computeVelReal(vNow, velHist.length ? velHist : [vNow]);
+        }
         cycleStart = Date.now();
         emit(type);
       } catch (e) {
