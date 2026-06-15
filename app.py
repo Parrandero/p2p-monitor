@@ -33,6 +33,7 @@ config = {
     "SPREAD_MIN_OPERATIVO": 0.35,
     "TOP_ANUNCIOS":         80,   # 4 páginas × 20 = 80 por lado (detalle/profundidad)
     "ANALISIS_TOP":         20,   # cabecera del libro p/ spread y liquidez (mantiene baseline)
+    "BANDA_PONDERADO_PCT":  2.0,  # % desde el lider para ponderar (descarta outliers en libros finos)
 }
 config_lock = threading.Lock()
 
@@ -375,17 +376,22 @@ def analizar(tab_compra, tab_venta):
     with config_lock:
         c = dict(config)
     lider_tc    = min(tab_compra, key=lambda x: x["precio"])
-    mas_caro_tc = max(tab_compra, key=lambda x: x["precio"])
     lider_tv    = max(tab_venta,  key=lambda x: x["precio"])
-    menos_tv    = min(tab_venta,  key=lambda x: x["precio"])
     spread_abs = lider_tc["precio"] - lider_tv["precio"]
     spread_pct = round((spread_abs / lider_tv["precio"]) * 100, 4) if lider_tv["precio"] > 0 else 0
-    pond_tc = round(precio_ponderado(tab_compra), 2)
-    pond_tv = round(precio_ponderado(tab_venta),  2)
+    # Banda anti-outliers: para ponderado/liquidez solo contamos anuncios cerca
+    # del lider (descarta ballenas con precio disparatado en libros finos).
+    banda = c["BANDA_PONDERADO_PCT"] / 100
+    cab_tc = [a for a in tab_compra if a["precio"] <= lider_tc["precio"] * (1 + banda)] or tab_compra
+    cab_tv = [a for a in tab_venta  if a["precio"] >= lider_tv["precio"] * (1 - banda)] or tab_venta
+    mas_caro_tc = max(cab_tc, key=lambda x: x["precio"])
+    menos_tv    = min(cab_tv, key=lambda x: x["precio"])
+    pond_tc = round(precio_ponderado(cab_tc), 2)
+    pond_tv = round(precio_ponderado(cab_tv), 2)
     spread_pond_abs = round(pond_tc - pond_tv, 2)
     spread_pond_pct = round((spread_pond_abs / pond_tv) * 100, 4) if pond_tv > 0 else 0
-    liq_tc = sum(a["disponible"] for a in tab_compra)
-    liq_tv = sum(a["disponible"] for a in tab_venta)
+    liq_tc = sum(a["disponible"] for a in cab_tc)
+    liq_tv = sum(a["disponible"] for a in cab_tv)
     precio_maker_vender  = round(lider_tc["precio"] - 0.01, 2)
     precio_maker_comprar = round(lider_tv["precio"] + 0.01, 2)
     comision_total_pct = c["COMISION_BN"] * 2 * 100
@@ -418,14 +424,15 @@ def analizar(tab_compra, tab_venta):
         "spread_pond_pct":            spread_pond_pct,
         "liq_tab_compra":             round(liq_tc, 2),
         "liq_tab_venta":              round(liq_tv, 2),
-        "n_tab_compra":               len(tab_compra),
-        "n_tab_venta":                len(tab_venta),
+        "n_tab_compra":               len(cab_tc),
+        "n_tab_venta":                len(cab_tv),
         "precio_maker_vender":        precio_maker_vender,
         "precio_maker_comprar":       precio_maker_comprar,
         "ganancia_neta_pct":          ganancia,
         "comision_total_pct":         round(comision_total_pct, 4),
         "spread_min_operativo":       c["SPREAD_MIN_OPERATIVO"],
         "analisis_top":               c["ANALISIS_TOP"],
+        "banda_ponderado_pct":        c["BANDA_PONDERADO_PCT"],
         "brecha_ok":                  brecha_ok,
         "estado":                     estado,
         "color":                      color,
@@ -1390,26 +1397,32 @@ window.P2P_CONFIG = {
     const CAB = parseInt(snap.analisis_top) || 20;
     const cabC = dc.slice(0, CAB);
     const cabV = dv.slice(0, CAB);
-    const pond_tc = r2(pond(cabC)), pond_tv = r2(pond(cabV));
+    // Banda anti-outliers: pondera solo lo cercano al líder (libros finos con ballenas lejos del precio)
+    const bandaP = (parseFloat(snap.banda_ponderado_pct) || 2) / 100;
+    const wC = cabC.filter((r) => r.precio <= cabC[0].precio * (1 + bandaP));
+    const wV = cabV.filter((r) => r.precio >= cabV[0].precio * (1 - bandaP));
+    const useC = wC.length ? wC : cabC;
+    const useV = wV.length ? wV : cabV;
+    const pond_tc = r2(pond(useC)), pond_tv = r2(pond(useV));
     const lider_tc = cabC[0], lider_tv = cabV[0];
     const spread_abs = r2(lider_tc.precio - lider_tv.precio);
     const spread_pct = Math.round((spread_abs / lider_tv.precio) * 10000) / 100;
     const spread_pond_abs = r2(pond_tc - pond_tv);
     const spread_pond_pct = Math.round((spread_pond_abs / pond_tv) * 10000) / 100;
     const ganancia_neta_pct = r2(spread_pond_pct - COMISION_BN * 2 * 100);
-    const liq_tc = cabC.reduce((s, r) => s + r.disponible, 0);
-    const liq_tv = cabV.reduce((s, r) => s + r.disponible, 0);
+    const liq_tc = useC.reduce((s, r) => s + r.disponible, 0);
+    const liq_tv = useV.reduce((s, r) => s + r.disponible, 0);
     const cls = clasificar(spread_pond_pct);
 
     return {
       ...snap,
       precio_pond_tab_compra: pond_tc, precio_pond_tab_venta: pond_tv,
-      mejor_vendedor_tab_compra: lider_tc.precio, peor_vendedor_tab_compra: cabC[cabC.length - 1].precio,
-      mejor_comprador_tab_venta: lider_tv.precio, peor_comprador_tab_venta: cabV[cabV.length - 1].precio,
+      mejor_vendedor_tab_compra: lider_tc.precio, peor_vendedor_tab_compra: useC[useC.length - 1].precio,
+      mejor_comprador_tab_venta: lider_tv.precio, peor_comprador_tab_venta: useV[useV.length - 1].precio,
       lider_tab_compra: lider_tc.anunciante, lider_tab_venta: lider_tv.anunciante,
       spread_abs, spread_pct, spread_pond_abs, spread_pond_pct, ganancia_neta_pct,
       liq_tab_compra: liq_tc, liq_tab_venta: liq_tv,
-      n_tab_compra: cabC.length, n_tab_venta: cabV.length,
+      n_tab_compra: useC.length, n_tab_venta: useV.length,
       precio_maker_vender: r2(lider_tc.precio - 0.01), precio_maker_comprar: r2(lider_tv.precio + 0.01),
       estado: cls.estado, color: cls.color,
       detalle_compra: dc, detalle_venta: dv,
