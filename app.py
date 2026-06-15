@@ -42,6 +42,8 @@ HEADERS = {"Content-Type": "application/json"}
 
 ultimo_estado = {}
 prev_detalle_raw = {}   # {tipo: {anunciante: (disponible, datetime)}}
+ultimo_estado_bybit = {}
+prev_detalle_raw_bybit = {}
 data_lock = threading.Lock()
 
 # ──────────────────────────────────────────────
@@ -129,6 +131,35 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_detalle_posicion
                 ON snapshots_detalle(posicion, tipo, snapshot_timestamp)
             """)
+            # ── Tablas Bybit (colector paralelo) ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS snapshots_bybit (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP NOT NULL,
+                    hora INTEGER, dia TEXT,
+                    mejor_vendedor_tab_compra NUMERIC, peor_vendedor_tab_compra NUMERIC,
+                    precio_pond_tab_compra NUMERIC, lider_tab_compra TEXT,
+                    mejor_comprador_tab_venta NUMERIC, peor_comprador_tab_venta NUMERIC,
+                    precio_pond_tab_venta NUMERIC, lider_tab_venta TEXT,
+                    spread_abs NUMERIC, spread_pct NUMERIC,
+                    spread_pond_abs NUMERIC, spread_pond_pct NUMERIC,
+                    liq_tab_compra NUMERIC, liq_tab_venta NUMERIC,
+                    n_tab_compra INTEGER, n_tab_venta INTEGER,
+                    precio_maker_vender NUMERIC, precio_maker_comprar NUMERIC,
+                    ganancia_neta_pct NUMERIC, estado TEXT, color TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS snapshots_detalle_bybit (
+                    id SERIAL PRIMARY KEY,
+                    snapshot_timestamp TIMESTAMP NOT NULL,
+                    hora INTEGER, tipo TEXT, posicion INTEGER,
+                    anunciante TEXT, precio NUMERIC, disponible NUMERIC,
+                    completadas INTEGER, tasa_exito NUMERIC, es_merchant BOOLEAN
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_byb_detalle_ts ON snapshots_detalle_bybit(snapshot_timestamp)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_byb_detalle_anun ON snapshots_detalle_bybit(anunciante, tipo)")
         conn.commit()
     print("\u2705 Base de datos lista (snapshots + snapshots_detalle)")
 
@@ -144,11 +175,11 @@ def reset_db():
         prev_detalle_raw.clear()
     print("\u2705 Base de datos reseteada")
 
-def guardar_snapshot(m):
+def guardar_snapshot(m, tabla="snapshots"):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO snapshots (
+            cur.execute(f"""
+                INSERT INTO {tabla} (
                     timestamp, hora, dia,
                     mejor_vendedor_tab_compra, peor_vendedor_tab_compra,
                     precio_pond_tab_compra, lider_tab_compra,
@@ -447,6 +478,155 @@ def purgar_detalle_antiguo(dias=30):
     if eliminadas > 0:
         print(f"[PURGA] {eliminadas:,} filas eliminadas (>{dias} días)")
     return eliminadas
+
+# ──────────────────────────────────────────────
+#  BYBIT P2P (colector paralelo)
+# ──────────────────────────────────────────────
+URL_BYBIT     = "https://api2.bybit.com/fiat/otc/item/online"
+HEADERS_BYBIT = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Origin": "https://www.bybit.com",
+    "Referer": "https://www.bybit.com/",
+}
+
+def obtener_anuncios_bybit(tipo):
+    """tipo BUY = comprar USDT (side 1) ; SELL = vender USDT (side 0)."""
+    side = "1" if tipo == "BUY" else "0"
+    with config_lock:
+        c = dict(config)
+    top = c["TOP_ANUNCIOS"]
+    POR_PAGINA = 20
+    n_paginas = (top + POR_PAGINA - 1) // POR_PAGINA
+    out = []
+    for page in range(1, n_paginas + 1):
+        payload = {
+            "userId": "", "tokenId": c["MONEDA"], "currencyId": c["FIAT"],
+            "payment": [], "side": side, "size": str(POR_PAGINA),
+            "page": str(page), "amount": "", "authMaker": False, "canTrade": False,
+        }
+        try:
+            r = requests.post(URL_BYBIT, json=payload, headers=HEADERS_BYBIT, timeout=10)
+            r.raise_for_status()
+            items = ((r.json().get("result") or {}).get("items")) or []
+        except Exception as e:
+            print(f"[ERROR bybit {tipo} p{page}] {e}")
+            break
+        if not items:
+            break
+        out.extend(items)
+        if len(items) < POR_PAGINA:
+            break
+        if page < n_paginas:
+            time.sleep(0.3)
+    return out[:top]
+
+def _bybit_item(item):
+    return {
+        "anunciante":  item.get("nickName", ""),
+        "precio":      float(item.get("price", 0) or 0),
+        "disponible":  float(item.get("lastQuantity", item.get("quantity", 0)) or 0),
+        "completadas": int(item.get("recentOrderNum", 0) or 0),
+        "tasa_exito":  float(item.get("recentExecuteRate", 0) or 0),   # ya viene 0-100
+        "es_merchant": item.get("userType", "PERSONAL") != "PERSONAL",
+    }
+
+def parsear_y_filtrar_bybit(items, tipo):
+    with config_lock:
+        c = dict(config)
+    res = []
+    for it in items:
+        f = _bybit_item(it)
+        if f["disponible"]  < c["FILTRO_MIN_USDT"]: continue
+        if f["completadas"] < c["FILTRO_MIN_ORD"]:  continue
+        if f["tasa_exito"]  < c["FILTRO_MIN_TASA"]: continue
+        res.append({"tipo": tipo, "precio": f["precio"], "disponible": f["disponible"], "anunciante": f["anunciante"]})
+    return res
+
+def guardar_detalle_bybit(timestamp, hora, raw_compra, raw_venta):
+    with config_lock:
+        top = config["TOP_ANUNCIOS"]
+    rows = []
+    for tipo, raw in (("BUY", raw_compra), ("SELL", raw_venta)):
+        for pos, it in enumerate(raw[:top], 1):
+            f = _bybit_item(it)
+            rows.append((timestamp, hora, tipo, pos, f["anunciante"], f["precio"],
+                         f["disponible"], f["completadas"], f["tasa_exito"], f["es_merchant"]))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO snapshots_detalle_bybit
+                (snapshot_timestamp, hora, tipo, posicion, anunciante, precio,
+                 disponible, completadas, tasa_exito, es_merchant)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, rows)
+        conn.commit()
+
+def build_detalle_memory_bybit(raw, tipo, now_dt):
+    global prev_detalle_raw_bybit
+    with config_lock:
+        top = config["TOP_ANUNCIOS"]
+    prev = prev_detalle_raw_bybit.get(tipo, {})
+    rows, nuevo = [], {}
+    for pos, it in enumerate(raw[:top], 1):
+        f = _bybit_item(it)
+        nombre, disp = f["anunciante"], f["disponible"]
+        vel = 0.0
+        if nombre in prev:
+            pd, pdt = prev[nombre]
+            dm = (now_dt - pdt).total_seconds() / 60
+            if dm > 0 and pd > disp:
+                vel = round((pd - disp) / dm, 1)
+        nuevo[nombre] = (disp, now_dt)
+        rows.append({"posicion": pos, "anunciante": nombre, "precio": f["precio"],
+                     "disponible": disp, "completadas": f["completadas"],
+                     "tasa_exito": round(f["tasa_exito"], 1), "es_merchant": f["es_merchant"], "velocidad": vel})
+    prev_detalle_raw_bybit[tipo] = nuevo
+    return rows
+
+def ciclo_colector_bybit():
+    print("[BYBIT] Iniciando thread...")
+    time.sleep(8)
+    _ultima_purga = None
+    while True:
+        try:
+            hoy = datetime.now(SANTIAGO_TZ).date()
+            if _ultima_purga != hoy:
+                try:
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("DELETE FROM snapshots_detalle_bybit WHERE snapshot_timestamp < NOW() - INTERVAL '30 days'")
+                        conn.commit()
+                except Exception as e:
+                    print(f"[BYBIT purga] {e}")
+                _ultima_purga = hoy
+            raw_compra = obtener_anuncios_bybit("BUY")
+            raw_venta  = obtener_anuncios_bybit("SELL")
+            with config_lock:
+                anal_top = config["ANALISIS_TOP"]
+            tab_compra = parsear_y_filtrar_bybit(raw_compra[:anal_top], "BUY")
+            tab_venta  = parsear_y_filtrar_bybit(raw_venta[:anal_top],  "SELL")
+            estado = analizar(tab_compra, tab_venta)
+            if estado:
+                guardar_snapshot(estado, "snapshots_bybit")
+                ts, hora = estado["timestamp"], estado["hora"]
+                now_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SANTIAGO_TZ)
+                guardar_detalle_bybit(ts, hora, raw_compra, raw_venta)
+                estado["detalle_compra"] = build_detalle_memory_bybit(raw_compra, "BUY",  now_dt)
+                estado["detalle_venta"]  = build_detalle_memory_bybit(raw_venta,  "SELL", now_dt)
+                with data_lock:
+                    ultimo_estado_bybit.clear()
+                    ultimo_estado_bybit.update(estado)
+                print(f"[BYBIT {ts}] spread {estado['spread_pond_pct']}% | {len(raw_compra)+len(raw_venta)} anuncios")
+            else:
+                print("[BYBIT] sin datos suficientes")
+        except Exception as e:
+            import traceback
+            print(f"[ERROR BYBIT] {e}")
+            print(traceback.format_exc())
+        with config_lock:
+            intervalo = config["INTERVALO_MIN"]
+        time.sleep(intervalo * 60)
 
 def ciclo_colector():
     print("[COLECTOR] Iniciando thread...")
@@ -4258,6 +4438,39 @@ def api_intel_rotacion():
     })
 
 
+@app.route("/api/bybit/estado")
+def api_bybit_estado():
+    with data_lock:
+        return jsonify(dict(ultimo_estado_bybit) if ultimo_estado_bybit else {})
+
+
+@app.route("/api/cross")
+def api_cross():
+    """Brecha cruzada Binance <-> Bybit usando precios lider."""
+    with data_lock:
+        b = dict(ultimo_estado) if ultimo_estado else {}
+        y = dict(ultimo_estado_bybit) if ultimo_estado_bybit else {}
+    def g(d, k):
+        v = d.get(k)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    bin_buy  = g(b, "mejor_vendedor_tab_compra")   # comprar USDT en Binance (mas barato)
+    bin_sell = g(b, "mejor_comprador_tab_venta")   # vender USDT en Binance (mas alto)
+    byb_buy  = g(y, "mejor_vendedor_tab_compra")
+    byb_sell = g(y, "mejor_comprador_tab_venta")
+    def pct(compra, venta):
+        return round((venta - compra) / compra * 100, 4) if (compra and venta) else None
+    return jsonify({
+        "binance": {"comprar_usdt": bin_buy, "vender_usdt": bin_sell, "timestamp": b.get("timestamp")},
+        "bybit":   {"comprar_usdt": byb_buy, "vender_usdt": byb_sell, "timestamp": y.get("timestamp")},
+        "comprar_binance_vender_bybit_pct": pct(bin_buy, byb_sell),
+        "comprar_bybit_vender_binance_pct": pct(byb_buy, bin_sell),
+        "nota": "Bruto, sin comisiones P2P ni costo de transferir USDT entre exchanges (red/retiro).",
+    })
+
+
 @app.route("/api/heatmap")
 def api_heatmap():
     rows = obtener_heatmap()
@@ -4411,9 +4624,11 @@ if __name__ == "__main__":
     init_pool()
     init_db()
     threading.Thread(target=ciclo_colector, daemon=True).start()
+    threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 else:
     init_pool()
     init_db()
     threading.Thread(target=ciclo_colector, daemon=True).start()
+    threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
