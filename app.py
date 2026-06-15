@@ -3783,8 +3783,12 @@ function CrossView() {
   if (!cross) return <div className="intel-loading">Sin datos de cross todavía.</div>;
   const bin = cross.binance || {}, by = cross.bybit || {};
   const sinBybit = (by.comprar_usdt == null && by.vender_usdt == null);
-  const rA = cross.comprar_binance_vender_bybit_pct;
-  const rB = cross.comprar_bybit_vender_binance_pct;
+  // Lógica MAKER: comprás USDT cerca del mejor BID (postás un bid) y vendés cerca del mejor ASK (postás un ask).
+  const binAsk = bin.comprar_usdt, binBid = bin.vender_usdt;
+  const bybAsk = by.comprar_usdt,  bybBid = by.vender_usdt;
+  const pctR = (compra, venta) => (compra && venta) ? (venta - compra) / compra * 100 : null;
+  const rA = pctR(binBid, bybAsk);  // acumular Binance (comprar al bid) -> distribuir Bybit (vender al ask)
+  const rB = pctR(bybBid, binAsk);  // acumular Bybit -> distribuir Binance
   const neto = (g) => g == null ? null : g - costo;
   const card = (titulo, compraEx, ventaEx, compraP, ventaP, gross) => {
     const net = neto(gross);
@@ -3801,18 +3805,18 @@ function CrossView() {
   return (
     <div className="view tone-accent">
       <section className="chart-card">
-        <div className="card-head"><h3>Arbitraje cruzado · Binance ↔ Bybit</h3><span className="card-sub">USDT/CLP · precios líder · se actualiza cada 30s</span></div>
+        <div className="card-head"><h3>Arbitraje cruzado · Binance ↔ Bybit</h3><span className="card-sub">USDT/CLP · lógica MAKER (vos posteás) · se actualiza cada 30s</span></div>
         {sinBybit ? <div className="intel-explain">Esperando el primer ciclo de Bybit… si recién deployaste, dale 1-2 minutos.</div> : null}
         <div className="stat-cards" style={{ gridTemplateColumns: "1fr 1fr" }}>
           <div className="statcard">
-            <div className="statcard-label">Binance</div>
-            <div style={{ fontSize: 13, marginTop: 8 }}>comprar USDT: <b>{fmt(bin.comprar_usdt)}</b></div>
-            <div style={{ fontSize: 13 }}>vender USDT: <b>{fmt(bin.vender_usdt)}</b></div>
+            <div className="statcard-label">Binance (maker)</div>
+            <div style={{ fontSize: 13, marginTop: 8 }}>comprar USDT (postás bid) ≈ <b>{fmt(bin.vender_usdt)}</b></div>
+            <div style={{ fontSize: 13 }}>vender USDT (postás ask) ≈ <b>{fmt(bin.comprar_usdt)}</b></div>
           </div>
           <div className="statcard">
-            <div className="statcard-label">Bybit</div>
-            <div style={{ fontSize: 13, marginTop: 8 }}>comprar USDT: <b>{fmt(by.comprar_usdt)}</b></div>
-            <div style={{ fontSize: 13 }}>vender USDT: <b>{fmt(by.vender_usdt)}</b></div>
+            <div className="statcard-label">Bybit (maker)</div>
+            <div style={{ fontSize: 13, marginTop: 8 }}>comprar USDT (postás bid) ≈ <b>{fmt(by.vender_usdt)}</b></div>
+            <div style={{ fontSize: 13 }}>vender USDT (postás ask) ≈ <b>{fmt(by.comprar_usdt)}</b></div>
           </div>
         </div>
         <div className="filters-grid" style={{ gridTemplateColumns: "260px", margin: "14px 0" }}>
@@ -3820,12 +3824,12 @@ function CrossView() {
             <input type="number" step="0.05" value={costo} onChange={e => setCosto(parseFloat(e.target.value) || 0)} /></div>
         </div>
         <div className="stat-cards" style={{ gridTemplateColumns: "1fr 1fr" }}>
-          {card("Ruta A", "Binance", "Bybit", bin.comprar_usdt, by.vender_usdt, rA)}
-          {card("Ruta B", "Bybit", "Binance", by.comprar_usdt, bin.vender_usdt, rB)}
+          {card("Acumular Binance → Distribuir Bybit", "Binance", "Bybit", bin.vender_usdt, by.comprar_usdt, rA)}
+          {card("Acumular Bybit → Distribuir Binance", "Bybit", "Binance", by.vender_usdt, bin.comprar_usdt, rB)}
         </div>
         <div className="intel-explain">
-          <b>Cómo leerlo:</b> el % bruto es la diferencia entre comprar USDT en un exchange y venderlo en el otro. El <b>neto</b> le resta tu costo estimado (comisiones P2P de los dos lados + mover el USDT por red). Si el neto está en verde, hay arbitraje real en ese instante.<br/>
-          <b>Ojo:</b> Bybit en CLP es fino, así que estas brechas pueden ser de momentos sueltos. Verificá que se sostengan y que Bybit tenga liquidez para tu tamaño antes de operar.
+          <b>Lógica maker:</b> como vos posteás anuncios (no tomás), comprás USDT cerca del <b>mejor bid</b> y vendés cerca del <b>mejor ask</b>. Por eso los precios acá están al revés que si tomaras la orden. El <b>neto</b> resta tu costo estimado (comisiones maker de los dos lados + mover USDT por red).<br/>
+          <b>Riesgo de ejecución:</b> esto NO es instantáneo como tomar — posteás en los dos exchanges y esperás que se llenen los dos. Si uno se llena y el otro no, o el precio se mueve, la brecha puede evaporarse. Además necesitás inventario en ambos lados para postear. Verificá que la brecha se sostenga y que Bybit tenga liquidez para tu tamaño.
         </div>
       </section>
     </div>
