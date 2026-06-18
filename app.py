@@ -375,6 +375,20 @@ def analizar(tab_compra, tab_venta):
         return None
     with config_lock:
         c = dict(config)
+    # Sanity anti-glitch: descarta anuncios con precio absurdo (scam/mal-tipeado)
+    # usando la MEDIANA como referencia robusta. Asi un solo anuncio basura no
+    # puede quedar de lider ni contaminar el ponderado (evita los picos del grafico).
+    def _sanos(ads):
+        if len(ads) < 4:
+            return ads
+        ps = sorted(a["precio"] for a in ads)
+        med = ps[len(ps) // 2]
+        if med <= 0:
+            return ads
+        limpio = [a for a in ads if abs(a["precio"] - med) / med <= 0.04]
+        return limpio if len(limpio) >= 3 else ads
+    tab_compra = _sanos(tab_compra)
+    tab_venta  = _sanos(tab_venta)
     lider_tc    = min(tab_compra, key=lambda x: x["precio"])
     lider_tv    = max(tab_venta,  key=lambda x: x["precio"])
     spread_abs = lider_tc["precio"] - lider_tv["precio"]
@@ -1386,6 +1400,16 @@ window.P2P_CONFIG = {
     // evitar división por cero: si un lado queda vacío, dejamos el mejor original
     if (!dc.length) dc = snap.detalle_compra.slice(0, 1);
     if (!dv.length) dv = snap.detalle_venta.slice(0, 1);
+    // Sanity anti-glitch: descarta ads >4% de la mediana (un scam/mistype no debe ser lider)
+    const sanos = (rows) => {
+      if (rows.length < 4) return rows;
+      const ps = rows.map((r) => r.precio).slice().sort((a, b) => a - b);
+      const med = ps[Math.floor(ps.length / 2)];
+      if (!med) return rows;
+      const limpio = rows.filter((r) => Math.abs(r.precio - med) / med <= 0.04);
+      return limpio.length >= 3 ? limpio : rows;
+    };
+    dc = sanos(dc); dv = sanos(dv);
     dc = dc.slice().sort((a, b) => a.precio - b.precio).map((r, i) => ({ ...r, posicion: i + 1 }));
     dv = dv.slice().sort((a, b) => b.precio - a.precio).map((r, i) => ({ ...r, posicion: i + 1 }));
 
