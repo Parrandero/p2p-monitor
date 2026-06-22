@@ -3868,6 +3868,9 @@ function Muros() {
   const [loading, setLoading] = React.useState(true);
   const [umbral, setUmbral] = React.useState(10000);
   const [topN, setTopN] = React.useState(6);
+  const [selC, setSelC] = React.useState(0);
+  const [selV, setSelV] = React.useState(0);
+  const [comision, setComision] = React.useState(0.36);
 
   React.useEffect(() => {
     let stop = false;
@@ -3902,10 +3905,19 @@ function Muros() {
   const centralV = parseFloat(estado.precio_pond_tab_venta) || parseFloat(estado.mejor_comprador_tab_venta) || 0;
   const murosC = muros(estado.detalle_compra, centralC);
   const murosV = muros(estado.detalle_venta, centralV);
+  const wC = murosC[selC] || murosC[0];
+  const wV = murosV[selV] || murosV[0];
+  const sellP = wC ? wC.precio - 0.01 : null;   // vendés acá (tab compra)
+  const buyP  = wV ? wV.precio + 0.01 : null;    // comprás acá (tab venta)
+  const brutaPct = (sellP && buyP) ? (sellP - buyP) / buyP * 100 : null;
+  const netaPct = brutaPct == null ? null : brutaPct - comision;
+  const cdC = wC ? cmB[parseInt(wC.posicion)] : null;
+  const cdV = wV ? cmS[parseInt(wV.posicion)] : null;
+  const muerta = (cd) => cd && cd.caudal_min != null && cd.caudal_min < 40;
 
   const lab = (c) => c == null ? { t: "—", col: "var(--text-3)" } : c >= 100 ? { t: "🔥 alta", col: "#35e07a" } : c >= 40 ? { t: "media", col: "#ffd740" } : { t: "❄️ muerta", col: "var(--text-3)" };
 
-  const tabla = (lista, cm, lado) => (
+  const tabla = (lista, cm, lado, sel, setSel) => (
     <div className="intel-scroll">
       <table className="intel-table">
         <thead><tr>
@@ -3922,7 +3934,7 @@ function Muros() {
           const cmin = cd ? cd.caudal_min : null;
           const L = lab(cmin);
           const sug = lado === "BUY" ? a.precio - 0.01 : a.precio + 0.01;
-          return <tr key={i} style={{ background: big ? "rgba(91,141,239,0.10)" : "transparent" }}>
+          return <tr key={i} onClick={() => setSel(i)} style={{ cursor: "pointer", background: i === sel ? "var(--accent-soft)" : (big ? "rgba(91,141,239,0.10)" : "transparent"), outline: i === sel ? "1px solid var(--accent)" : "none" }}>
             <td style={{ fontWeight: big ? 700 : 400 }}>{a.anunciante} {a.es_merchant ? <span className="merch" title="Merchant verificado">✦</span> : <span style={{ color: "var(--text-3)", fontSize: 10 }} title="No verificado">·</span>}</td>
             <td className="tnum" style={{ fontWeight: big ? 700 : 400, color: big ? "var(--accent)" : "var(--text)" }}>{fmt(a.disponible)} U</td>
             <td className="tnum">${fmt(a.precio, 2)}</td>
@@ -3939,18 +3951,29 @@ function Muros() {
     <div className="view tone-accent">
       <section className="chart-card">
         <div className="card-head"><h3>Muros de liquidez</h3><span className="card-sub">los anuncios más grandes · dónde ponerte para interceptar su flujo · actualiza 30s</span></div>
-        <div className="filters-grid" style={{ gridTemplateColumns: "200px 220px" }}>
+        <div className="filters-grid" style={{ gridTemplateColumns: "190px 200px 200px" }}>
           <div className="f-item"><label>Cuántos muros por lado</label><input type="number" min="3" max="15" value={topN} onChange={(e) => setTopN(parseInt(e.target.value) || 6)} /></div>
           <div className="f-item"><label>Resaltar si supera (USDT)</label><input type="number" step="1000" value={umbral} onChange={(e) => setUmbral(parseFloat(e.target.value) || 0)} /></div>
+          <div className="f-item"><label>Comisión ida+vuelta (%)</label><input type="number" step="0.01" value={comision} onChange={(e) => setComision(parseFloat(e.target.value) || 0)} /></div>
+        </div>
+        <div style={{ marginTop: 14, padding: "14px 16px", borderRadius: 12, background: "var(--bg-2)", border: "1px solid var(--line)" }}>
+          <div className="statcard-label">Brecha hipotética — clic en un muro de cada lado para comparar</div>
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: 18, marginTop: 8 }}>
+            <span style={{ fontSize: 13 }}>Vendés a <b style={{ color: "var(--buy)" }}>${fmt(sellP, 2)}</b>{wC ? " (" + wC.anunciante + ")" : ""}</span>
+            <span style={{ fontSize: 13 }}>Comprás a <b style={{ color: "var(--sell)" }}>${fmt(buyP, 2)}</b>{wV ? " (" + wV.anunciante + ")" : ""}</span>
+            <span style={{ fontSize: 22, fontWeight: 700, color: (netaPct != null && netaPct > 0) ? "var(--buy)" : "var(--sell)" }}>{brutaPct == null ? "—" : (brutaPct >= 0 ? "+" : "") + fmt(brutaPct, 3) + "% bruto"}</span>
+            <span style={{ fontSize: 15, color: (netaPct != null && netaPct > 0) ? "var(--buy)" : "var(--text-3)" }}>neta {netaPct == null ? "—" : (netaPct >= 0 ? "+" : "") + fmt(netaPct, 3) + "%"} (−{fmt(comision, 2)}% com.)</span>
+          </div>
+          {(muerta(cdC) || muerta(cdV)) ? <div style={{ fontSize: 12, color: "#ffd740", marginTop: 6 }}>⚠️ Uno de los dos muros tiene caudal muerto — esa brecha es teórica, ahí no te llenás.</div> : null}
         </div>
         <div className="market" style={{ gridTemplateColumns: "1fr 1fr", gap: "16px", marginTop: 14 }}>
           <div>
             <div className="ob-coltitle" style={{ color: "var(--buy)" }}>COMPRA · vendedores de USDT (acá vendés)</div>
-            {tabla(murosC, cmB, "BUY")}
+            {tabla(murosC, cmB, "BUY", selC, setSelC)}
           </div>
           <div>
             <div className="ob-coltitle" style={{ color: "var(--sell)" }}>VENTA · compradores de USDT (acá comprás)</div>
-            {tabla(murosV, cmS, "SELL")}
+            {tabla(murosV, cmS, "SELL", selV, setSelV)}
           </div>
         </div>
         <div className="intel-explain">
