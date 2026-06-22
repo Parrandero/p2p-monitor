@@ -2464,7 +2464,7 @@ function TopBar({ snap, secondsLeft, cycleMs }) {
 
 /* ---------- Tab bar ---------- */
 function Tabs({ tab, setTab }) {
-  const items = [["tr", "Tiempo Real"], ["hist", "Histórico"], ["precio", "Precio"], ["intel", "Inteligencia"], ["heat", "Mapa de Calor"], ["rot", "Rotación"], ["cross", "Cross"], ["backup", "Backup"]];
+  const items = [["tr", "Tiempo Real"], ["hist", "Histórico"], ["precio", "Precio"], ["intel", "Inteligencia"], ["heat", "Mapa de Calor"], ["rot", "Rotación"], ["cross", "Cross"], ["muros", "Muros"], ["backup", "Backup"]];
   return (
     <nav className="tabbar" role="tablist">
       {items.map(([k, label]) => (
@@ -3860,7 +3860,110 @@ function CrossView() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView };
+function Muros() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [estado, setEstado] = React.useState(null);
+  const [rotB, setRotB] = React.useState(null);
+  const [rotS, setRotS] = React.useState(null);
+  const [loading, setLoading] = React.useState(true);
+  const [umbral, setUmbral] = React.useState(10000);
+  const [topN, setTopN] = React.useState(6);
+
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => {
+      Promise.all([
+        fetch(B + "/api/estado").then(r => r.json()).catch(() => null),
+        fetch(B + "/api/inteligencia/rotacion?tipo=BUY&dias=7").then(r => r.json()).catch(() => null),
+        fetch(B + "/api/inteligencia/rotacion?tipo=SELL&dias=7").then(r => r.json()).catch(() => null),
+      ]).then(([e, b, sj]) => { if (!stop) { setEstado(e); setRotB(b); setRotS(sj); setLoading(false); } });
+    };
+    load();
+    const id = setInterval(load, 30000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+
+  const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("es-CL", { maximumFractionDigits: d });
+  if (loading) return <div className="intel-loading">Cargando libro y caudal…</div>;
+  if (!estado || !estado.detalle_compra) return <div className="intel-loading">Sin datos del libro todavía.</div>;
+
+  const caudalMap = (rot) => {
+    const m = {};
+    ((rot && rot.por_posicion) || []).forEach((r) => { m[parseInt(r.posicion)] = r; });
+    return m;
+  };
+  const cmB = caudalMap(rotB), cmS = caudalMap(rotS);
+
+  const muros = (detalle, central) => {
+    const ads = (detalle || []).filter((a) => central > 0 && Math.abs(a.precio - central) / central <= 0.03 && a.disponible > 0);
+    return ads.slice().sort((x, y) => y.disponible - x.disponible).slice(0, topN);
+  };
+  const centralC = parseFloat(estado.precio_pond_tab_compra) || parseFloat(estado.mejor_vendedor_tab_compra) || 0;
+  const centralV = parseFloat(estado.precio_pond_tab_venta) || parseFloat(estado.mejor_comprador_tab_venta) || 0;
+  const murosC = muros(estado.detalle_compra, centralC);
+  const murosV = muros(estado.detalle_venta, centralV);
+
+  const lab = (c) => c == null ? { t: "—", col: "var(--text-3)" } : c >= 100 ? { t: "🔥 alta", col: "#35e07a" } : c >= 40 ? { t: "media", col: "#ffd740" } : { t: "❄️ muerta", col: "var(--text-3)" };
+
+  const tabla = (lista, cm, lado) => (
+    <div className="intel-scroll">
+      <table className="intel-table">
+        <thead><tr>
+          <th>Anunciante</th>
+          <th title="Liquidez del anuncio (USDT disponible)">Tamaño</th>
+          <th>Precio</th>
+          <th title="Posición en el libro">Pos</th>
+          <th title="Caudal histórico que llega a esa posición (USDT/min)">Caudal</th>
+          <th title="Precio para quedar 1 centavo adelante del muro">Poné en</th>
+        </tr></thead>
+        <tbody>{lista.map((a, i) => {
+          const big = a.disponible >= umbral;
+          const cd = cm[parseInt(a.posicion)];
+          const cmin = cd ? cd.caudal_min : null;
+          const L = lab(cmin);
+          const sug = lado === "BUY" ? a.precio - 0.01 : a.precio + 0.01;
+          return <tr key={i} style={{ background: big ? "rgba(91,141,239,0.10)" : "transparent" }}>
+            <td style={{ fontWeight: big ? 700 : 400 }}>{a.anunciante} {a.es_merchant ? <span className="merch" title="Merchant verificado">✦</span> : <span style={{ color: "var(--text-3)", fontSize: 10 }} title="No verificado">·</span>}</td>
+            <td className="tnum" style={{ fontWeight: big ? 700 : 400, color: big ? "var(--accent)" : "var(--text)" }}>{fmt(a.disponible)} U</td>
+            <td className="tnum">${fmt(a.precio, 2)}</td>
+            <td className="tnum" style={{ color: "var(--text-3)" }}>{a.posicion}</td>
+            <td className="tnum" style={{ color: L.col }}>{cmin == null ? "" : fmt(cmin) + " "}<span style={{ fontSize: 11 }}>{L.t}</span></td>
+            <td className="tnum" style={{ color: "#35e07a", fontWeight: 600 }}>${fmt(sug, 2)}</td>
+          </tr>;
+        })}</tbody>
+      </table>
+    </div>
+  );
+
+  return (
+    <div className="view tone-accent">
+      <section className="chart-card">
+        <div className="card-head"><h3>Muros de liquidez</h3><span className="card-sub">los anuncios más grandes · dónde ponerte para interceptar su flujo · actualiza 30s</span></div>
+        <div className="filters-grid" style={{ gridTemplateColumns: "200px 220px" }}>
+          <div className="f-item"><label>Cuántos muros por lado</label><input type="number" min="3" max="15" value={topN} onChange={(e) => setTopN(parseInt(e.target.value) || 6)} /></div>
+          <div className="f-item"><label>Resaltar si supera (USDT)</label><input type="number" step="1000" value={umbral} onChange={(e) => setUmbral(parseFloat(e.target.value) || 0)} /></div>
+        </div>
+        <div className="market" style={{ gridTemplateColumns: "1fr 1fr", gap: "16px", marginTop: 14 }}>
+          <div>
+            <div className="ob-coltitle" style={{ color: "var(--buy)" }}>COMPRA · vendedores de USDT (acá vendés)</div>
+            {tabla(murosC, cmB, "BUY")}
+          </div>
+          <div>
+            <div className="ob-coltitle" style={{ color: "var(--sell)" }}>VENTA · compradores de USDT (acá comprás)</div>
+            {tabla(murosV, cmS, "SELL")}
+          </div>
+        </div>
+        <div className="intel-explain">
+          <b>Cómo usarlo:</b> los muros son los anuncios con más liquidez — marcan dónde se concentra el volumen. La columna <b>Poné en</b> te da el precio para quedar un centavo adelante de ese muro e interceptar su flujo. El <b>✦</b> es merchant verificado.<br/>
+          <b>Caudal:</b> cuánto flujo histórico llega a esa posición del libro. Un muro con caudal 🔥 alto es oro (te llenás); uno ❄️ muerto significa que casi nadie llega ahí, ponerte adelante no sirve. Buscá el muro más profundo (más spread para vos) que todavía tenga caudal decente.<br/>
+          <b>Ojo:</b> el caudal es promedio de 7 días por posición; las posiciones profundas (20+) tienen poca muestra y son ruidosas.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros };
 
 </script>
 <script type="text/babel">
@@ -3946,6 +4049,7 @@ function App() {
         {tab === "heat" && <V.Heatmap heatmap={heatmap} />}
         {tab === "rot" && <V.RotacionCalc />}
         {tab === "cross" && <V.CrossView />}
+        {tab === "muros" && <V.Muros />}
         {tab === "backup" && <V.Backup />}
       </main>
       <footer className="foot">
