@@ -616,7 +616,7 @@ def ciclo_colector_bybit():
                 try:
                     with get_conn() as conn:
                         with conn.cursor() as cur:
-                            cur.execute("DELETE FROM snapshots_detalle_bybit WHERE snapshot_timestamp < NOW() - INTERVAL '30 days'")
+                            cur.execute("DELETE FROM snapshots_detalle_bybit WHERE snapshot_timestamp < NOW() - INTERVAL '7 days'")
                         conn.commit()
                 except Exception as e:
                     print(f"[BYBIT purga] {e}")
@@ -659,7 +659,7 @@ def ciclo_colector():
             # ── Purga diaria ──────────────────────────────────
             hoy = datetime.now(SANTIAGO_TZ).date()
             if _ultima_purga != hoy:
-                purgar_detalle_antiguo(dias=30)
+                purgar_detalle_antiguo(dias=7)
                 _ultima_purga = hoy
             print("[COLECTOR] Consultando Binance BUY...")
             raw_compra = obtener_anuncios("BUY")
@@ -2436,6 +2436,25 @@ const ESTADO_ICON = { "MUY APTO": "▲▲", "APTO": "▲", "ESTRECHO": "▬", "N
 
 /* ---------- TopBar ---------- */
 function TopBar({ snap, secondsLeft, cycleMs }) {
+  // Reloj vivo: recalcula la edad del dato cada segundo. Si el colector sigue
+  // guardando, el contador se resetea cada ciclo (confirmacion de "en vivo").
+  // Si se corta, sigue subiendo y el indicador pasa a amarillo y luego rojo.
+  const [now, setNow] = React.useState(Date.now());
+  React.useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const ts = snap.timestamp ? Date.parse(String(snap.timestamp).replace(" ", "T")) : null;
+  const ageSec = ts ? Math.max(0, (now - ts) / 1000) : null;
+  const fresh = ageSec != null && ageSec < 180;   // < 3 min = en vivo
+  const dead  = ageSec == null || ageSec >= 360;   // > 6 min = colector parado
+  const tone  = dead ? "sell" : fresh ? "buy" : "warn";
+  const label = ageSec == null ? "SIN DATOS" : dead ? "SIN DATOS EN VIVO" : fresh ? "EN VIVO" : "RETRASADO";
+  const hace  = ageSec == null ? "—"
+    : ageSec < 60 ? "hace " + Math.round(ageSec) + "s"
+    : ageSec < 3600 ? "hace " + Math.round(ageSec / 60) + " min"
+    : "hace " + Math.round(ageSec / 3600) + " h";
+  const col = dead ? "var(--sell)" : fresh ? "var(--buy)" : "var(--warn)";
   return (
     <header className="topbar">
       <div className="brand">
@@ -2451,10 +2470,10 @@ function TopBar({ snap, secondsLeft, cycleMs }) {
         <span className="mc-src">Binance P2P</span>
       </div>
       <div className="topbar-right">
-        <LivePulse tone="buy" label="EN VIVO" />
+        <LivePulse tone={tone} label={label} />
         <div className="last-upd">
-          <div className="lu-label">Última actualización</div>
-          <div className="lu-time tnum">{snap.timestamp ? snap.timestamp.slice(11, 19) : "—"}</div>
+          <div className="lu-label">Actualizado</div>
+          <div className="lu-time tnum" style={{ color: col }}>{hace}</div>
         </div>
         <CountdownRing secondsLeft={secondsLeft} total={cycleMs / 1000} />
       </div>
@@ -3986,7 +4005,37 @@ function Muros() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros };
+function SystemBar({ snapTs }) {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [st, setSt] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/storage").then(r => r.json()).then(d => { if (!stop) setSt(d); }).catch(() => {});
+    load();
+    const id = setInterval(load, 60000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  const ageMin = snapTs ? (Date.now() - Date.parse(String(snapTs).replace(" ", "T"))) / 60000 : null;
+  const stale = ageMin != null && ageMin > 8;
+  const pct = st ? st.pct : null;
+  const barCol = pct == null ? "var(--text-3)" : pct >= 90 ? "var(--sell)" : pct >= 75 ? "var(--warn)" : "var(--buy)";
+  return (
+    <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
+      {st ? (
+        <div title="Espacio usado en la base de datos (aprox). Si llega a 100% el colector deja de guardar." style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 999, padding: "6px 14px" }}>
+          <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Almacenamiento</span>
+          <span style={{ width: 90, height: 6, background: "var(--bg-3)", borderRadius: 4, overflow: "hidden", display: "inline-block" }}>
+            <span style={{ display: "block", height: "100%", width: Math.min(100, pct || 0) + "%", background: barCol }}></span>
+          </span>
+          <b style={{ color: barCol }}>{pct == null ? "—" : pct + "%"}</b>
+          <span style={{ color: "var(--text-3)" }}>{st.libre_mb} MB libres / {st.limite_mb}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar };
 
 </script>
 <script type="text/babel">
@@ -4062,6 +4111,7 @@ function App() {
     <div className="app" data-animate={t.animatePrices ? "on" : "off"}>
       <Core.TopBar snap={viewSnap} secondsLeft={secondsLeft} cycleMs={state.cycleMs} />
       <Core.Tabs tab={tab} setTab={setTab} />
+      <V.SystemBar snapTs={viewSnap.timestamp} />
       {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
       <main className="content">
         {tab === "tr" && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
@@ -4705,6 +4755,30 @@ def api_cross():
         "comprar_binance_vender_bybit_pct": pct(bin_buy, byb_sell),
         "comprar_bybit_vender_binance_pct": pct(byb_buy, bin_sell),
         "nota": "Bruto, sin comisiones P2P ni costo de transferir USDT entre exchanges (red/retiro).",
+    })
+
+
+@app.route("/api/storage")
+def api_storage():
+    LIMITE_MB = 500.0   # volumen del plan Railway (ajustar si cambia)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_database_size(current_database())")
+            size = cur.fetchone()[0]
+            tablas = {}
+            for t in ("snapshots", "snapshots_detalle", "snapshots_detalle_bybit"):
+                try:
+                    cur.execute("SELECT pg_total_relation_size(%s)", (t,))
+                    tablas[t] = round(cur.fetchone()[0] / 1048576.0, 1)
+                except Exception:
+                    tablas[t] = None
+    usado = size / 1048576.0
+    return jsonify({
+        "usado_mb":  round(usado, 1),
+        "limite_mb": LIMITE_MB,
+        "libre_mb":  round(LIMITE_MB - usado, 1),
+        "pct":       round(usado / LIMITE_MB * 100, 1),
+        "tablas_mb": tablas,
     })
 
 
