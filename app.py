@@ -3890,6 +3890,7 @@ function Muros() {
   const [selC, setSelC] = React.useState(0);
   const [selV, setSelV] = React.useState(0);
   const [comision, setComision] = React.useState(0.36);
+  const [orden, setOrden] = React.useState(2000);
 
   React.useEffect(() => {
     let stop = false;
@@ -3935,8 +3936,38 @@ function Muros() {
   const muerta = (cd) => cd && cd.caudal_min != null && cd.caudal_min < 40;
 
   const lab = (c) => c == null ? { t: "—", col: "var(--text-3)" } : c >= 100 ? { t: "🔥 alta", col: "#35e07a" } : c >= 40 ? { t: "media", col: "#ffd740" } : { t: "❄️ muerta", col: "var(--text-3)" };
+  // Tiempo de llenado de TU orden a ese ritmo (caudal en USDT/min)
+  const tiempoLlen = (cmin) => {
+    if (cmin == null || cmin <= 0) return { t: "no se llena", col: "var(--text-3)" };
+    const min = orden / cmin;
+    const txt = min < 90 ? "~" + Math.round(min) + " min" : "~" + (min / 60).toFixed(1) + " h";
+    const col = min <= 20 ? "#35e07a" : min <= 60 ? "#ffd740" : "var(--text-3)";
+    return { t: txt, col };
+  };
+  // Mejor muro de cada lado: el precio mas conveniente que TODAVIA se llena (caudal >= 40)
+  const mejorIdx = (lista, cm, lado) => {
+    let best = -1, bp = null;
+    lista.forEach((a, i) => {
+      const cd = cm[parseInt(a.posicion)];
+      const cmin = cd ? cd.caudal_min : null;
+      if (cmin == null || cmin < 40) return;
+      if (lado === "BUY") { if (bp == null || a.precio > bp) { bp = a.precio; best = i; } }
+      else { if (bp == null || a.precio < bp) { bp = a.precio; best = i; } }
+    });
+    return best;
+  };
+  const mejorC = mejorIdx(murosC, cmB, "BUY");
+  const mejorV = mejorIdx(murosV, cmS, "SELL");
+  const resumen = (lista, cm, mejor, accion) => {
+    if (mejor < 0) return <span style={{ fontSize: 11.5, color: "var(--text-3)" }}>Ningún muro con flujo decente ahora mismo.</span>;
+    const a = lista[mejor];
+    const cd = cm[parseInt(a.posicion)];
+    const T = tiempoLlen(cd ? cd.caudal_min : null);
+    const sug = accion === "vender" ? a.precio - 0.01 : a.precio + 0.01;
+    return <span style={{ fontSize: 12, color: "var(--text-2)" }}>★ Mejor para <b>{accion}</b>: poné en <b style={{ color: "#35e07a" }}>${fmt(sug, 2)}</b> (adelante de {a.anunciante}, pos {a.posicion}) — te llenás en {T.t}.</span>;
+  };
 
-  const tabla = (lista, cm, lado, sel, setSel) => (
+  const tabla = (lista, cm, lado, sel, setSel, mejor) => (
     <div className="intel-scroll">
       <table className="intel-table">
         <thead><tr>
@@ -3944,7 +3975,8 @@ function Muros() {
           <th title="Liquidez del anuncio (USDT disponible)">Tamaño</th>
           <th>Precio</th>
           <th title="Posición en el libro">Pos</th>
-          <th title="Caudal histórico que llega a esa posición (USDT/min)">Caudal</th>
+          <th title="Ritmo de compra/venta en esa posición: USDT por minuto (promedio 7 días)">Flujo</th>
+          <th title="Cuánto tarda en llenarse TU orden a ese ritmo">Se llena en</th>
           <th title="Precio para quedar 1 centavo adelante del muro">Poné en</th>
         </tr></thead>
         <tbody>{lista.map((a, i) => {
@@ -3952,13 +3984,16 @@ function Muros() {
           const cd = cm[parseInt(a.posicion)];
           const cmin = cd ? cd.caudal_min : null;
           const L = lab(cmin);
+          const T = tiempoLlen(cmin);
           const sug = lado === "BUY" ? a.precio - 0.01 : a.precio + 0.01;
-          return <tr key={i} onClick={() => setSel(i)} style={{ cursor: "pointer", background: i === sel ? "var(--accent-soft)" : (big ? "rgba(91,141,239,0.10)" : "transparent"), outline: i === sel ? "1px solid var(--accent)" : "none" }}>
-            <td style={{ fontWeight: big ? 700 : 400 }}>{a.anunciante} {a.es_merchant ? <span className="merch" title="Merchant verificado">✦</span> : <span style={{ color: "var(--text-3)", fontSize: 10 }} title="No verificado">·</span>}</td>
-            <td className="tnum" style={{ fontWeight: big ? 700 : 400, color: big ? "var(--accent)" : "var(--text)" }}>{fmt(a.disponible)} U</td>
+          const esMejor = i === mejor;
+          return <tr key={i} onClick={() => setSel(i)} style={{ cursor: "pointer", background: i === sel ? "var(--accent-soft)" : (esMejor ? "rgba(53,224,122,0.10)" : (big ? "rgba(91,141,239,0.08)" : "transparent")), outline: i === sel ? "1px solid var(--accent)" : "none" }}>
+            <td style={{ fontWeight: big || esMejor ? 700 : 400 }}>{esMejor ? "★ " : ""}{a.anunciante} {a.es_merchant ? <span className="merch" title="Merchant verificado">✦</span> : <span style={{ color: "var(--text-3)", fontSize: 10 }} title="No verificado">·</span>}</td>
+            <td className="tnum" style={{ fontWeight: big ? 700 : 400, color: big ? "var(--accent)" : "var(--text)" }}>{fmt(a.disponible)} USDT</td>
             <td className="tnum">${fmt(a.precio, 2)}</td>
             <td className="tnum" style={{ color: "var(--text-3)" }}>{a.posicion}</td>
-            <td className="tnum" style={{ color: L.col }}>{cmin == null ? "" : fmt(cmin) + " "}<span style={{ fontSize: 11 }}>{L.t}</span></td>
+            <td className="tnum" style={{ color: L.col }}>{cmin == null ? "—" : fmt(cmin) + " U/min "}<span style={{ fontSize: 11 }}>{L.t}</span></td>
+            <td className="tnum" style={{ color: T.col }}>{T.t}</td>
             <td className="tnum" style={{ color: "#35e07a", fontWeight: 600 }}>${fmt(sug, 2)}</td>
           </tr>;
         })}</tbody>
@@ -3970,7 +4005,8 @@ function Muros() {
     <div className="view tone-accent">
       <section className="chart-card">
         <div className="card-head"><h3>Muros de liquidez</h3><span className="card-sub">los anuncios más grandes · dónde ponerte para interceptar su flujo · actualiza 30s</span></div>
-        <div className="filters-grid" style={{ gridTemplateColumns: "190px 200px 200px" }}>
+        <div className="filters-grid" style={{ gridTemplateColumns: "170px 180px 170px 180px" }}>
+          <div className="f-item"><label>Tu orden (USDT)</label><input type="number" step="500" value={orden} onChange={(e) => setOrden(parseFloat(e.target.value) || 0)} /></div>
           <div className="f-item"><label>Cuántos muros por lado</label><input type="number" min="3" max="15" value={topN} onChange={(e) => setTopN(parseInt(e.target.value) || 6)} /></div>
           <div className="f-item"><label>Resaltar si supera (USDT)</label><input type="number" step="1000" value={umbral} onChange={(e) => setUmbral(parseFloat(e.target.value) || 0)} /></div>
           <div className="f-item"><label>Comisión ida+vuelta (%)</label><input type="number" step="0.01" value={comision} onChange={(e) => setComision(parseFloat(e.target.value) || 0)} /></div>
@@ -3987,18 +4023,21 @@ function Muros() {
         </div>
         <div className="market" style={{ gridTemplateColumns: "1fr 1fr", gap: "16px", marginTop: 14 }}>
           <div>
-            <div className="ob-coltitle" style={{ color: "var(--buy)" }}>COMPRA · vendedores de USDT (acá vendés)</div>
-            {tabla(murosC, cmB, "BUY", selC, setSelC)}
+            <div className="ob-coltitle" style={{ color: "var(--buy)" }}>COMPRA · vendedores de USDT (acá VENDÉS)</div>
+            <div style={{ margin: "0 0 8px" }}>{resumen(murosC, cmB, mejorC, "vender")}</div>
+            {tabla(murosC, cmB, "BUY", selC, setSelC, mejorC)}
           </div>
           <div>
-            <div className="ob-coltitle" style={{ color: "var(--sell)" }}>VENTA · compradores de USDT (acá comprás)</div>
-            {tabla(murosV, cmS, "SELL", selV, setSelV)}
+            <div className="ob-coltitle" style={{ color: "var(--sell)" }}>VENTA · compradores de USDT (acá COMPRÁS)</div>
+            <div style={{ margin: "0 0 8px" }}>{resumen(murosV, cmS, mejorV, "comprar")}</div>
+            {tabla(murosV, cmS, "SELL", selV, setSelV, mejorV)}
           </div>
         </div>
         <div className="intel-explain">
           <b>Cómo usarlo:</b> los muros son los anuncios con más liquidez — marcan dónde se concentra el volumen. La columna <b>Poné en</b> te da el precio para quedar un centavo adelante de ese muro e interceptar su flujo. El <b>✦</b> es merchant verificado.<br/>
-          <b>Caudal:</b> cuánto flujo histórico llega a esa posición del libro. Un muro con caudal 🔥 alto es oro (te llenás); uno ❄️ muerto significa que casi nadie llega ahí, ponerte adelante no sirve. Buscá el muro más profundo (más spread para vos) que todavía tenga caudal decente.<br/>
-          <b>Ojo:</b> el caudal es promedio de 7 días por posición; las posiciones profundas (20+) tienen poca muestra y son ruidosas.
+          <b>Flujo y "Se llena en":</b> el flujo es cuántos USDT por minuto se mueven en esa posición (promedio 7 días). "Se llena en" traduce eso a cuánto tarda TU orden (la de arriba) en completarse ahí: verde = rápido, amarillo = lento, gris = no se llena. Buscá el muro más profundo (más spread) que todavía se llene en un tiempo razonable.<br/>
+          <b>★ Mejor:</b> te marca automáticamente el muro con mejor precio de cada lado que todavía tenga flujo decente. La línea de arriba te lo dice en criollo.<br/>
+          <b>Ojo:</b> el flujo es promedio de 7 días por posición; las posiciones profundas (20+) tienen poca muestra y son ruidosas.
         </div>
       </section>
     </div>
