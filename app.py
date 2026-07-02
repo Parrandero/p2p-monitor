@@ -3940,7 +3940,12 @@ function Muros() {
   const tiempoLlen = (cmin) => {
     if (cmin == null || cmin <= 0) return { t: "no se llena", col: "var(--text-3)" };
     const min = orden / cmin;
-    const txt = min < 90 ? "~" + Math.round(min) + " min" : "~" + (min / 60).toFixed(1) + " h";
+    const lo = min * 0.5, hi = min * 2;   // rango: los llenados son a los saltos
+    const u = (m) => m < 90 ? Math.round(m) + " min" : (m / 60).toFixed(1) + " h";
+    let txt;
+    if (hi < 90) txt = Math.round(lo) + "-" + Math.round(hi) + " min";
+    else if (lo >= 90) txt = (lo / 60).toFixed(1) + "-" + (hi / 60).toFixed(1) + " h";
+    else txt = Math.round(lo) + " min - " + u(hi);
     const col = min <= 20 ? "#35e07a" : min <= 60 ? "#ffd740" : "var(--text-3)";
     return { t: txt, col };
   };
@@ -3951,6 +3956,7 @@ function Muros() {
       const cd = cm[parseInt(a.posicion)];
       const cmin = cd ? cd.caudal_min : null;
       if (cmin == null || cmin < 40) return;
+      if (cd.obs != null && cd.obs < 200) return;   // ignorar posiciones con poca muestra (ruidosas)
       if (lado === "BUY") { if (bp == null || a.precio > bp) { bp = a.precio; best = i; } }
       else { if (bp == null || a.precio < bp) { bp = a.precio; best = i; } }
     });
@@ -4035,8 +4041,8 @@ function Muros() {
         </div>
         <div className="intel-explain">
           <b>Cómo usarlo:</b> los muros son los anuncios con más liquidez — marcan dónde se concentra el volumen. La columna <b>Poné en</b> te da el precio para quedar un centavo adelante de ese muro e interceptar su flujo. El <b>✦</b> es merchant verificado.<br/>
-          <b>Flujo y "Se llena en":</b> el flujo es cuántos USDT por minuto se mueven en esa posición (promedio 7 días). "Se llena en" traduce eso a cuánto tarda TU orden (la de arriba) en completarse ahí: verde = rápido, amarillo = lento, gris = no se llena. Buscá el muro más profundo (más spread) que todavía se llene en un tiempo razonable.<br/>
-          <b>★ Mejor:</b> te marca automáticamente el muro con mejor precio de cada lado que todavía tenga flujo decente. La línea de arriba te lo dice en criollo.<br/>
+          <b>Flujo y "Se llena en":</b> el flujo es cuántos USDT/min se mueven en esa posición (promedio 7 días). "Se llena en" traduce eso a cuánto tardaría TU orden (la de arriba), como <b>rango</b> — los llenados son a los saltos, así que es un estimado, no un cronómetro. Usalo para comparar (este muro llena más rápido que aquel).<br/>
+          <b>★ Mejor:</b> el muro con mejor precio de cada lado que todavía se llena. Ignora las posiciones muy profundas con poca muestra (ruidosas), así no te manda a un lugar poco confiable. La línea de arriba te lo dice en criollo.<br/>
           <b>Ojo:</b> el flujo es promedio de 7 días por posición; las posiciones profundas (20+) tienen poca muestra y son ruidosas.
         </div>
       </section>
