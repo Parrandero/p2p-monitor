@@ -3185,11 +3185,11 @@ function PrecioChart() {
         });
 
         serieCompra = chart.addLineSeries({
-          color: "#35e07a", lineWidth: 2, title: "Vendés USDT",
+          color: "#35e07a", lineWidth: 2, lastValueVisible: true, priceLineVisible: false,
           priceFormat: { type: "price", precision: 2, minMove: 0.01 },
         });
         serieVenta = chart.addLineSeries({
-          color: "#ff5d6c", lineWidth: 2, title: "Comprás USDT",
+          color: "#ff5d6c", lineWidth: 2, lastValueVisible: true, priceLineVisible: false,
           priceFormat: { type: "price", precision: 2, minMove: 0.01 },
         });
         serieCompra.setData(compra);
@@ -3253,8 +3253,10 @@ function PrecioChart() {
       return;
     }
     const ahora = compra[compra.length - 1].time;
+    const primero = compra[0].time;
     const dias = cual === "24h" ? 1 : cual === "7d" ? 7 : 30;
-    chart.timeScale().setVisibleRange({ from: ahora - dias * 86400, to: ahora + 3600 });
+    const desde = Math.max(primero, ahora - dias * 86400);
+    chart.timeScale().setVisibleRange({ from: desde, to: ahora + 3600 });
   }
 
   return (
@@ -4100,10 +4102,10 @@ function VolumenBar() {
   return (
     <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "wrap", gap: 16, alignItems: "center", fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px" }}>
       <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Volumen USDT</span>
-      <span>Hoy: <b style={{ color: "var(--text)" }}>{fmt(v.hoy.total)}</b></span>
-      <span>Última hora: <b style={{ color: "var(--text)" }}>{fmt(v.hora.total)}</b></span>
-      <span>4h: <b style={{ color: "var(--text)" }}>{fmt(v.vol_4h)}</b> {chgTag(v.cambio_4h_pct)}</span>
-      <span>24h: <b style={{ color: "var(--text)" }}>{fmt(v.vol_24h)}</b> {chgTag(v.cambio_24h_pct)}</span>
+      <span title="Acumulado desde las 00:00 de hoy (hora Chile). Se pone en CERO a la medianoche y vuelve a empezar. Es el unico que corta por dia de calendario.">Hoy <span style={{ color: "var(--text-3)", fontSize: 10 }}>(desde 00:00)</span>: <b style={{ color: "var(--text)" }}>{fmt(v.hoy.total)}</b></span>
+      <span title="Ventana MOVIL: siempre los ultimos 60 minutos hacia atras desde este instante. No espera al cambio de hora; se corre minuto a minuto.">Ultima hora <span style={{ color: "var(--text-3)", fontSize: 10 }}>(movil)</span>: <b style={{ color: "var(--text)" }}>{fmt(v.hora.total)}</b></span>
+      <span title="Volumen de las ultimas 4 horas (ventana movil, no espera al cambio de hora). La flecha compara contra las 4 horas anteriores a esas.">4h <span style={{ color: "var(--text-3)", fontSize: 10 }}>(movil)</span>: <b style={{ color: "var(--text)" }}>{fmt(v.vol_4h)}</b> {chgTag(v.cambio_4h_pct)}</span>
+      <span title="Volumen de las ultimas 24 horas (ventana movil, corre en tiempo real). La flecha compara contra las 24 horas previas.">24h <span style={{ color: "var(--text-3)", fontSize: 10 }}>(movil)</span>: <b style={{ color: "var(--text)" }}>{fmt(v.vol_24h)}</b> {chgTag(v.cambio_24h_pct)}</span>
       <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
         Presión:
         <span style={{ width: 130, height: 8, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block", position: "relative" }}>
