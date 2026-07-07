@@ -5,7 +5,7 @@ import requests
 import threading
 import time
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, Response, request
 import psycopg2
@@ -2553,9 +2553,9 @@ function SideCard({ side, snap, history }) {
     <article className={"sidecard tone-" + tone} data-screen-label={isBuy ? "Tab Compra" : "Tab Venta"}>
       <div className="sc-head">
         <span className="sc-badge">{isBuy ? "TAB COMPRA" : "TAB VENTA"}</span>
-        <span className="sc-role">{isBuy ? "Vendedores de USDT" : "Compradores de USDT"}</span>
+        <span className="sc-role">{isBuy ? "ACÁ VENDÉS USDT" : "ACÁ COMPRÁS USDT"}</span>
       </div>
-      <div className="sc-desc">{isBuy ? "El usuario viene acá a comprar" : "El usuario viene acá a vender"}</div>
+      <div className="sc-desc">{isBuy ? "Vendedores de USDT · posteás tu anuncio de VENTA" : "Compradores de USDT · posteás tu anuncio de COMPRA"}</div>
 
       <div className="sc-pond">
         <div className="sc-pond-label">Precio ponderado</div>
@@ -3026,7 +3026,7 @@ function Historico({ history }) {
         <StatCard label="Muestras" value={history.length} tone="accent" />
       </div>
       <section className="chart-card">
-        <div className="card-head"><h3>Precio ponderado · compra vs venta</h3><span className="card-sub">cómo se mueve el precio</span></div>
+        <div className="card-head"><h3>Precio · vendés vs comprás USDT</h3><span className="card-sub">verde = vendés USDT · rojo = comprás USDT</span></div>
         <TimeChart height={240} yUnit="" xLabels={labels} times={times} decimals={1}
           series={[
             { data: history.map((h) => h.precio_pond_tab_compra), tone: "buy", label: "Compra (vendedores)", fill: false },
@@ -3184,11 +3184,11 @@ function PrecioChart() {
         });
 
         serieCompra = chart.addLineSeries({
-          color: "#35e07a", lineWidth: 2, title: "Compra",
+          color: "#35e07a", lineWidth: 2, title: "Vendés USDT",
           priceFormat: { type: "price", precision: 2, minMove: 0.01 },
         });
         serieVenta = chart.addLineSeries({
-          color: "#ff5d6c", lineWidth: 2, title: "Venta",
+          color: "#ff5d6c", lineWidth: 2, title: "Comprás USDT",
           priceFormat: { type: "price", precision: 2, minMove: 0.01 },
         });
         serieCompra.setData(compra);
@@ -3266,8 +3266,8 @@ function PrecioChart() {
         {estado === "ok" && (
           <div className="precio-top">
             <div className="precio-leg">
-              <span className="pl-item"><span className="pl-dot" style={{ background: "#35e07a" }} />Compra {meta.ultCompra ? "$" + meta.ultCompra.toFixed(2) : ""}</span>
-              <span className="pl-item"><span className="pl-dot" style={{ background: "#ff5d6c" }} />Venta {meta.ultVenta ? "$" + meta.ultVenta.toFixed(2) : ""}</span>
+              <span className="pl-item"><span className="pl-dot" style={{ background: "#35e07a" }} />Vendés USDT {meta.ultCompra ? "$" + meta.ultCompra.toFixed(2) : ""}</span>
+              <span className="pl-item"><span className="pl-dot" style={{ background: "#ff5d6c" }} />Comprás USDT {meta.ultVenta ? "$" + meta.ultVenta.toFixed(2) : ""}</span>
               {brecha && (
                 <span className="pl-brecha tnum">
                   Brecha <b>${brecha.abs}</b> · <b>{brecha.pct}%</b>
@@ -4080,7 +4080,38 @@ function SystemBar({ snapTs }) {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar };
+function VolumenBar() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [v, setV] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/volumen").then(r => r.json()).then(d => { if (!stop) setV(d); }).catch(() => {});
+    load();
+    const id = setInterval(load, 60000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  const fmt = (x) => x == null ? "—" : Number(x).toLocaleString("es-CL");
+  if (!v) return null;
+  const pc = v.presion_compra_pct;   // % del volumen que es COMPRA de USDT (demanda)
+  return (
+    <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "wrap", gap: 16, alignItems: "center", fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px" }}>
+      <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Volumen USDT</span>
+      <span>Hoy: <b style={{ color: "var(--text)" }}>{fmt(v.hoy.total)}</b></span>
+      <span>Última hora: <b style={{ color: "var(--text)" }}>{fmt(v.hora.total)}</b></span>
+      <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        Presión:
+        <span style={{ width: 130, height: 8, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block", position: "relative" }}>
+          <span style={{ display: "block", height: "100%", width: pc + "%", background: "var(--buy)" }}></span>
+        </span>
+        <b style={{ color: "var(--buy)" }}>{fmt(pc)}% compran</b>
+        <span style={{ color: "var(--sell)" }}>{fmt(Math.round(100 - pc))}% venden</span>
+      </span>
+      <span title="Compran USDT = takers comprando (demanda). Venden = takers vendiendo (oferta). Presión alta de compra empuja el precio arriba." style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
+    </div>
+  );
+}
+
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar };
 
 </script>
 <script type="text/babel">
@@ -4157,6 +4188,7 @@ function App() {
       <Core.TopBar snap={viewSnap} secondsLeft={secondsLeft} cycleMs={state.cycleMs} />
       <Core.Tabs tab={tab} setTab={setTab} />
       <V.SystemBar snapTs={viewSnap.timestamp} />
+      <V.VolumenBar />
       {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
       <main className="content">
         {tab === "tr" && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
@@ -4824,6 +4856,43 @@ def api_storage():
         "libre_mb":  round(LIMITE_MB - usado, 1),
         "pct":       round(usado / LIMITE_MB * 100, 1),
         "tablas_mb": tablas,
+    })
+
+
+@app.route("/api/volumen")
+def api_volumen():
+    """Volumen operado (USDT) hoy y última hora, separado por lado.
+    BUY = USDT que los takers COMPRAN (demanda). SELL = USDT que VENDEN (oferta).
+    Cap por paso para descartar el ruido de reposicionamiento."""
+    now = datetime.now(SANTIAGO_TZ)
+    hoy0   = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    hace1h = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                WITH cons AS (
+                    SELECT tipo, snapshot_timestamp,
+                        LEAST(GREATEST(0, LAG(disponible) OVER (
+                            PARTITION BY anunciante, tipo ORDER BY snapshot_timestamp) - disponible), 5000) AS c
+                    FROM snapshots_detalle
+                    WHERE snapshot_timestamp >= %(hoy0)s
+                )
+                SELECT tipo,
+                    COALESCE(SUM(c), 0) AS hoy,
+                    COALESCE(SUM(c) FILTER (WHERE snapshot_timestamp >= %(h1)s), 0) AS hora
+                FROM cons GROUP BY tipo
+            """, {"hoy0": hoy0, "h1": hace1h})
+            rows = {r["tipo"]: r for r in cur.fetchall()}
+    def g(t, k):
+        return float(rows.get(t, {}).get(k, 0) or 0)
+    buy_hoy, sell_hoy = g("BUY", "hoy"), g("SELL", "hoy")
+    buy_h, sell_h = g("BUY", "hora"), g("SELL", "hora")
+    tot_hoy = buy_hoy + sell_hoy
+    tot_h = buy_h + sell_h
+    return jsonify({
+        "hoy":   {"compra_usdt": round(buy_hoy), "venta_usdt": round(sell_hoy), "total": round(tot_hoy)},
+        "hora":  {"compra_usdt": round(buy_h),   "venta_usdt": round(sell_h),   "total": round(tot_h)},
+        "presion_compra_pct": round(buy_hoy / tot_hoy * 100, 1) if tot_hoy else 50.0,
     })
 
 
