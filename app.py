@@ -3120,6 +3120,7 @@ function PrecioChart() {
   const [meta, setMeta] = vS({ puntos: 0, ultCompra: null, ultVenta: null });
   const [rango, setRango] = vS("todo"); // 24h | 7d | todo
   const [brecha, setBrecha] = vS(null); // { abs, pct } al hover
+  const [hoverP, setHoverP] = vS(null); // { c, v } precio al hover
 
   vE(() => {
     let chart = null, serieCompra = null, serieVenta = null, ro = null, cancelado = false;
@@ -3215,8 +3216,9 @@ function PrecioChart() {
             const abs = pc.value - pv.value;
             const pct = (abs / pv.value) * 100;
             setBrecha({ abs: abs.toFixed(2), pct: pct.toFixed(3) });
+            setHoverP({ c: pc.value, v: pv.value });
           } else {
-            setBrecha(null);
+            setBrecha(null); setHoverP(null);
           }
         });
 
@@ -3251,8 +3253,8 @@ function PrecioChart() {
       return;
     }
     const ahora = compra[compra.length - 1].time;
-    const desde = cual === "24h" ? ahora - 86400 : ahora - 7 * 86400;
-    chart.timeScale().setVisibleRange({ from: desde, to: ahora + 3600 });
+    const dias = cual === "24h" ? 1 : cual === "7d" ? 7 : 30;
+    chart.timeScale().setVisibleRange({ from: ahora - dias * 86400, to: ahora + 3600 });
   }
 
   return (
@@ -3266,8 +3268,8 @@ function PrecioChart() {
         {estado === "ok" && (
           <div className="precio-top">
             <div className="precio-leg">
-              <span className="pl-item"><span className="pl-dot" style={{ background: "#35e07a" }} />Vendés USDT {meta.ultCompra ? "$" + meta.ultCompra.toFixed(2) : ""}</span>
-              <span className="pl-item"><span className="pl-dot" style={{ background: "#ff5d6c" }} />Comprás USDT {meta.ultVenta ? "$" + meta.ultVenta.toFixed(2) : ""}</span>
+              <span className="pl-item"><span className="pl-dot" style={{ background: "#35e07a" }} />Vendés USDT <b style={{marginLeft:4}}>{hoverP ? "$" + hoverP.c.toFixed(2) : (meta.ultCompra ? "$" + meta.ultCompra.toFixed(2) : "")}</b></span>
+              <span className="pl-item"><span className="pl-dot" style={{ background: "#ff5d6c" }} />Comprás USDT <b style={{marginLeft:4}}>{hoverP ? "$" + hoverP.v.toFixed(2) : (meta.ultVenta ? "$" + meta.ultVenta.toFixed(2) : "")}</b></span>
               {brecha && (
                 <span className="pl-brecha tnum">
                   Brecha <b>${brecha.abs}</b> · <b>{brecha.pct}%</b>
@@ -3275,7 +3277,7 @@ function PrecioChart() {
               )}
             </div>
             <div className="precio-rangos">
-              {[["24h", "24h"], ["7d", "7 días"], ["todo", "Todo"]].map(([k, lbl]) => (
+              {[["24h", "24h"], ["7d", "7 días"], ["30d", "30 días"], ["todo", "Todo"]].map(([k, lbl]) => (
                 <button key={k} className={"pr-btn" + (rango === k ? " on" : "")} onClick={() => aplicarRango(k)}>{lbl}</button>
               ))}
             </div>
@@ -4091,6 +4093,8 @@ function VolumenBar() {
     return () => { stop = true; clearInterval(id); };
   }, []);
   const fmt = (x) => x == null ? "—" : Number(x).toLocaleString("es-CL");
+  const chgTag = (p) => p == null ? <span style={{ color: "var(--text-3)" }}>—</span> :
+    <b style={{ color: p >= 0 ? "var(--buy)" : "var(--sell)" }}>{p >= 0 ? "▲" : "▼"}{Math.abs(p)}%</b>;
   if (!v) return null;
   const pc = v.presion_compra_pct;   // % del volumen que es COMPRA de USDT (demanda)
   return (
@@ -4098,6 +4102,8 @@ function VolumenBar() {
       <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Volumen USDT</span>
       <span>Hoy: <b style={{ color: "var(--text)" }}>{fmt(v.hoy.total)}</b></span>
       <span>Última hora: <b style={{ color: "var(--text)" }}>{fmt(v.hora.total)}</b></span>
+      <span>4h: <b style={{ color: "var(--text)" }}>{fmt(v.vol_4h)}</b> {chgTag(v.cambio_4h_pct)}</span>
+      <span>24h: <b style={{ color: "var(--text)" }}>{fmt(v.vol_24h)}</b> {chgTag(v.cambio_24h_pct)}</span>
       <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
         Presión:
         <span style={{ width: 130, height: 8, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block", position: "relative" }}>
@@ -4865,34 +4871,43 @@ def api_volumen():
     BUY = USDT que los takers COMPRAN (demanda). SELL = USDT que VENDEN (oferta).
     Cap por paso para descartar el ruido de reposicionamiento."""
     now = datetime.now(SANTIAGO_TZ)
-    hoy0   = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-    hace1h = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    def f(dt): return dt.strftime("%Y-%m-%d %H:%M:%S")
+    hoy0 = f(now.replace(hour=0, minute=0, second=0, microsecond=0))
+    h1, h4, h8 = f(now - timedelta(hours=1)), f(now - timedelta(hours=4)), f(now - timedelta(hours=8))
+    h24, h48 = f(now - timedelta(hours=24)), f(now - timedelta(hours=48))
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 WITH cons AS (
-                    SELECT tipo, snapshot_timestamp,
+                    SELECT tipo, snapshot_timestamp AS t,
                         LEAST(GREATEST(0, LAG(disponible) OVER (
                             PARTITION BY anunciante, tipo ORDER BY snapshot_timestamp) - disponible), 5000) AS c
                     FROM snapshots_detalle
-                    WHERE snapshot_timestamp >= %(hoy0)s
+                    WHERE snapshot_timestamp >= %(h48)s
                 )
                 SELECT tipo,
-                    COALESCE(SUM(c), 0) AS hoy,
-                    COALESCE(SUM(c) FILTER (WHERE snapshot_timestamp >= %(h1)s), 0) AS hora
+                    COALESCE(SUM(c) FILTER (WHERE t >= %(hoy0)s), 0) AS hoy,
+                    COALESCE(SUM(c) FILTER (WHERE t >= %(h1)s), 0)   AS hora,
+                    COALESCE(SUM(c) FILTER (WHERE t >= %(h4)s), 0)   AS u4,
+                    COALESCE(SUM(c) FILTER (WHERE t >= %(h8)s AND t < %(h4)s), 0)  AS p4,
+                    COALESCE(SUM(c) FILTER (WHERE t >= %(h24)s), 0)  AS u24,
+                    COALESCE(SUM(c) FILTER (WHERE t >= %(h48)s AND t < %(h24)s), 0) AS p24
                 FROM cons GROUP BY tipo
-            """, {"hoy0": hoy0, "h1": hace1h})
+            """, {"hoy0": hoy0, "h1": h1, "h4": h4, "h8": h8, "h24": h24, "h48": h48})
             rows = {r["tipo"]: r for r in cur.fetchall()}
-    def g(t, k):
-        return float(rows.get(t, {}).get(k, 0) or 0)
-    buy_hoy, sell_hoy = g("BUY", "hoy"), g("SELL", "hoy")
-    buy_h, sell_h = g("BUY", "hora"), g("SELL", "hora")
+    def g(k):
+        return float(rows.get("BUY", {}).get(k, 0) or 0) + float(rows.get("SELL", {}).get(k, 0) or 0)
+    buy_hoy = float(rows.get("BUY", {}).get("hoy", 0) or 0)
+    sell_hoy = float(rows.get("SELL", {}).get("hoy", 0) or 0)
     tot_hoy = buy_hoy + sell_hoy
-    tot_h = buy_h + sell_h
+    u4, p4, u24, p24 = g("u4"), g("p4"), g("u24"), g("p24")
+    def chg(u, p): return round((u - p) / p * 100, 1) if p else None
     return jsonify({
-        "hoy":   {"compra_usdt": round(buy_hoy), "venta_usdt": round(sell_hoy), "total": round(tot_hoy)},
-        "hora":  {"compra_usdt": round(buy_h),   "venta_usdt": round(sell_h),   "total": round(tot_h)},
+        "hoy":   {"total": round(tot_hoy)},
+        "hora":  {"total": round(g("hora"))},
         "presion_compra_pct": round(buy_hoy / tot_hoy * 100, 1) if tot_hoy else 50.0,
+        "vol_4h": round(u4), "cambio_4h_pct": chg(u4, p4),
+        "vol_24h": round(u24), "cambio_24h_pct": chg(u24, p24),
     })
 
 
