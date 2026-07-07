@@ -3614,15 +3614,16 @@ function Backup() {
   const [dias, setDias] = React.useState(30);
   const [tipo, setTipo] = React.useState("ALL");
   const [fmt, setFmt]   = React.useState("csv");
+  const [fuente, setFuente] = React.useState("binance");
   const [msg, setMsg]   = React.useState("");
   const last = (() => { try { return parseInt(localStorage.getItem("ua_p2p_last_backup") || "0"); } catch (e) { return 0; } })();
   const lastTxt = last ? new Date(last).toLocaleString("es-CL") : "nunca";
   const diasDesde = last ? Math.floor((Date.now() - last) / 86400000) : null;
   const descargar = () => {
-    const url = B + "/api/export/detalle?dias=" + dias + "&tipo=" + tipo + "&fmt=" + fmt;
+    const url = B + "/api/export/detalle?dias=" + dias + "&tipo=" + tipo + "&fmt=" + fmt + "&fuente=" + fuente;
     const a = document.createElement("a");
     a.href = url;
-    a.download = "detalle_" + tipo + "_" + dias + "d." + fmt;
+    a.download = "detalle_" + fuente + "_" + tipo + "_" + dias + "d." + fmt;
     document.body.appendChild(a); a.click(); a.remove();
     try { localStorage.setItem("ua_p2p_last_backup", String(Date.now())); } catch (e) {}
     setMsg("✅ Descarga iniciada. Guardá el archivo en Drive o un disco externo para tener tu copia.");
@@ -3634,6 +3635,11 @@ function Backup() {
         <div style={{ marginBottom: 6 }}><SystemBar /></div>
         <p className="backup-last">Última copia registrada en este navegador: <b>{lastTxt}</b>{diasDesde !== null ? " (hace " + diasDesde + " días)" : ""}.</p>
         <div className="backup-grid">
+          <div className="f-item"><label>Exchange</label>
+            <select value={fuente} onChange={e => setFuente(e.target.value)}>
+              <option value="binance">Binance</option>
+              <option value="bybit">Bybit</option>
+            </select></div>
           <div className="f-item"><label>Días de datos</label>
             <input type="number" min="1" max="365" value={dias} onChange={e => setDias(parseInt(e.target.value) || 1)} /></div>
           <div className="f-item"><label>Lado</label>
@@ -3650,13 +3656,13 @@ function Backup() {
         </div>
         <div className="backup-actions">
           <button className="btn-apply dirty" onClick={descargar}>⬇ Descargar {fmt.toUpperCase()}</button>
-          <span className="backup-last">Genera: <code>detalle_{tipo}_{dias}d.{fmt}</code></span>
+          <span className="backup-last">Genera: <code>detalle_{fuente}_{tipo}_{dias}d.{fmt}</code></span>
         </div>
         {msg && <div className="backup-msg">{msg}</div>}
         <div className="backup-help">
           <b>Cómo hacerlo vos mismo sin esta página:</b> abrí en el navegador la dirección de tu monitor seguida de:<br/>
-          <code>/api/export/detalle?dias=30&tipo=ALL&fmt=csv</code><br/>
-          Cambiá <code>dias</code> por los que quieras, <code>tipo</code> por BUY/SELL/ALL y <code>fmt</code> por csv/json. El archivo se descarga solo.<br/><br/>
+          <code>/api/export/detalle?dias=30&tipo=ALL&fmt=csv&fuente=binance</code><br/>
+          Cambiá <code>dias</code> por los que quieras, <code>tipo</code> por BUY/SELL/ALL, <code>fmt</code> por csv/json y <code>fuente</code> por binance/bybit. El archivo se descarga solo.<br/><br/>
           <b>Recomendación:</b> exportá al menos una vez por semana y guardá el CSV en Drive o disco externo. La base se purga automáticamente a los 30 días, así que un backup mensual conserva tu historia completa.
         </div>
       </section>
@@ -5009,6 +5015,8 @@ def api_export_detalle():
         dias = 7
     tipo = (request.args.get("tipo", "ALL") or "ALL").upper()
     fmt  = (request.args.get("fmt", "csv") or "csv").lower()
+    fuente = (request.args.get("fuente", "binance") or "binance").lower()
+    tabla = "snapshots_detalle_bybit" if fuente == "bybit" else "snapshots_detalle"
     limit_arg = request.args.get("limit")
 
     where  = ["snapshot_timestamp >= NOW() - (%s || ' days')::INTERVAL"]
@@ -5019,7 +5027,7 @@ def api_export_detalle():
     sql = """
         SELECT snapshot_timestamp, hora, tipo, posicion, anunciante,
                precio, disponible, completadas, tasa_exito, es_merchant
-        FROM snapshots_detalle
+        FROM """ + tabla + """
         WHERE """ + " AND ".join(where) + """
         ORDER BY snapshot_timestamp DESC, tipo, posicion
     """
@@ -5065,7 +5073,7 @@ def api_export_detalle():
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=detalle_{tipo}_{dias}d.csv"},
+        headers={"Content-Disposition": f"attachment; filename=detalle_{fuente}_{tipo}_{dias}d.csv"},
     )
 
 
