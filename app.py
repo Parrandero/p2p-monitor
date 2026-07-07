@@ -909,6 +909,7 @@ body {
 .spine-label { font-size: 9.5px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.1em; }
 .spine-val { font-size: 17px; color: var(--text); margin-top: 3px; }
 .spine-pct { font-size: 12px; color: var(--accent); margin-top: 2px; }
+.sc-leader-val, .spine-val, .spine-pct, .rank-liq, .rank-price, .ob-price, .ob-amt { font-variant-numeric: tabular-nums; }
 
 /* ---------- Maker ---------- */
 .maker { border: 1px solid var(--line); border-radius: var(--card-r); background: var(--bg-1); padding: var(--pad); }
@@ -920,7 +921,7 @@ body {
 .mc-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .mc-title { font-size: 13px; font-weight: 600; color: var(--text); letter-spacing: 0.01em; }
 .mc-side { font-size: 11px; color: var(--text-3); }
-.mc-price { font-size: clamp(26px, 3.4vw, 34px); font-weight: 500; color: var(--tone); margin: 8px 0 6px; }
+.mc-price { font-size: clamp(26px, 3.4vw, 34px); font-weight: 500; color: var(--tone); margin: 8px 0 6px; font-variant-numeric: tabular-nums; }
 .mc-note { font-size: 12.5px; color: var(--text-2); }
 .mc-note b { color: var(--text); font-weight: 600; }
 .mc-tip { font-size: 11.5px; color: var(--text-3); margin-top: 8px; }
@@ -934,7 +935,7 @@ body {
 .precio-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
 .precio-leg { display: flex; gap: 16px; flex-wrap: wrap; }
 .pl-item { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
-.pl-brecha { font-size: 12px; color: var(--color-warn, #ffd740); background: rgba(255,215,64,0.1); border: 1px solid rgba(255,215,64,0.25); border-radius: 6px; padding: 2px 10px; margin-left: 4px; }
+.pl-brecha { font-size: 12px; color: var(--warn); background: var(--warn-soft); border: 1px solid color-mix(in oklch, var(--warn) 35%, transparent); border-radius: 6px; padding: 2px 10px; margin-left: 4px; font-variant-numeric: tabular-nums; }
 .pl-dot { width: 10px; height: 10px; border-radius: 3px; }
 .precio-rangos { display: flex; gap: 6px; }
 .pr-btn { font-size: 12px; padding: 5px 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg-2); color: var(--text-2); cursor: pointer; }
@@ -4104,7 +4105,7 @@ function VolumenBar() {
   if (!v) return null;
   const pc = v.presion_compra_pct;   // % del volumen que es COMPRA de USDT (demanda)
   return (
-    <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "nowrap", gap: 14, alignItems: "center", fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", overflowX: "auto", whiteSpace: "nowrap" }}>
+    <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "nowrap", gap: 14, alignItems: "center", fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", overflowX: "auto", whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
       <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10, flexShrink: 0 }}>Volumen USDT</span>
       <span style={{ flexShrink: 0 }} title="Acumulado desde las 00:00 de hoy (hora Chile). Se pone en CERO a la medianoche. Es el unico que corta por dia de calendario; el resto son ventanas moviles.">Hoy: <b style={{ color: "var(--text)" }}>{fmt(v.hoy.total)}</b></span>
       <span style={{ flexShrink: 0 }} title="Ventana MOVIL: los ultimos 60 minutos hacia atras. La flecha compara contra los 60 minutos anteriores a esos.">1h: <b style={{ color: "var(--text)" }}>{fmt(v.hora.total)}</b> {chgTag(v.cambio_1h_pct)}</span>
