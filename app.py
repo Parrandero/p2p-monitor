@@ -1198,6 +1198,8 @@ body {
   .heat { grid-template-columns: 34px 1fr; }
   .velocity { grid-template-columns: 1fr; gap: 14px; }
   .vel-meter { min-width: 0; justify-content: space-between; }
+  .backup-grid { grid-template-columns: 1fr; }
+  .app { padding-bottom: 28px; }
 }
 
 /* ---------- Intel explain + rotación ---------- */
