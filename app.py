@@ -945,7 +945,9 @@ body {
 .intel-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
 .intel-tab { font-size:12px; padding:6px 13px; border-radius:8px; border:1px solid var(--line); background:var(--bg-2); color:var(--text-2); cursor:pointer; }
 .intel-tab.active { border-color:var(--accent); color:var(--accent); background:var(--accent-soft); font-weight:600; }
-.intel-scroll { overflow-x:auto; }
+.intel-scroll { overflow-x:auto; min-width:0; max-width:100%; -webkit-overflow-scrolling:touch; }
+.muros-cols { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px; margin-top:14px; }
+.muros-cols > div { min-width:0; }
 .intel-table { width:100%; border-collapse:collapse; font-size:12px; min-width:500px; }
 .intel-table th { font-size:10.5px; color:var(--text-3); font-weight:500; padding:7px 10px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
 .intel-table td { padding:7px 10px; border-bottom:0.5px solid var(--line-soft,rgba(255,255,255,0.05)); white-space:nowrap; }
@@ -1177,6 +1179,7 @@ body {
   .spine-line:last-child { background: linear-gradient(90deg, var(--line), transparent); }
   .spine-pill { margin: 0 10px; display: flex; align-items: baseline; gap: 8px; }
   .tr-bottom { grid-template-columns: 1fr; }
+  .muros-cols { grid-template-columns: 1fr; }
   .stat-cards { grid-template-columns: repeat(2, 1fr); }
   .ob-grid { grid-template-columns: 1fr; gap: 16px; }
   .filters-grid { grid-template-columns: repeat(2, 1fr); }
@@ -4016,7 +4019,7 @@ function Muros() {
     <div className="view tone-accent">
       <section className="chart-card">
         <div className="card-head"><h3>Muros de liquidez</h3><span className="card-sub">los anuncios más grandes · dónde ponerte para interceptar su flujo · actualiza 30s</span></div>
-        <div className="filters-grid" style={{ gridTemplateColumns: "170px 180px 170px 180px" }}>
+        <div className="filters-grid">
           <div className="f-item"><label>Tu orden (USDT)</label><input type="number" step="500" value={orden} onChange={(e) => setOrden(parseFloat(e.target.value) || 0)} /></div>
           <div className="f-item"><label>Cuántos muros por lado</label><input type="number" min="3" max="15" value={topN} onChange={(e) => setTopN(parseInt(e.target.value) || 6)} /></div>
           <div className="f-item"><label>Resaltar si supera (USDT)</label><input type="number" step="1000" value={umbral} onChange={(e) => setUmbral(parseFloat(e.target.value) || 0)} /></div>
@@ -4032,7 +4035,7 @@ function Muros() {
           </div>
           {(muerta(cdC) || muerta(cdV)) ? <div style={{ fontSize: 12, color: "#ffd740", marginTop: 6 }}>⚠️ Uno de los dos muros tiene caudal muerto — esa brecha es teórica, ahí no te llenás.</div> : null}
         </div>
-        <div className="market" style={{ gridTemplateColumns: "1fr 1fr", gap: "16px", marginTop: 14 }}>
+        <div className="muros-cols">
           <div>
             <div className="ob-coltitle" style={{ color: "var(--buy)" }}>COMPRA · vendedores de USDT (acá VENDÉS)</div>
             <div style={{ margin: "0 0 8px" }}>{resumen(murosC, cmB, mejorC, "vender")}</div>
