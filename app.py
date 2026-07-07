@@ -1199,8 +1199,8 @@ body {
 .intel-explain b { color:var(--text); }
 
 /* ---------- Backup banner & panel ---------- */
-.backup-banner { display:flex; align-items:center; gap:12px; margin:10px 0 0; padding:11px 16px; border-radius:12px; background:var(--warn-soft); border:1px solid var(--warn); font-size:13px; color:var(--text); }
-.bb-dot { width:9px; height:9px; border-radius:50%; background:var(--warn); flex:none; box-shadow:0 0 0 0 var(--warn); animation:pulse 1.6s infinite; }
+.backup-banner { display:flex; align-items:center; gap:12px; margin:8px 0 0; padding:8px 14px; border-radius:10px; background:var(--bg-1); border:1px solid var(--line-soft); border-left:3px solid var(--warn); font-size:12.5px; color:var(--text-2); }
+.bb-dot { width:7px; height:7px; border-radius:50%; background:var(--warn); flex:none; }
 .bb-txt { flex:1; }
 .bb-go { font-family:var(--font); font-size:12.5px; font-weight:600; color:var(--bg); background:var(--warn); border:none; padding:7px 14px; border-radius:8px; cursor:pointer; }
 .bb-x { background:transparent; border:none; color:var(--text-3); cursor:pointer; font-size:14px; line-height:1; }
@@ -3623,6 +3623,7 @@ function Backup() {
     <div className="view">
       <section className="chart-card backup-wrap">
         <div className="card-head"><h3>Backup / Exportar base de datos</h3><span className="card-sub">descarga el detalle por anunciante</span></div>
+        <div style={{ marginBottom: 6 }}><SystemBar /></div>
         <p className="backup-last">Última copia registrada en este navegador: <b>{lastTxt}</b>{diasDesde !== null ? " (hace " + diasDesde + " días)" : ""}.</p>
         <div className="backup-grid">
           <div className="f-item"><label>Días de datos</label>
@@ -4069,7 +4070,7 @@ function SystemBar({ snapTs }) {
   const pct = st ? st.pct : null;
   const barCol = pct == null ? "var(--text-3)" : pct >= 90 ? "var(--sell)" : pct >= 75 ? "var(--warn)" : "var(--buy)";
   return (
-    <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
+    <div style={{ margin: 0, display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
       {st ? (
         <div title="Espacio usado en la base de datos (aprox). Si llega a 100% el colector deja de guardar." style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 999, padding: "6px 14px" }}>
           <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Almacenamiento</span>
@@ -4195,7 +4196,6 @@ function App() {
     <div className="app" data-animate={t.animatePrices ? "on" : "off"}>
       <Core.TopBar snap={viewSnap} secondsLeft={secondsLeft} cycleMs={state.cycleMs} />
       <Core.Tabs tab={tab} setTab={setTab} />
-      <V.SystemBar snapTs={viewSnap.timestamp} />
       <V.VolumenBar />
       {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
       <main className="content">
