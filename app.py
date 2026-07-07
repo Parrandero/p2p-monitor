@@ -820,12 +820,14 @@ body {
 .ring-s { font-size: 9px; color: var(--text-3); }
 
 /* ---------- Tabs ---------- */
-.tabbar { display: flex; gap: 4px; padding: 14px 0 18px; }
+.tabbar { display: flex; gap: 4px; padding: 14px 0 18px; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none; -webkit-overflow-scrolling: touch; }
+.tabbar::-webkit-scrollbar { display: none; }
 .tab {
   font-family: var(--font); font-size: 13px; font-weight: 500;
   color: var(--text-3); background: transparent;
   border: 1px solid transparent; border-radius: 9px;
   padding: 8px 15px; cursor: pointer; transition: all .15s;
+  white-space: nowrap; flex-shrink: 0;
 }
 .tab:hover { color: var(--text-2); background: var(--bg-1); }
 .tab.active { color: var(--text); background: var(--bg-2); border-color: var(--line); box-shadow: inset 0 -2px 0 var(--accent); }
