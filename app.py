@@ -4300,14 +4300,12 @@ def api_precios():
     for r in rows:
         ts = r["timestamp"]
         try:
-            # Si el timestamp ya tiene tzinfo, usarlo directo; si no, asumir Santiago
-            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
-                dt_aware = ts
-            else:
-                ts_str = str(ts)[:19].replace(" ", "T")
-                dt_naive = _dt.fromisoformat(ts_str)
-                dt_aware = dt_naive.replace(tzinfo=SANTIAGO_TZ)
-            unix = int(dt_aware.astimezone(_tz.utc).timestamp())
+            # La hora guardada es hora de pared de Santiago. La codificamos como
+            # epoch-UTC para que getUTCHours() en el front muestre esa MISMA hora
+            # (hora Chile) y coincida con el resto del panel (Historico, etc.).
+            ts_str = str(ts)[:19].replace(" ", "T")
+            dt_naive = _dt.fromisoformat(ts_str)
+            unix = int(dt_naive.replace(tzinfo=_tz.utc).timestamp())
         except Exception:
             continue
         # Garantizar estrictamente creciente (Lightweight Charts lo exige)
