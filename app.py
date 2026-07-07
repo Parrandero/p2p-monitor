@@ -4100,13 +4100,13 @@ function VolumenBar() {
   if (!v) return null;
   const pc = v.presion_compra_pct;   // % del volumen que es COMPRA de USDT (demanda)
   return (
-    <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "wrap", gap: 16, alignItems: "center", fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px" }}>
-      <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Volumen USDT</span>
-      <span title="Acumulado desde las 00:00 de hoy (hora Chile). Se pone en CERO a la medianoche y vuelve a empezar. Es el unico que corta por dia de calendario.">Hoy <span style={{ color: "var(--text-3)", fontSize: 10 }}>(desde 00:00)</span>: <b style={{ color: "var(--text)" }}>{fmt(v.hoy.total)}</b></span>
-      <span title="Ventana MOVIL: siempre los ultimos 60 minutos hacia atras desde este instante. No espera al cambio de hora; se corre minuto a minuto.">Ultima hora <span style={{ color: "var(--text-3)", fontSize: 10 }}>(movil)</span>: <b style={{ color: "var(--text)" }}>{fmt(v.hora.total)}</b></span>
-      <span title="Volumen de las ultimas 4 horas (ventana movil, no espera al cambio de hora). La flecha compara contra las 4 horas anteriores a esas.">4h <span style={{ color: "var(--text-3)", fontSize: 10 }}>(movil)</span>: <b style={{ color: "var(--text)" }}>{fmt(v.vol_4h)}</b> {chgTag(v.cambio_4h_pct)}</span>
-      <span title="Volumen de las ultimas 24 horas (ventana movil, corre en tiempo real). La flecha compara contra las 24 horas previas.">24h <span style={{ color: "var(--text-3)", fontSize: 10 }}>(movil)</span>: <b style={{ color: "var(--text)" }}>{fmt(v.vol_24h)}</b> {chgTag(v.cambio_24h_pct)}</span>
-      <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+    <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "nowrap", gap: 14, alignItems: "center", fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", overflowX: "auto", whiteSpace: "nowrap" }}>
+      <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10, flexShrink: 0 }}>Volumen USDT</span>
+      <span style={{ flexShrink: 0 }} title="Acumulado desde las 00:00 de hoy (hora Chile). Se pone en CERO a la medianoche. Es el unico que corta por dia de calendario; el resto son ventanas moviles.">Hoy: <b style={{ color: "var(--text)" }}>{fmt(v.hoy.total)}</b></span>
+      <span style={{ flexShrink: 0 }} title="Ventana MOVIL: los ultimos 60 minutos hacia atras. La flecha compara contra los 60 minutos anteriores a esos.">1h: <b style={{ color: "var(--text)" }}>{fmt(v.hora.total)}</b> {chgTag(v.cambio_1h_pct)}</span>
+      <span style={{ flexShrink: 0 }} title="Ventana MOVIL: las ultimas 4 horas. La flecha compara contra las 4 horas anteriores a esas.">4h: <b style={{ color: "var(--text)" }}>{fmt(v.vol_4h)}</b> {chgTag(v.cambio_4h_pct)}</span>
+      <span style={{ flexShrink: 0 }} title="Ventana MOVIL: las ultimas 24 horas. La flecha compara contra las 24 horas previas.">24h: <b style={{ color: "var(--text)" }}>{fmt(v.vol_24h)}</b> {chgTag(v.cambio_24h_pct)}</span>
+      <span style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
         Presión:
         <span style={{ width: 130, height: 8, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block", position: "relative" }}>
           <span style={{ display: "block", height: "100%", width: pc + "%", background: "var(--buy)" }}></span>
@@ -4873,7 +4873,8 @@ def api_volumen():
     now = datetime.now(SANTIAGO_TZ)
     def f(dt): return dt.strftime("%Y-%m-%d %H:%M:%S")
     hoy0 = f(now.replace(hour=0, minute=0, second=0, microsecond=0))
-    h1, h4, h8 = f(now - timedelta(hours=1)), f(now - timedelta(hours=4)), f(now - timedelta(hours=8))
+    h1, h2 = f(now - timedelta(hours=1)), f(now - timedelta(hours=2))
+    h4, h8 = f(now - timedelta(hours=4)), f(now - timedelta(hours=8))
     h24, h48 = f(now - timedelta(hours=24)), f(now - timedelta(hours=48))
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -4888,23 +4889,26 @@ def api_volumen():
                 SELECT tipo,
                     COALESCE(SUM(c) FILTER (WHERE t >= %(hoy0)s), 0) AS hoy,
                     COALESCE(SUM(c) FILTER (WHERE t >= %(h1)s), 0)   AS hora,
+                    COALESCE(SUM(c) FILTER (WHERE t >= %(h2)s AND t < %(h1)s), 0) AS p1,
                     COALESCE(SUM(c) FILTER (WHERE t >= %(h4)s), 0)   AS u4,
                     COALESCE(SUM(c) FILTER (WHERE t >= %(h8)s AND t < %(h4)s), 0)  AS p4,
                     COALESCE(SUM(c) FILTER (WHERE t >= %(h24)s), 0)  AS u24,
                     COALESCE(SUM(c) FILTER (WHERE t >= %(h48)s AND t < %(h24)s), 0) AS p24
                 FROM cons GROUP BY tipo
-            """, {"hoy0": hoy0, "h1": h1, "h4": h4, "h8": h8, "h24": h24, "h48": h48})
+            """, {"hoy0": hoy0, "h1": h1, "h2": h2, "h4": h4, "h8": h8, "h24": h24, "h48": h48})
             rows = {r["tipo"]: r for r in cur.fetchall()}
     def g(k):
         return float(rows.get("BUY", {}).get(k, 0) or 0) + float(rows.get("SELL", {}).get(k, 0) or 0)
     buy_hoy = float(rows.get("BUY", {}).get("hoy", 0) or 0)
     sell_hoy = float(rows.get("SELL", {}).get("hoy", 0) or 0)
     tot_hoy = buy_hoy + sell_hoy
+    u1, p1 = g("hora"), g("p1")
     u4, p4, u24, p24 = g("u4"), g("p4"), g("u24"), g("p24")
     def chg(u, p): return round((u - p) / p * 100, 1) if p else None
     return jsonify({
         "hoy":   {"total": round(tot_hoy)},
-        "hora":  {"total": round(g("hora"))},
+        "hora":  {"total": round(u1)},
+        "cambio_1h_pct": chg(u1, p1),
         "presion_compra_pct": round(buy_hoy / tot_hoy * 100, 1) if tot_hoy else 50.0,
         "vol_4h": round(u4), "cambio_4h_pct": chg(u4, p4),
         "vol_24h": round(u24), "cambio_24h_pct": chg(u24, p24),
