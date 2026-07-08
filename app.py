@@ -28,10 +28,16 @@ config = {
     # Comisión Binance P2P por operación (cada lado).
     # Usuario regular: ~0.35% por lado.
     # Merchant verificado LATAM: ~0.18% por lado → 0.36% total round-trip.
-    "COMISION_BN":          0.0018,
+    "COMISION_BN":          0.002,   # Binance maker CLP = 0.2% (fuente: pagina de fees del usuario)
+    "COM_BINANCE_MAKER":    0.002,   # Binance maker CLP 0.2%
+    "COM_BINANCE_TAKER":    0.001,   # Binance taker CLP 0.1%
+    "COM_BYBIT_MAKER":      0.0,     # Bybit CLP: sin comision al publicar
+    "COM_BYBIT_TAKER":      0.0,     # Bybit CLP: taker sin comision
+    "COSTO_TRANSFER_USDT":  1.0,     # ~1 USDT fijo por transferir USDT entre exchanges (red TRC20)
     # Spread neto mínimo (después de comisiones) para considerar operable.
     "SPREAD_MIN_OPERATIVO": 0.35,
     "TOP_ANUNCIOS":         80,   # 4 páginas × 20 = 80 por lado (detalle/profundidad)
+    "BANDA_DETALLE_PCT":    6,    # descarta del detalle anuncios con precio fuera de +-6% del tope real (anti-basura, mismo criterio Binance/Bybit)
     "ANALISIS_TOP":         20,   # cabecera del libro p/ spread y liquidez (mantiene baseline)
     "BANDA_PONDERADO_PCT":  1.0,  # % desde el lider para ponderar (descarta outliers en libros finos)
 }
@@ -208,10 +214,31 @@ def guardar_snapshot(m, tabla="snapshots"):
             """, m)
         conn.commit()
 
+def _detalle_banda(raw, precio_de, band_pct):
+    """Descarta anuncios con precio fuera de +-band% de la MEDIANA de los 10 mejores.
+    El tope del libro (posiciones 1-10, ya ordenadas por precio) siempre es real, asi
+    que sirve de referencia robusta. Elimina ordenes basura lejos del mercado (ej. en
+    Bybit habia compras a 1112 y ventas a 741 que ensuciaban todo). Mismo criterio para
+    Binance y Bybit -> datos compatibles entre si."""
+    if len(raw) < 4:
+        return raw
+    top = [p for p in (precio_de(x) for x in raw[:10]) if p and p > 0]
+    if len(top) < 3:
+        return raw
+    ref = sorted(top)[len(top) // 2]
+    lo, hi = ref * (1 - band_pct / 100.0), ref * (1 + band_pct / 100.0)
+    out = [x for x in raw if lo <= (precio_de(x) or 0) <= hi]
+    return out if len(out) >= 3 else raw
+
+
 def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
     """Guarda los top 80 anunciantes de cada lado SIN filtros de mínimos"""
     with config_lock:
-        top = config["TOP_ANUNCIOS"]
+        top  = config["TOP_ANUNCIOS"]
+        band = config["BANDA_DETALLE_PCT"]
+    _pb = lambda item: float((item.get("adv") or {}).get("price", 0) or 0)
+    anuncios_raw_compra = _detalle_banda(anuncios_raw_compra, _pb, band)
+    anuncios_raw_venta  = _detalle_banda(anuncios_raw_venta,  _pb, band)
     rows = []
     for pos, item in enumerate(anuncios_raw_compra[:top], 1):
         adv   = item.get("adv", {})
@@ -370,7 +397,7 @@ def precio_ponderado(anuncios):
     if total == 0: return 0
     return sum(a["precio"] * a["disponible"] for a in anuncios) / total
 
-def analizar(tab_compra, tab_venta):
+def analizar(tab_compra, tab_venta, comision_lado=None):
     if not tab_compra or not tab_venta:
         return None
     with config_lock:
@@ -408,7 +435,8 @@ def analizar(tab_compra, tab_venta):
     liq_tv = sum(a["disponible"] for a in cab_tv)
     precio_maker_vender  = round(lider_tc["precio"] - 0.01, 2)
     precio_maker_comprar = round(lider_tv["precio"] + 0.01, 2)
-    comision_total_pct = c["COMISION_BN"] * 2 * 100
+    com_lado = c["COMISION_BN"] if comision_lado is None else comision_lado
+    comision_total_pct = com_lado * 2 * 100
     ganancia = round(spread_pond_pct - comision_total_pct, 4)
     brecha_ok = ganancia >= c["SPREAD_MIN_OPERATIVO"]
     if spread_pond_pct >= c["ALERTA_SPREAD"]:
@@ -566,7 +594,11 @@ def parsear_y_filtrar_bybit(items, tipo):
 
 def guardar_detalle_bybit(timestamp, hora, raw_compra, raw_venta):
     with config_lock:
-        top = config["TOP_ANUNCIOS"]
+        top  = config["TOP_ANUNCIOS"]
+        band = config["BANDA_DETALLE_PCT"]
+    _pb = lambda it: float(it.get("price", 0) or 0)
+    raw_compra = _detalle_banda(raw_compra, _pb, band)
+    raw_venta  = _detalle_banda(raw_venta,  _pb, band)
     rows = []
     for tipo, raw in (("BUY", raw_compra), ("SELL", raw_venta)):
         for pos, it in enumerate(raw[:top], 1):
@@ -627,7 +659,9 @@ def ciclo_colector_bybit():
                 anal_top = config["ANALISIS_TOP"]
             tab_compra = parsear_y_filtrar_bybit(raw_compra[:anal_top], "BUY")
             tab_venta  = parsear_y_filtrar_bybit(raw_venta[:anal_top],  "SELL")
-            estado = analizar(tab_compra, tab_venta)
+            with config_lock:
+                com_by = config["COM_BYBIT_MAKER"]
+            estado = analizar(tab_compra, tab_venta, com_by)
             if estado:
                 guardar_snapshot(estado, "snapshots_bybit")
                 ts, hora = estado["timestamp"], estado["hora"]
