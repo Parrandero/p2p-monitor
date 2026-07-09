@@ -4143,27 +4143,38 @@ function VolumenBar() {
     const id = setInterval(load, 60000);
     return () => { stop = true; clearInterval(id); };
   }, []);
-  const fmt = (x) => x == null ? "—" : Number(x).toLocaleString("es-CL");
-  const chgTag = (p) => p == null ? <span style={{ color: "var(--text-3)" }}>—</span> :
-    <b style={{ color: p >= 0 ? "var(--buy)" : "var(--sell)" }}>{p >= 0 ? "▲" : "▼"}{Math.abs(p)}%</b>;
+  const fmt = (x) => x == null ? "\u2014" : Number(x).toLocaleString("es-CL");
+  const chgTag = (p) => p == null ? <span style={{ color: "var(--text-3)" }}>\u2014</span> :
+    <b style={{ color: p >= 0 ? "var(--buy)" : "var(--sell)" }}>{p >= 0 ? "\u25b2" : "\u25bc"}{Math.abs(p)}%</b>;
   if (!v) return null;
-  const pc = v.presion_compra_pct;   // % del volumen que es COMPRA de USDT (demanda)
-  return (
-    <div style={{ margin: "8px 0 0", display: "flex", flexWrap: "nowrap", gap: 14, alignItems: "center", fontSize: 12, color: "var(--text-2)", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", overflowX: "auto", whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
-      <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10, flexShrink: 0 }}>Volumen USDT</span>
-      <span style={{ flexShrink: 0 }} title="Acumulado desde las 00:00 de hoy (hora Chile). Se pone en CERO a la medianoche. Es el unico que corta por dia de calendario; el resto son ventanas moviles.">Hoy: <b style={{ color: "var(--text)" }}>{fmt(v.hoy.total)}</b></span>
-      <span style={{ flexShrink: 0 }} title="Ventana MOVIL: los ultimos 60 minutos hacia atras. La flecha compara contra los 60 minutos anteriores a esos.">1h: <b style={{ color: "var(--text)" }}>{fmt(v.hora.total)}</b> {chgTag(v.cambio_1h_pct)}</span>
-      <span style={{ flexShrink: 0 }} title="Ventana MOVIL: las ultimas 4 horas. La flecha compara contra las 4 horas anteriores a esas.">4h: <b style={{ color: "var(--text)" }}>{fmt(v.vol_4h)}</b> {chgTag(v.cambio_4h_pct)}</span>
-      <span style={{ flexShrink: 0 }} title="Ventana MOVIL: las ultimas 24 horas. La flecha compara contra las 24 horas previas.">24h: <b style={{ color: "var(--text)" }}>{fmt(v.vol_24h)}</b> {chgTag(v.cambio_24h_pct)}</span>
-      <span style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-        Presión:
-        <span style={{ width: 130, height: 8, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block", position: "relative" }}>
-          <span style={{ display: "block", height: "100%", width: pc + "%", background: "var(--buy)" }}></span>
+
+  const fila = (nombre, d) => (
+    <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "nowrap", whiteSpace: "nowrap", overflowX: "auto" }}>
+      <span style={{ width: 60, flexShrink: 0, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.06em", fontSize: 10, fontWeight: 600 }}>{nombre}</span>
+      {!d ? <span style={{ color: "var(--text-3)" }}>sin datos a\u00fan</span> : <>
+        <span style={{ flexShrink: 0 }} title="Acumulado desde las 00:00 de hoy (hora Chile). Se pone en CERO a la medianoche.">Hoy: <b style={{ color: "var(--text)" }}>{fmt(d.hoy)}</b></span>
+        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimos 60 min. La flecha compara contra los 60 min anteriores.">1h: <b style={{ color: "var(--text)" }}>{fmt(d.hora)}</b> {chgTag(d.cambio_1h_pct)}</span>
+        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimas 4 horas.">4h: <b style={{ color: "var(--text)" }}>{fmt(d.vol_4h)}</b> {chgTag(d.cambio_4h_pct)}</span>
+        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimas 24 horas.">24h: <b style={{ color: "var(--text)" }}>{fmt(d.vol_24h)}</b> {chgTag(d.cambio_24h_pct)}</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+          Presi\u00f3n:
+          <span style={{ width: 90, height: 7, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block" }}>
+            <span style={{ display: "block", height: "100%", width: d.presion_compra_pct + "%", background: "var(--buy)" }}></span>
+          </span>
+          <b style={{ color: "var(--buy)" }}>{fmt(d.presion_compra_pct)}%</b> <span style={{ color: "var(--text-3)" }}>compran</span>
         </span>
-        <b style={{ color: "var(--buy)" }}>{fmt(pc)}% compran</b>
-        <span style={{ color: "var(--sell)" }}>{fmt(Math.round(100 - pc))}% venden</span>
-      </span>
-      <span title="Compran USDT = takers comprando (demanda). Venden = takers vendiendo (oferta). Presión alta de compra empuja el precio arriba." style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
+      </>}
+    </div>
+  );
+
+  return (
+    <div style={{ margin: "8px 0 0", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", fontSize: 12, color: "var(--text-2)", fontVariantNumeric: "tabular-nums", display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Volumen USDT \u00b7 estimaci\u00f3n</span>
+        <span title="Estimacion propia del tope del libro (no dato oficial). Sirve para la TENDENCIA (sube/baja), no para el USDT exacto. Ya descuenta el ruido de reposicion de avisos." style={{ color: "var(--text-3)", cursor: "help" }}>\u24d8</span>
+      </div>
+      {fila("Binance", v.binance)}
+      {fila("Bybit", v.bybit)}
     </div>
   );
 }
@@ -4913,38 +4924,34 @@ def api_storage():
     })
 
 
-@app.route("/api/volumen")
-def api_volumen():
-    """Volumen operado (USDT) hoy y última hora, separado por lado.
-    BUY = USDT que los takers COMPRAN (demanda). SELL = USDT que VENDEN (oferta).
-    Cap por paso para descartar el ruido de reposicionamiento."""
-    now = datetime.now(SANTIAGO_TZ)
-    def f(dt): return dt.strftime("%Y-%m-%d %H:%M:%S")
-    hoy0 = f(now.replace(hour=0, minute=0, second=0, microsecond=0))
-    h1, h2 = f(now - timedelta(hours=1)), f(now - timedelta(hours=2))
-    h4, h8 = f(now - timedelta(hours=4)), f(now - timedelta(hours=8))
-    h24, h48 = f(now - timedelta(hours=24)), f(now - timedelta(hours=48))
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                WITH cons AS (
-                    SELECT tipo, snapshot_timestamp AS t,
-                        LEAST(GREATEST(0, LAG(disponible) OVER (
-                            PARTITION BY anunciante, tipo ORDER BY snapshot_timestamp) - disponible), 5000) AS c
-                    FROM snapshots_detalle
-                    WHERE snapshot_timestamp >= %(h48)s
-                )
-                SELECT tipo,
-                    COALESCE(SUM(c) FILTER (WHERE t >= %(hoy0)s), 0) AS hoy,
-                    COALESCE(SUM(c) FILTER (WHERE t >= %(h1)s), 0)   AS hora,
-                    COALESCE(SUM(c) FILTER (WHERE t >= %(h2)s AND t < %(h1)s), 0) AS p1,
-                    COALESCE(SUM(c) FILTER (WHERE t >= %(h4)s), 0)   AS u4,
-                    COALESCE(SUM(c) FILTER (WHERE t >= %(h8)s AND t < %(h4)s), 0)  AS p4,
-                    COALESCE(SUM(c) FILTER (WHERE t >= %(h24)s), 0)  AS u24,
-                    COALESCE(SUM(c) FILTER (WHERE t >= %(h48)s AND t < %(h24)s), 0) AS p24
-                FROM cons GROUP BY tipo
-            """, {"hoy0": hoy0, "h1": h1, "h2": h2, "h4": h4, "h8": h8, "h24": h24, "h48": h48})
-            rows = {r["tipo"]: r for r in cur.fetchall()}
+def _volumen_tabla(cur, tabla, params):
+    """Estima volumen operado (USDT) desde la caida de 'disponible' por anunciante.
+    Limpia el ruido de reposicion: si el anunciante CAMBIO el precio Y la caida es
+    grande (>3000), es una edicion del aviso (no una venta) -> no cuenta. El resto
+    cuenta, capeado a 3000 por paso."""
+    cur.execute(f"""
+        WITH cons AS (
+            SELECT tipo, snapshot_timestamp AS t,
+                CASE
+                  WHEN (precio <> LAG(precio) OVER w)
+                       AND (LAG(disponible) OVER w - disponible) > 3000 THEN 0
+                  ELSE LEAST(GREATEST(0, LAG(disponible) OVER w - disponible), 3000)
+                END AS c
+            FROM {tabla}
+            WHERE snapshot_timestamp >= %(h48)s
+            WINDOW w AS (PARTITION BY anunciante, tipo ORDER BY snapshot_timestamp)
+        )
+        SELECT tipo,
+            COALESCE(SUM(c) FILTER (WHERE t >= %(hoy0)s), 0) AS hoy,
+            COALESCE(SUM(c) FILTER (WHERE t >= %(h1)s), 0)   AS hora,
+            COALESCE(SUM(c) FILTER (WHERE t >= %(h2)s AND t < %(h1)s), 0) AS p1,
+            COALESCE(SUM(c) FILTER (WHERE t >= %(h4)s), 0)   AS u4,
+            COALESCE(SUM(c) FILTER (WHERE t >= %(h8)s AND t < %(h4)s), 0)  AS p4,
+            COALESCE(SUM(c) FILTER (WHERE t >= %(h24)s), 0)  AS u24,
+            COALESCE(SUM(c) FILTER (WHERE t >= %(h48)s AND t < %(h24)s), 0) AS p24
+        FROM cons GROUP BY tipo
+    """, params)
+    rows = {r["tipo"]: r for r in cur.fetchall()}
     def g(k):
         return float(rows.get("BUY", {}).get(k, 0) or 0) + float(rows.get("SELL", {}).get(k, 0) or 0)
     buy_hoy = float(rows.get("BUY", {}).get("hoy", 0) or 0)
@@ -4953,14 +4960,45 @@ def api_volumen():
     u1, p1 = g("hora"), g("p1")
     u4, p4, u24, p24 = g("u4"), g("p4"), g("u24"), g("p24")
     def chg(u, p): return round((u - p) / p * 100, 1) if p else None
-    return jsonify({
-        "hoy":   {"total": round(tot_hoy)},
-        "hora":  {"total": round(u1)},
-        "cambio_1h_pct": chg(u1, p1),
+    return {
+        "hoy": round(tot_hoy), "hora": round(u1), "cambio_1h_pct": chg(u1, p1),
         "presion_compra_pct": round(buy_hoy / tot_hoy * 100, 1) if tot_hoy else 50.0,
         "vol_4h": round(u4), "cambio_4h_pct": chg(u4, p4),
         "vol_24h": round(u24), "cambio_24h_pct": chg(u24, p24),
-    })
+    }
+
+
+@app.route("/api/volumen")
+def api_volumen():
+    """Volumen estimado por exchange, SEPARADO (Binance / Bybit). No se mezclan."""
+    now = datetime.now(SANTIAGO_TZ)
+    def f(dt): return dt.strftime("%Y-%m-%d %H:%M:%S")
+    params = {
+        "hoy0": f(now.replace(hour=0, minute=0, second=0, microsecond=0)),
+        "h1": f(now - timedelta(hours=1)), "h2": f(now - timedelta(hours=2)),
+        "h4": f(now - timedelta(hours=4)), "h8": f(now - timedelta(hours=8)),
+        "h24": f(now - timedelta(hours=24)), "h48": f(now - timedelta(hours=48)),
+    }
+    binance = None; bybit = None
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                binance = _volumen_tabla(cur, "snapshots_detalle", params)
+            except Exception as e:
+                print("[volumen binance]", e)
+            try:
+                bybit = _volumen_tabla(cur, "snapshots_detalle_bybit", params)
+            except Exception as e:
+                print("[volumen bybit]", e)
+    out = {"binance": binance, "bybit": bybit}
+    if binance:
+        out.update({
+            "hoy": {"total": binance["hoy"]}, "hora": {"total": binance["hora"]},
+            "cambio_1h_pct": binance["cambio_1h_pct"], "presion_compra_pct": binance["presion_compra_pct"],
+            "vol_4h": binance["vol_4h"], "cambio_4h_pct": binance["cambio_4h_pct"],
+            "vol_24h": binance["vol_24h"], "cambio_24h_pct": binance["cambio_24h_pct"],
+        })
+    return jsonify(out)
 
 
 @app.route("/api/heatmap")
