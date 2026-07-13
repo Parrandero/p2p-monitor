@@ -45,7 +45,16 @@ config = {
     "FILL_VENTANA_MIN":     15,    # min para que 'completadas' confirme una caida (ventana de pago Binance)
     "FILL_CAP_USDT":        10000, # tope de sanidad por evento (antes 3000, ciego; ahora solo protege contra ediciones gigantes)
     "FILL_TICKET_DEF":      272,   # ticket mediano de mercado (validado sobre 7d de datos reales) p/ fills enmascarados
+    "FILL_TICKET_DEF_BYBIT": 200,  # ticket mediano de Bybit (mas chico que Binance: p50=196 en datos jul)
     "CAPITAL_OPERATIVO":    2000,  # USDT de capital de trabajo p/ proyecciones del asistente operativo
+    # ── Umbrales del asistente (ahora configurables en caliente) ──
+    "UMBRAL_ROT_LENTO":     0.7,   # ratio rotacion bajo el cual el mercado se considera lento
+    "UMBRAL_ROT_DUAL":      1.0,   # ratio rotacion desde el cual habilita OPERAR DUAL pleno
+    "UMBRAL_PRESION_SESGO": 10,    # |presion-50| minimo para habilitar SOLO VENTA/COMPRA
+    "GAP_OBJETIVO_BRUTO":   1.30,  # % de gap BRUTO entre tus dos anuncios flujo. Separado del
+                                   # semaforo: los duales rentables capturan 1.3-1.7% bruto
+                                   # (mediana 1.50%) parados profundo en el libro, aunque el
+                                   # spread instantaneo de la punta sea menor
 }
 config_lock = threading.Lock()
 
@@ -571,9 +580,10 @@ class FillTracker:
 
     def _cfg(self):
         with config_lock:
+            tk_key = "FILL_TICKET_DEF_BYBIT" if self.exchange == "bybit" else "FILL_TICKET_DEF"
             return (float(config.get("FILL_CAP_USDT", 10000)),
                     float(config.get("FILL_VENTANA_MIN", 15)),
-                    float(config.get("FILL_TICKET_DEF", 272)))
+                    float(config.get(tk_key, config.get("FILL_TICKET_DEF", 272))))
 
     def _ticket(self, st, defecto):
         tk = st.get("tickets")
@@ -631,7 +641,8 @@ class FillTracker:
                     monto, metodo = confirmado, "directo"
                 else:
                     # fill enmascarado por recarga en el mismo ciclo
-                    monto  = d_comp * self._ticket(st, ticket_def)
+                    # (capeado: protege contra saltos falsos del contador)
+                    monto  = min(d_comp * self._ticket(st, ticket_def), cap)
                     metodo = "enmascarado"
                 ordenes = d_comp
             elif d_disp > 1:
@@ -665,6 +676,27 @@ class FillTracker:
 
 fill_tracker       = FillTracker("binance")
 fill_tracker_bybit = FillTracker("bybit")
+
+
+def _agrupar_items(items):
+    """FIX multi-anuncio (validado con datos 6-13 jul): 131 anunciantes operan
+    2+ anuncios simultaneos en el mismo lado (22% de las filas del libro, 73%
+    del volumen). Sin agrupar, el tracker mezcla los stocks de ambos anuncios
+    y fabrica volumen falso (~31% de sobreconteo medido). Se fusiona por
+    anunciante: stock = suma de sus anuncios, contador = maximo (es por
+    anunciante y robusto a glitches de la API), precio = el del mejor puesto."""
+    por = {}
+    for it in items:
+        n = it.get("anunciante") or ""
+        if not n:
+            continue
+        d = por.get(n)
+        if d is None:
+            por[n] = dict(it)   # conserva el precio del primer (mejor) puesto
+        else:
+            d["disponible"]  = float(d.get("disponible") or 0) + float(it.get("disponible") or 0)
+            d["completadas"] = max(int(d.get("completadas") or 0), int(it.get("completadas") or 0))
+    return list(por.values())
 
 
 def _items_binance(raw):
@@ -739,8 +771,15 @@ def backfill_fills(horas=48):
                                    completadas - LAG(completadas) OVER w AS d_comp,
                                    EXTRACT(EPOCH FROM (snapshot_timestamp
                                        - LAG(snapshot_timestamp) OVER w)) / 60 AS gap
-                            FROM {tabla}
-                            WHERE snapshot_timestamp >= NOW() - (%(horas)s || ' hours')::INTERVAL
+                            FROM (
+                                SELECT snapshot_timestamp, tipo, anunciante,
+                                       SUM(disponible)  AS disponible,
+                                       MAX(completadas) AS completadas,
+                                       MIN(precio)      AS precio
+                                FROM {tabla}
+                                WHERE snapshot_timestamp >= NOW() - (%(horas)s || ' hours')::INTERVAL
+                                GROUP BY snapshot_timestamp, tipo, anunciante
+                            ) base
                             WINDOW w AS (PARTITION BY anunciante, tipo
                                          ORDER BY snapshot_timestamp)
                         ) t
@@ -892,8 +931,8 @@ def ciclo_colector_bybit():
                 guardar_detalle_bybit(ts, hora, raw_compra, raw_venta)
                 # ── Fills v2 (Bybit) ──
                 try:
-                    fills  = fill_tracker_bybit.procesar([_bybit_item(x) for x in raw_compra], "BUY",  now_dt)
-                    fills += fill_tracker_bybit.procesar([_bybit_item(x) for x in raw_venta],  "SELL", now_dt)
+                    fills  = fill_tracker_bybit.procesar(_agrupar_items([_bybit_item(x) for x in raw_compra]), "BUY",  now_dt)
+                    fills += fill_tracker_bybit.procesar(_agrupar_items([_bybit_item(x) for x in raw_venta]),  "SELL", now_dt)
                     if fills:
                         guardar_fills(fills)
                 except Exception as e:
@@ -960,8 +999,8 @@ def ciclo_colector():
                 guardar_detalle(ts, hora, raw_compra, raw_venta)
                 # ── Fills v2: confirmar consumo cruzando con 'completadas' ──
                 try:
-                    fills  = fill_tracker.procesar(_items_binance(raw_compra), "BUY",  now_dt)
-                    fills += fill_tracker.procesar(_items_binance(raw_venta),  "SELL", now_dt)
+                    fills  = fill_tracker.procesar(_agrupar_items(_items_binance(raw_compra)), "BUY",  now_dt)
+                    fills += fill_tracker.procesar(_agrupar_items(_items_binance(raw_venta)),  "SELL", now_dt)
                     if fills:
                         guardar_fills(fills)
                 except Exception as e:
@@ -5598,6 +5637,9 @@ def api_operativa():
     # ── senales ──
     gan       = float(snap.get("ganancia_neta_pct") or 0)     # spread neto %
     min_op    = float(c["SPREAD_MIN_OPERATIVO"])
+    rot_lento = float(c.get("UMBRAL_ROT_LENTO", 0.7))
+    rot_dual  = float(c.get("UMBRAL_ROT_DUAL", 1.0))
+    sesgo_min = float(c.get("UMBRAL_PRESION_SESGO", 10))
     com_total = float(c["COMISION_BN"]) * 2 * 100              # % round-trip
     usdt_min_30m  = stats["vol_30m"] / 30
     usdt_min_prom = stats["vol_12h"] / (horas_prom * 60) if stats["vol_12h"] else 0
@@ -5605,16 +5647,16 @@ def api_operativa():
     presion  = round(stats["vol_60m_buy"] / stats["vol_60m"] * 100, 1) if stats["vol_60m"] else 50.0
 
     # ── decision ──
-    if gan >= min_op and (ratio is None or ratio >= 1.0):
+    if gan >= min_op and (ratio is None or ratio >= rot_dual):
         decision, color = "OPERAR DUAL", "green"
         razon = f"Spread neto {gan}% sobre tu minimo ({min_op}%)" + (f" y mercado rotando {ratio}x su promedio de 12h" if ratio else "")
-    elif gan >= min_op and ratio >= 0.7:
+    elif gan >= min_op and ratio >= rot_lento:
         decision, color = "OPERAR DUAL (paciente)", "yellow"
-        razon = f"Spread neto {gan}% es operable, pero la rotacion esta en {ratio}x del promedio: los fills tardaran mas de lo habitual"
+        razon = f"Spread neto {gan}% es operable, pero la rotacion esta en {ratio}x del promedio (umbral dual: {rot_dual}x): los fills tardaran mas de lo habitual"
     elif gan >= min_op:
         decision, color = "SOLO PIERNA CON FLUJO", "orange"
         razon = f"Spread neto {gan}% pero mercado lento ({ratio}x): no bloquees capital en dual; opera solo el lado que la presion favorece"
-    elif ratio is not None and ratio >= 1.0 and abs(presion - 50) >= 10:
+    elif ratio is not None and ratio >= rot_dual and abs(presion - 50) >= sesgo_min:
         lado = "VENTA" if presion > 50 else "COMPRA"
         decision, color = f"SOLO {lado}", "orange"
         razon = f"Spread neto {gan}% bajo tu minimo, pero el flujo esta {ratio}x acelerado y {presion}% cargado a la compra: una sola pierna del lado con demanda puede pagar"
@@ -5628,7 +5670,8 @@ def api_operativa():
     pond_c = float(snap.get("precio_pond_tab_compra") or 0)
     pond_v = float(snap.get("precio_pond_tab_venta") or 0)
     mid    = (pond_c + pond_v) / 2 if pond_c and pond_v else 0
-    objetivo_bruto = min_op + com_total                        # % gap bruto minimo p/ tu neto
+    gap_cfg = float(c.get("GAP_OBJETIVO_BRUTO", 0) or 0)
+    objetivo_bruto = gap_cfg if gap_cfg > 0 else (min_op + com_total)   # % gap bruto de tus anuncios flujo
     venta_share = min(0.75, max(0.25, presion / 100))
     margen_venta  = round(objetivo_bruto * venta_share, 3)
     margen_compra = round(objetivo_bruto * (1 - venta_share), 3)
@@ -5763,7 +5806,12 @@ def api_config():
             "FILL_VENTANA_MIN":     float,
             "FILL_CAP_USDT":        float,
             "FILL_TICKET_DEF":      float,
+            "FILL_TICKET_DEF_BYBIT": float,
             "CAPITAL_OPERATIVO":    float,
+            "UMBRAL_ROT_LENTO":     float,
+            "UMBRAL_ROT_DUAL":      float,
+            "UMBRAL_PRESION_SESGO": float,
+            "GAP_OBJETIVO_BRUTO":   float,
         }
         errores = {}
         with config_lock:
