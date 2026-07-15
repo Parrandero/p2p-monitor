@@ -4610,7 +4610,87 @@ function AsistenteOperativo() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo };
+function EstrategiaPanel() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [cfg, setCfg] = React.useState(null);
+  const [gap, setGap] = React.useState("");
+  const [cap, setCap] = React.useState("");
+  const [msg, setMsg] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const load = () => fetch(B + "/api/config").then(r => r.json()).then(d => {
+    setCfg(d);
+    setGap(String(d.GAP_OBJETIVO_BRUTO != null ? d.GAP_OBJETIVO_BRUTO : 1.25));
+    setCap(String(d.CAPITAL_OPERATIVO != null ? d.CAPITAL_OPERATIVO : 760));
+  }).catch(() => {});
+  React.useEffect(() => { load(); }, []);
+  const base = { SPREAD_MIN_OPERATIVO: 0.28, UMBRAL_ROT_LENTO: 0.5, UMBRAL_ROT_DUAL: 0.8, UMBRAL_PRESION_SESGO: 15 };
+  const aplicar = (body, nombre) => {
+    if (busy) return;
+    setBusy(true); setMsg("Aplicando...");
+    fetch(B + "/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then(r => r.json())
+      .then(() => { setMsg("\u2713 Aplicado: " + nombre); load(); setBusy(false); setTimeout(() => setMsg(""), 5000); })
+      .catch(() => { setMsg("\u2717 Error al aplicar"); setBusy(false); });
+  };
+  const presets = [
+    { n: "Margen ancho", gap: 1.35, d: "pocos giros, m\u00e1ximo por peso" },
+    { n: "Equilibrado",  gap: 1.25, d: "la base recomendada" },
+    { n: "Rotaci\u00f3n",     gap: 1.10, d: "llena r\u00e1pido, m\u00e1s giros" },
+  ];
+  const gapActual = cfg ? Number(cfg.GAP_OBJETIVO_BRUTO || 0) : null;
+  const esBaseOk = cfg && Number(cfg.SPREAD_MIN_OPERATIVO) === 0.28 && Number(cfg.UMBRAL_PRESION_SESGO) === 15;
+  return (
+    <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderRadius: 14, padding: "13px 16px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Estrategia</span>
+        {cfg && <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: "var(--text-2)" }}>
+          gap {gapActual}% \u00b7 m\u00ednimo sem\u00e1foro {Number(cfg.SPREAD_MIN_OPERATIVO)}% \u00b7 capital {Number(cfg.CAPITAL_OPERATIVO)} USDT
+          {!esBaseOk && <span style={{ color: "var(--warn)" }}> \u00b7 umbrales base sin aplicar</span>}
+        </span>}
+        {msg && <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, color: msg.indexOf("\u2713") === 0 ? "var(--buy)" : "var(--warn)", marginLeft: "auto" }}>{msg}</span>}
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "stretch" }}>
+        {presets.map(p => {
+          const activo = gapActual != null && Math.abs(gapActual - p.gap) < 0.001 && esBaseOk;
+          return (
+            <button key={p.n} disabled={busy}
+              onClick={() => aplicar(Object.assign({}, base, { GAP_OBJETIVO_BRUTO: p.gap }), p.n + " (gap " + p.gap + ")")}
+              style={{ flex: 1, minWidth: 130, textAlign: "left", cursor: "pointer", borderRadius: 10, padding: "9px 12px",
+                border: "1px solid " + (activo ? "var(--accent)" : "var(--line)"),
+                background: activo ? "var(--accent-soft)" : "var(--bg-2)", color: "var(--text)" }}>
+              <div style={{ fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 600, color: activo ? "var(--accent)" : "var(--text)" }}>
+                {activo ? "\u25cf " : ""}{p.n} \u00b7 {p.gap}%
+              </div>
+              <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 2 }}>{p.d}</div>
+            </button>
+          );
+        })}
+        <div style={{ display: "flex", gap: 6, alignItems: "center", background: "var(--bg-2)", border: "1px solid var(--line)", borderRadius: 10, padding: "6px 10px" }}>
+          <span style={{ fontSize: 10, color: "var(--text-3)" }}>gap</span>
+          <input value={gap} onChange={e => setGap(e.target.value)} inputMode="decimal"
+            style={{ width: 46, background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12, padding: "4px 6px" }} />
+          <span style={{ fontSize: 10, color: "var(--text-3)" }}>capital</span>
+          <input value={cap} onChange={e => setCap(e.target.value)} inputMode="numeric"
+            style={{ width: 56, background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12, padding: "4px 6px" }} />
+          <button disabled={busy}
+            onClick={() => {
+              const g = parseFloat(String(gap).replace(",", ".")), c = parseFloat(String(cap).replace(",", "."));
+              if (!(g > 0.3 && g < 5) || !(c > 0)) { setMsg("\u2717 Valores fuera de rango"); return; }
+              aplicar(Object.assign({}, base, { GAP_OBJETIVO_BRUTO: g, CAPITAL_OPERATIVO: c }), "personalizado (gap " + g + ")");
+            }}
+            style={{ cursor: "pointer", borderRadius: 7, padding: "5px 12px", border: "1px solid var(--accent)", background: "var(--accent-soft)", color: "var(--accent)", fontSize: 11.5, fontFamily: "var(--mono)" }}>
+            Aplicar
+          </button>
+        </div>
+      </div>
+      <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 8 }}>
+        Todos los botones aplican tambi\u00e9n los umbrales base del sem\u00e1foro (m\u00ednimo 0,28 \u00b7 rotaci\u00f3n 0,5/0,8 \u00b7 sesgo \u00b115). Termostato: llena en menos de 2 h \u2192 Rotaci\u00f3n \u00b7 tarda m\u00e1s de 6 h \u2192 Margen ancho.
+      </div>
+    </div>
+  );
+}
+
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel };
 
 </script>
 <script type="text/babel">
@@ -4689,6 +4769,7 @@ function App() {
       <V.VolumenBar />
       {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
       <main className="content">
+        {tab === "tr" && <V.EstrategiaPanel />}
         {tab === "tr" && <V.AsistenteOperativo />}
         {tab === "tr" && <V.VelocidadMercado />}
         {tab === "tr" && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
