@@ -4029,12 +4029,33 @@ function Backup() {
     try { localStorage.setItem("ua_p2p_last_backup", String(Date.now())); } catch (e) {}
     setMsg("✅ Descarga iniciada. Guardá el archivo en Drive o un disco externo para tener tu copia.");
   };
+  const descargarTodo = () => {
+    const a = document.createElement("a");
+    a.href = B + "/api/export/todo?dias=" + dias;
+    a.download = "backup_p2p.zip";
+    document.body.appendChild(a); a.click(); a.remove();
+    try { localStorage.setItem("ua_p2p_last_backup", String(Date.now())); } catch (e) {}
+    setMsg("✅ Backup general (Binance + Bybit) en un ZIP. Guardalo en Drive o disco externo.");
+  };
+  const vaciar = async () => {
+    if (!window.confirm("¿Vaciar las listas conservando las últimas 24h? Hacé el backup ANTES. No borra precios, volumen ni historial.")) return;
+    setMsg("Vaciando…");
+    try {
+      const r = await fetch(B + "/api/mantenimiento/vaciar", { method: "POST" });
+      const d = await r.json();
+      setMsg(d.ok ? "✅ Listas vaciadas (conservé 24h). Disco liberado." : "No se pudo vaciar.");
+    } catch (e) { setMsg("No se pudo vaciar."); }
+  };
   return (
     <div className="view">
       <section className="chart-card backup-wrap">
         <div className="card-head"><h3>Backup / Exportar base de datos</h3><span className="card-sub">descarga el detalle por anunciante</span></div>
         <div style={{ marginBottom: 6 }}><SystemBar /></div>
-        <p className="backup-last">Última copia registrada en este navegador: <b>{lastTxt}</b>{diasDesde !== null ? " (hace " + diasDesde + " días)" : ""}.</p>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", margin: "10px 0 6px" }}>
+          <button className="btn-apply dirty" onClick={descargarTodo}>⬇ Backup general (Binance + Bybit)</button>
+          <button className="btn-reset" onClick={vaciar}>Vaciar listas (conservar 24h)</button>
+        </div>
+        <p className="backup-last">Un clic baja TODO en un ZIP. Última copia: <b>{lastTxt}</b>{diasDesde !== null ? " (hace " + diasDesde + " días)" : ""}.</p>
         <div className="backup-grid">
           <div className="f-item"><label>Exchange</label>
             <select value={fuente} onChange={e => setFuente(e.target.value)}>
@@ -4073,15 +4094,24 @@ function Backup() {
 
 function BackupBanner({ onGo }) {
   const [dismissed, setDismissed] = React.useState(false);
+  const [pct, setPct] = React.useState(null);
+  React.useEffect(() => {
+    const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+    fetch(B + "/api/storage").then(r => r.json()).then(d => setPct(d.pct)).catch(() => {});
+  }, []);
   const last = (() => { try { return parseInt(localStorage.getItem("ua_p2p_last_backup") || "0"); } catch (e) { return 0; } })();
   const diasDesde = last ? Math.floor((Date.now() - last) / 86400000) : null;
-  const vencido = diasDesde === null || diasDesde >= 7;
-  if (dismissed || !vencido) return null;
+  const backupVencido = diasDesde === null || diasDesde >= 7;
+  const discoAlto = pct != null && pct >= 70;
+  if (dismissed || (!backupVencido && !discoAlto)) return null;
+  const txt = discoAlto
+    ? ("Disco al " + pct + "%. Hacé el backup general y después vaciá las listas.")
+    : ((diasDesde === null ? "Todavía no registraste ninguna copia de la base de datos." : ("Tu última copia fue hace " + diasDesde + " días.")) + " Conviene exportar un backup.");
   return (
-    <div className="backup-banner">
+    <div className="backup-banner" style={discoAlto ? { borderLeftColor: "var(--sell)" } : {}}>
       <span className="bb-dot"></span>
-      <span className="bb-txt">{diasDesde === null ? "Todavía no registraste ninguna copia de la base de datos." : ("Tu última copia fue hace " + diasDesde + " días.")} Conviene exportar un backup.</span>
-      <button className="bb-go" onClick={onGo}>Hacer backup</button>
+      <span className="bb-txt">{txt}</span>
+      <button className="bb-go" onClick={onGo}>{discoAlto ? "Ir a Backup" : "Hacer backup"}</button>
       <button className="bb-x" onClick={() => setDismissed(true)} aria-label="cerrar">✕</button>
     </div>
   );
@@ -6068,6 +6098,80 @@ def api_export_detalle():
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename=detalle_{fuente}_{tipo}_{dias}d.csv"},
     )
+
+
+@app.route("/api/export/todo")
+def api_export_todo():
+    """Backup general en UN clic: ZIP con el detalle de Binance y Bybit.
+    Param: ?dias=N (default 30, cubre toda la base)."""
+    import csv, io, zipfile
+    try:
+        dias = int(request.args.get("dias", 30))
+    except (ValueError, TypeError):
+        dias = 30
+    campos = ["snapshot_timestamp", "hora", "tipo", "posicion", "anunciante",
+              "precio", "disponible", "completadas", "tasa_exito", "es_merchant"]
+    def csv_de(tabla):
+        buf = io.StringIO(); w = csv.writer(buf); w.writerow(campos)
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT snapshot_timestamp, hora, tipo, posicion, anunciante,
+                           precio, disponible, completadas, tasa_exito, es_merchant
+                    FROM """ + tabla + """
+                    WHERE snapshot_timestamp >= NOW() - (%s || ' days')::INTERVAL
+                    ORDER BY snapshot_timestamp DESC, tipo, posicion
+                """, [dias])
+                for r in cur.fetchall():
+                    w.writerow([str(r["snapshot_timestamp"])[:19], r["hora"], r["tipo"], r["posicion"],
+                                r["anunciante"],
+                                float(r["precio"]) if r["precio"] is not None else "",
+                                float(r["disponible"]) if r["disponible"] is not None else "",
+                                r["completadas"],
+                                float(r["tasa_exito"]) if r["tasa_exito"] is not None else "",
+                                r["es_merchant"]])
+        return buf.getvalue()
+    hoy = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d")
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+        for tabla, nombre in (("snapshots_detalle", "binance"), ("snapshots_detalle_bybit", "bybit")):
+            try:
+                z.writestr(f"{nombre}_{hoy}.csv", csv_de(tabla))
+            except Exception as e:
+                print(f"[export todo {nombre}]", e)
+    zbuf.seek(0)
+    return Response(zbuf.getvalue(), mimetype="application/zip",
+                    headers={"Content-Disposition": f"attachment; filename=backup_p2p_{hoy}.zip"})
+
+
+@app.route("/api/mantenimiento/vaciar", methods=["POST"])
+def api_vaciar_listas():
+    """Vacia las listas top-80 conservando las ultimas 24h (para el solape).
+    Libera disco. NO toca snapshots (precios), fills_estimados ni operativa_historial."""
+    horas = 24
+    res = {}
+    try:
+        conn = get_conn(); conn.autocommit = True
+        cur = conn.cursor()
+        for t in ("snapshots_detalle", "snapshots_detalle_bybit"):
+            try:
+                cur.execute(f"SELECT to_regclass('public.{t}')")
+                if cur.fetchone()[0] is None:
+                    res[t] = "no existe"; continue
+                cur.execute("DROP TABLE IF EXISTS _keep_tmp")
+                cur.execute(f"CREATE TEMP TABLE _keep_tmp AS SELECT * FROM {t} "
+                            f"WHERE snapshot_timestamp >= NOW() - INTERVAL '{horas} hours'")
+                cur.execute(f"TRUNCATE TABLE {t}")
+                cur.execute(f"INSERT INTO {t} SELECT * FROM _keep_tmp")
+                cur.execute("DROP TABLE _keep_tmp")
+                cur.execute(f"SELECT COUNT(*) FROM {t}")
+                res[t] = f"conservadas {cur.fetchone()[0]} filas ({horas}h)"
+            except Exception as e:
+                res[t] = f"error: {e}"
+        conn.close()
+        return jsonify({"ok": True, "detalle": res})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ──────────────────────────────────────────────
