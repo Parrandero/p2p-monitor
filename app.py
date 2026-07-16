@@ -198,6 +198,20 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills_estimados(exchange, ts)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_fills_anun ON fills_estimados(anunciante, tipo, ts)")
+            # ── Historial de decisiones del asistente (para ver ventanas por hora) ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS operativa_historial (
+                    id SERIAL PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL,
+                    hora INTEGER,
+                    decision TEXT,
+                    color TEXT,
+                    spread_neto NUMERIC,
+                    ratio NUMERIC,
+                    presion NUMERIC
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_operativa_ts ON operativa_historial(ts)")
         conn.commit()
     print("\u2705 Base de datos lista (snapshots + snapshots_detalle)")
 
@@ -953,6 +967,66 @@ def ciclo_colector_bybit():
             intervalo = config["INTERVALO_MIN"]
         time.sleep(intervalo * 60)
 
+_ultimo_reg_operativa = [None]   # throttle del registro (1 fila cada 5 min)
+
+def _registrar_operativa(snap):
+    """Registra la decisión del asistente en operativa_historial, para poder
+    ver por hora/día cuándo hubo ventana. Copia la lógica de señales+decisión
+    de api_operativa. Se llama desde el ciclo del colector (throttle 5 min);
+    va envuelto en try/except del que lo llama, nunca rompe el ciclo."""
+    now = datetime.now(SANTIAGO_TZ)
+    if _ultimo_reg_operativa[0] and (now - _ultimo_reg_operativa[0]).total_seconds() < 300:
+        return
+    if not snap or snap.get("spread_pond_pct") is None:
+        return
+    with config_lock:
+        c = dict(config)
+    f = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
+    hp = 12
+    v30 = v60b = v60 = v12 = 0.0
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT COALESCE(SUM(monto) FILTER (WHERE ts >= %(m30)s), 0) AS v30,
+                       COALESCE(SUM(monto) FILTER (WHERE ts >= %(m60)s AND tipo='BUY'), 0) AS v60b,
+                       COALESCE(SUM(monto) FILTER (WHERE ts >= %(m60)s), 0) AS v60,
+                       COALESCE(SUM(monto), 0) AS v12
+                FROM fills_estimados WHERE exchange='binance' AND ts >= %(h12)s
+            """, {"m30": f(now - timedelta(minutes=30)),
+                  "m60": f(now - timedelta(minutes=60)),
+                  "h12": f(now - timedelta(hours=hp))})
+            r = cur.fetchone()
+            v30, v60b = float(r["v30"] or 0), float(r["v60b"] or 0)
+            v60, v12  = float(r["v60"] or 0), float(r["v12"] or 0)
+    gan       = float(snap.get("ganancia_neta_pct") or 0)
+    min_op    = float(c["SPREAD_MIN_OPERATIVO"])
+    rot_lento = float(c.get("UMBRAL_ROT_LENTO", 0.7))
+    rot_dual  = float(c.get("UMBRAL_ROT_DUAL", 1.0))
+    sesgo_min = float(c.get("UMBRAL_PRESION_SESGO", 10))
+    um30  = v30 / 30
+    uprom = v12 / (hp * 60) if v12 else 0
+    ratio   = round(um30 / uprom, 2) if uprom else None
+    presion = round(v60b / v60 * 100, 1) if v60 else 50.0
+    if gan >= min_op and (ratio is None or ratio >= rot_dual):
+        decision, color = "OPERAR DUAL", "green"
+    elif gan >= min_op and ratio >= rot_lento:
+        decision, color = "OPERAR DUAL (paciente)", "yellow"
+    elif gan >= min_op:
+        decision, color = "SOLO PIERNA CON FLUJO", "orange"
+    elif ratio is not None and ratio >= rot_dual and abs(presion - 50) >= sesgo_min:
+        decision, color = ("SOLO VENTA" if presion > 50 else "SOLO COMPRA"), "orange"
+    else:
+        decision, color = "ESPERAR", "red"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO operativa_historial (ts, hora, decision, color, spread_neto, ratio, presion)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """, (f(now), now.hour, decision, color, round(gan, 4), ratio, presion))
+        conn.commit()
+    _ultimo_reg_operativa[0] = now
+
+
 def ciclo_colector():
     print("[COLECTOR] Iniciando thread...")
     time.sleep(5)
@@ -1007,6 +1081,11 @@ def ciclo_colector():
                     print(f"[FILLS BN] {e}")
                 estado["detalle_compra"] = build_detalle_memory(raw_compra, "BUY",  now_dt)
                 estado["detalle_venta"]  = build_detalle_memory(raw_venta,  "SELL", now_dt)
+                # ── Registro del asistente (historial de ventanas por hora) ──
+                try:
+                    _registrar_operativa(estado)
+                except Exception as e:
+                    print(f"[REG operativa] {e}")
                 with data_lock:
                     ultimo_estado.update(estado)
                 print(f"[{estado['timestamp']}] Spread pond: {estado['spread_pond_pct']}% — {estado['estado']} | Detalle: {len(raw_compra)+len(raw_venta)} anunciantes guardados")
