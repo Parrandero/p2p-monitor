@@ -4043,8 +4043,8 @@ function Backup() {
     try {
       const r = await fetch(B + "/api/mantenimiento/vaciar", { method: "POST" });
       const d = await r.json();
-      setMsg(d.ok ? "✅ Listas vaciadas (conservé 24h). Disco liberado." : "No se pudo vaciar.");
-    } catch (e) { setMsg("No se pudo vaciar."); }
+      setMsg(d.ok ? "🧹 Vaciando en segundo plano — mirá el ALMACENAMIENTO de arriba, en unos segundos baja. No cierres la app." : "No se pudo iniciar el vaciado.");
+    } catch (e) { setMsg("No se pudo iniciar el vaciado."); }
   };
   return (
     <div className="view">
@@ -6147,31 +6147,34 @@ def api_export_todo():
 @app.route("/api/mantenimiento/vaciar", methods=["POST"])
 def api_vaciar_listas():
     """Vacia las listas top-80 conservando las ultimas 24h (para el solape).
-    Libera disco. NO toca snapshots (precios), fills_estimados ni operativa_historial."""
-    horas = 24
-    res = {}
-    try:
-        conn = get_conn(); conn.autocommit = True
-        cur = conn.cursor()
-        for t in ("snapshots_detalle", "snapshots_detalle_bybit"):
-            try:
-                cur.execute(f"SELECT to_regclass('public.{t}')")
-                if cur.fetchone()[0] is None:
-                    res[t] = "no existe"; continue
-                cur.execute("DROP TABLE IF EXISTS _keep_tmp")
-                cur.execute(f"CREATE TEMP TABLE _keep_tmp AS SELECT * FROM {t} "
-                            f"WHERE snapshot_timestamp >= NOW() - INTERVAL '{horas} hours'")
-                cur.execute(f"TRUNCATE TABLE {t}")
-                cur.execute(f"INSERT INTO {t} SELECT * FROM _keep_tmp")
-                cur.execute("DROP TABLE _keep_tmp")
-                cur.execute(f"SELECT COUNT(*) FROM {t}")
-                res[t] = f"conservadas {cur.fetchone()[0]} filas ({horas}h)"
-            except Exception as e:
-                res[t] = f"error: {e}"
-        conn.close()
-        return jsonify({"ok": True, "detalle": res})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    Corre EN SEGUNDO PLANO para no colgar la peticion (el colector sigue vivo).
+    NO toca snapshots (precios), fills_estimados ni operativa_historial."""
+    def _worker():
+        horas = 24
+        try:
+            conn = get_conn(); conn.autocommit = True
+            cur = conn.cursor()
+            try: cur.execute("SET lock_timeout = '25s'")
+            except Exception: pass
+            for t in ("snapshots_detalle", "snapshots_detalle_bybit"):
+                try:
+                    cur.execute(f"SELECT to_regclass('public.{t}')")
+                    if cur.fetchone()[0] is None:
+                        continue
+                    cur.execute("DROP TABLE IF EXISTS _keep_tmp")
+                    cur.execute(f"CREATE TEMP TABLE _keep_tmp AS SELECT * FROM {t} "
+                                f"WHERE snapshot_timestamp >= NOW() - INTERVAL '{horas} hours'")
+                    cur.execute(f"TRUNCATE TABLE {t}")
+                    cur.execute(f"INSERT INTO {t} SELECT * FROM _keep_tmp")
+                    cur.execute("DROP TABLE _keep_tmp")
+                    print(f"[VACIAR] {t}: OK (conservadas 24h)")
+                except Exception as e:
+                    print(f"[VACIAR {t}] {e}")
+            conn.close()
+        except Exception as e:
+            print(f"[VACIAR] {e}")
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"ok": True, "msg": "Vaciando en segundo plano. En unos segundos baja el disco."})
 
 
 # ──────────────────────────────────────────────
