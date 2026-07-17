@@ -4724,15 +4724,17 @@ function EstrategiaPanel() {
   const [cfg, setCfg] = React.useState(null);
   const [gap, setGap] = React.useState("");
   const [cap, setCap] = React.useState("");
+  const [minop, setMinop] = React.useState("");
   const [msg, setMsg] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const load = () => fetch(B + "/api/config").then(r => r.json()).then(d => {
     setCfg(d);
     setGap(String(d.GAP_OBJETIVO_BRUTO != null ? d.GAP_OBJETIVO_BRUTO : 1.25));
     setCap(String(d.CAPITAL_OPERATIVO != null ? d.CAPITAL_OPERATIVO : 760));
+    setMinop(String(d.SPREAD_MIN_OPERATIVO != null ? d.SPREAD_MIN_OPERATIVO : 0.28));
   }).catch(() => {});
   React.useEffect(() => { load(); }, []);
-  const base = { SPREAD_MIN_OPERATIVO: 0.28, UMBRAL_ROT_LENTO: 0.5, UMBRAL_ROT_DUAL: 0.8, UMBRAL_PRESION_SESGO: 15 };
+  const base = { UMBRAL_ROT_LENTO: 0.5, UMBRAL_ROT_DUAL: 0.8, UMBRAL_PRESION_SESGO: 15 };
   const aplicar = (body, nombre) => {
     if (busy) return;
     setBusy(true); setMsg("Aplicando...");
@@ -4742,12 +4744,14 @@ function EstrategiaPanel() {
       .catch(() => { setMsg("\u2717 Error al aplicar"); setBusy(false); });
   };
   const presets = [
-    { n: "Margen ancho", gap: 1.35, d: "pocos giros, m\u00e1ximo por peso" },
-    { n: "Equilibrado",  gap: 1.25, d: "la base recomendada" },
-    { n: "Rotaci\u00f3n",     gap: 1.10, d: "llena r\u00e1pido, m\u00e1s giros" },
+    { n: "Margen ancho", gap: 1.35, min: 0.28,  d: "pocos giros, m\u00e1ximo por peso" },
+    { n: "Equilibrado",  gap: 1.25, min: 0.28,  d: "la base recomendada" },
+    { n: "Rotaci\u00f3n",     gap: 1.10, min: 0.28,  d: "llena r\u00e1pido, m\u00e1s giros" },
+    { n: "Farming",      gap: 0.60, min: -0.20, d: "farmea \u00f3rdenes a margen m\u00ednimo" },
   ];
   const gapActual = cfg ? Number(cfg.GAP_OBJETIVO_BRUTO || 0) : null;
-  const esBaseOk = cfg && Number(cfg.SPREAD_MIN_OPERATIVO) === 0.28 && Number(cfg.UMBRAL_PRESION_SESGO) === 15;
+  const minActual = cfg ? Number(cfg.SPREAD_MIN_OPERATIVO) : null;
+  const esBaseOk = cfg && Number(cfg.UMBRAL_PRESION_SESGO) === 15 && Number(cfg.UMBRAL_ROT_LENTO) === 0.5;
   return (
     <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderRadius: 14, padding: "13px 16px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
@@ -4760,10 +4764,10 @@ function EstrategiaPanel() {
       </div>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "stretch" }}>
         {presets.map(p => {
-          const activo = gapActual != null && Math.abs(gapActual - p.gap) < 0.001 && esBaseOk;
+          const activo = gapActual != null && Math.abs(gapActual - p.gap) < 0.001 && minActual != null && Math.abs(minActual - p.min) < 0.001;
           return (
             <button key={p.n} disabled={busy}
-              onClick={() => aplicar(Object.assign({}, base, { GAP_OBJETIVO_BRUTO: p.gap }), p.n + " (gap " + p.gap + ")")}
+              onClick={() => aplicar(Object.assign({}, base, { GAP_OBJETIVO_BRUTO: p.gap, SPREAD_MIN_OPERATIVO: p.min }), p.n + " (gap " + p.gap + ", m\u00edn " + p.min + ")")}
               style={{ flex: 1, minWidth: 130, textAlign: "left", cursor: "pointer", borderRadius: 10, padding: "9px 12px",
                 border: "1px solid " + (activo ? "var(--accent)" : "var(--line)"),
                 background: activo ? "var(--accent-soft)" : "var(--bg-2)", color: "var(--text)" }}>
@@ -4778,14 +4782,17 @@ function EstrategiaPanel() {
           <span style={{ fontSize: 10, color: "var(--text-3)" }}>gap</span>
           <input value={gap} onChange={e => setGap(e.target.value)} inputMode="decimal"
             style={{ width: 46, background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12, padding: "4px 6px" }} />
+          <span style={{ fontSize: 10, color: "var(--text-3)" }}>m\u00edn</span>
+          <input value={minop} onChange={e => setMinop(e.target.value)} inputMode="decimal"
+            style={{ width: 46, background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12, padding: "4px 6px" }} />
           <span style={{ fontSize: 10, color: "var(--text-3)" }}>capital</span>
           <input value={cap} onChange={e => setCap(e.target.value)} inputMode="numeric"
             style={{ width: 56, background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12, padding: "4px 6px" }} />
           <button disabled={busy}
             onClick={() => {
-              const g = parseFloat(String(gap).replace(",", ".")), c = parseFloat(String(cap).replace(",", "."));
-              if (!(g > 0.3 && g < 5) || !(c > 0)) { setMsg("\u2717 Valores fuera de rango"); return; }
-              aplicar(Object.assign({}, base, { GAP_OBJETIVO_BRUTO: g, CAPITAL_OPERATIVO: c }), "personalizado (gap " + g + ")");
+              const g = parseFloat(String(gap).replace(",", ".")), c = parseFloat(String(cap).replace(",", ".")), m = parseFloat(String(minop).replace(",", "."));
+              if (!(g > 0.3 && g < 5) || !(c > 0) || !(m >= -1 && m <= 5)) { setMsg("\u2717 Valores fuera de rango"); return; }
+              aplicar(Object.assign({}, base, { GAP_OBJETIVO_BRUTO: g, CAPITAL_OPERATIVO: c, SPREAD_MIN_OPERATIVO: m }), "personalizado (gap " + g + ", m\u00edn " + m + ")");
             }}
             style={{ cursor: "pointer", borderRadius: 7, padding: "5px 12px", border: "1px solid var(--accent)", background: "var(--accent-soft)", color: "var(--accent)", fontSize: 11.5, fontFamily: "var(--mono)" }}>
             Aplicar
@@ -4793,7 +4800,7 @@ function EstrategiaPanel() {
         </div>
       </div>
       <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 8 }}>
-        Todos los botones aplican tambi\u00e9n los umbrales base del sem\u00e1foro (m\u00ednimo 0,28 \u00b7 rotaci\u00f3n 0,5/0,8 \u00b7 sesgo \u00b115). Termostato: llena en menos de 2 h \u2192 Rotaci\u00f3n \u00b7 tarda m\u00e1s de 6 h \u2192 Margen ancho.
+        El "m\u00ednimo sem\u00e1foro" es el margen NETO m\u00ednimo (ya con comisi\u00f3n) para que diga OPERAR. Farming lo baja a -0,2%: farmea \u00f3rdenes aceptando una p\u00e9rdida m\u00ednima, para reputaci\u00f3n. Pod\u00e9s editar gap, m\u00edn y capital a mano.
       </div>
     </div>
   );
