@@ -4086,6 +4086,19 @@ function PrecioChart() {
         const compra = data.compra || [], venta = data.venta || [];
         if (!compra.length && !venta.length) { setEstado("vacio"); return; }
 
+        // Perfil horario para sombrear el fondo según qué tan buena es cada
+        // hora (índice medido). Si falla, el sombreado cae al horario fijo.
+        let perfil = null;
+        try {
+          const rp = await fetch(base + "/api/perfil_horas");
+          const jp = await rp.json();
+          if (jp && jp.filas && jp.filas.length) {
+            perfil = {};
+            jp.filas.forEach(f => { perfil[f.hora] = f.indice; });
+          }
+        } catch (e) { /* sin perfil: se usa el sombreado fijo */ }
+        if (cancelado) return;
+
         const el = wrapRef.current;
         if (!el) return;
         chart = LightweightCharts.createChart(el, {
@@ -4141,6 +4154,51 @@ function PrecioChart() {
         });
         serieCompra.setData(compra);
         serieVenta.setData(venta);
+
+        // ── Bandas de contexto (COL19) ──────────────────────────────────
+        // Dos series histograma sobre una escala superpuesta, sólo para pintar
+        // el fondo: no llevan datos de precio, por eso van con priceScaleId ""
+        // y sin etiquetas. Los timestamps ya vienen corridos a hora Chile, así
+        // que getUTCHours() devuelve la hora local.
+        const serieBase = (compra.length >= venta.length ? compra : venta);
+        if (serieBase.length) {
+          // 1) intensidad del sombreado según qué tan buena es cada hora
+          //    (índice medido spread × flujo). Si el perfil aún no está,
+          //    cae a un sombreado plano de 9 a 16h.
+          const pintar = (t) => {
+            const h = new Date(t * 1000).getUTCHours();
+            let inten;
+            if (perfil && perfil[h] != null) inten = (perfil[h] / 100) * 0.13;
+            else inten = (h >= 9 && h <= 16) ? 0.07 : 0;
+            return "rgba(91,141,239," + inten.toFixed(3) + ")";
+          };
+          const banda = chart.addHistogramSeries({
+            priceScaleId: "", priceLineVisible: false, lastValueVisible: false,
+            baseLineVisible: false,
+          });
+          banda.priceScale().applyOptions({ scaleMargins: { top: 0, bottom: 0 } });
+          banda.setData(serieBase.map(p => ({ time: p.time, value: 1, color: pintar(p.time) })));
+
+          // 2) línea vertical en cada cambio de día
+          const dias = [];
+          let ultDia = null;
+          serieBase.forEach(p => {
+            const d = new Date(p.time * 1000).getUTCDate();
+            if (ultDia !== null && d !== ultDia) {
+              dias.push({ time: p.time, value: 1, color: "rgba(255,255,255,0.22)" });
+            }
+            ultDia = d;
+          });
+          if (dias.length) {
+            const sep = chart.addHistogramSeries({
+              priceScaleId: "", priceLineVisible: false, lastValueVisible: false,
+              baseLineVisible: false,
+            });
+            sep.priceScale().applyOptions({ scaleMargins: { top: 0, bottom: 0 } });
+            sep.setData(dias);
+          }
+        }
+
         chart.timeScale().fitContent();
 
         // Doble toque en móvil → volver a vista completa
