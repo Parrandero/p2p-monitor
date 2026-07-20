@@ -4246,6 +4246,67 @@ function PrecioChart() {
 }
 
 /* ─────────── INTELIGENCIA DE MERCADO ─────────── */
+function PerfilHoras() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    fetch(B + "/api/perfil_horas").then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
+    return () => { stop = true; };
+  }, []);
+  if (!d) return <div className="intel-loading">Cargando perfil horario…</div>;
+  const filas = d.filas || [];
+  if (!filas.length) return <div className="intel-loading">Todavía sin perfil horario (se calcula al arrancar el monitor).</div>;
+  const f = (x, n) => x == null ? "—" : Number(x).toFixed(n == null ? 2 : n);
+  const ahora = new Date().getHours();
+  const mejores = filas.slice().sort((a, b) => b.indice - a.indice).slice(0, 3).map(r => r.hora);
+  return (
+    <section className="chart-card">
+      <div className="card-head">
+        <h3>Perfil por hora — cuándo conviene operar</h3>
+        <span className="card-sub">73 días de spread × flujo medido · el gap sugerido sigue al spread de cada hora</span>
+      </div>
+      <div className="intel-scroll">
+        <table className="intel-table">
+          <thead><tr>
+            <th title="Hora del día, horario Chile.">Hora</th>
+            <th title="Qué tan buena es la hora para farmear. Combina cuánto margen hay (spread) con cuánta gente opera (flujo). 100 = la mejor hora del día.">Índice</th>
+            <th></th>
+            <th title="Spread mediano del mercado en esa hora: el margen bruto disponible.">Spread</th>
+            <th title="Órdenes que se completan en esa hora, en promedio por día. Es lo que más pesa en el índice.">Flujo</th>
+            <th title="El gap que conviene usar en esa hora. Sigue al spread: un gap fijo queda ancho al mediodía y angosto de madrugada.">Gap sugerido</th>
+            <th title="Qué porcentaje del tiempo el semáforo dio verde o amarillo en esa hora (últimos 14 días).">% operable</th>
+          </tr></thead>
+          <tbody>{filas.map(r => {
+            const c = r.indice >= 75 ? "#35e07a" : r.indice >= 55 ? "#ffd740" : r.indice >= 35 ? "#ff9100" : "#ff5d6c";
+            const esAhora = r.hora === ahora;
+            return (
+              <tr key={r.hora} style={{ borderLeft: `3px solid ${c}`, background: esAhora ? "var(--bg-2)" : undefined }}>
+                <td><b className="tnum">{String(r.hora).padStart(2, "0")}h</b>{esAhora && <span style={{ fontSize: 9, color: "var(--accent)" }}> ahora</span>}{mejores.indexOf(r.hora) >= 0 && <span style={{ fontSize: 10 }}> ★</span>}</td>
+                <td className="tnum" style={{ color: c, fontWeight: 600 }}>{f(r.indice, 0)}</td>
+                <td style={{ width: 120 }}>
+                  <div style={{ background: "var(--bg-3)", borderRadius: 3, height: 7, width: 110 }}>
+                    <div style={{ background: c, width: Math.max(2, r.indice / 100 * 110), height: 7, borderRadius: 3 }} />
+                  </div>
+                </td>
+                <td className="tnum">{f(r.spread_med, 3)}%</td>
+                <td className="tnum">{f(r.flujo_ordenes, 0)}</td>
+                <td className="tnum" style={{ fontWeight: 600 }}>{r.gap_sugerido == null ? "—" : f(r.gap_sugerido) + "%"}</td>
+                <td className="tnum" style={{ color: "var(--text-3)" }}>{r.pct_operable == null ? "—" : f(r.pct_operable, 0) + "%"}</td>
+              </tr>
+            );
+          })}</tbody>
+        </table>
+      </div>
+      <div className="intel-explain">
+        <b>El hallazgo que ordena todo esto:</b> el <b>flujo</b> varía 90 veces entre horas (de 5 órdenes/hora de madrugada a 449 al mediodía) mientras el <b>spread</b> solo varía 3 veces. Como el flujo pesa mucho más, es el que manda.<br/>
+        <b>La trampa de la madrugada:</b> a las 4-5h el spread es el más ancho del día (1,26%), pero pasan 5 órdenes por hora. Margen inmejorable y nadie con quien operar.<br/>
+        <b>Qué hacer:</b> operá en las horas con índice alto, y usá el <b>gap sugerido</b> de esa hora — no un gap fijo. Las marcadas con ★ son las tres mejores del día.
+      </div>
+    </section>
+  );
+}
+
 function FichaAnunciante() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [q, setQ] = React.useState("");
@@ -4407,7 +4468,9 @@ function CruzarOEsperar() {
           {cruzarGana ? "CRUZAR sale más barato" : "PUBLICAR y esperar sale más barato"}
         </div>
         <div style={{ fontSize: 12.5, color: "var(--text-2)", lineHeight: 1.6 }}>
-          Con el spread actual de <b>{f(lib.spread_pct)}%</b>, cruzar conviene en órdenes desde <b>{d.umbral.tamano_equilibrio_usdt || "—"} USDT</b>.
+          {u.tamano_equilibrio_usdt
+            ? <>Con el spread actual de <b>{f(lib.spread_pct)}%</b>, cruzar conviene en órdenes desde <b>{u.tamano_equilibrio_usdt} USDT</b>. </>
+            : <>El spread actual (<b>{f(lib.spread_pct)}%</b>) supera la comisión maker ({d.comisiones.maker_pct}%): con este spread <b>no conviene cruzar a ningún tamaño</b>. </>}
           Para esta orden de {d.usdt_evaluado} USDT la diferencia es de <b style={{ color: tono }}>{u.ventaja_cruzar_pct > 0 ? "+" : ""}{f(u.ventaja_cruzar_pct)}%</b> a favor de {cruzarGana ? "cruzar" : "publicar"}.
         </div>
         <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}>
@@ -4489,7 +4552,7 @@ function Inteligencia() {
   const [farmers, setFarmers] = vS(null);
   const [curva, setCurva] = vS(null);
   const [loading, setLoading] = vS(true);
-  const [seccion, setSeccion] = vS("horario");
+  const [seccion, setSeccion] = vS("perfilhoras");
 
   vE(() => {
     setLoading(true);
@@ -4520,10 +4583,14 @@ function Inteligencia() {
 
   // Agrupadas por DECISIÓN, no por origen del dato (COL18). El grupo se
   // muestra como separador para que se entienda qué pregunta responde cada una.
+  // COL19: de 10 pestañas a 6. Las 3 vistas por hora (Ventanas reales /
+  // Horario / Patrones) se fusionaron en "Perfil por hora", que mide lo mismo
+  // con 73 días y mejor método. Pares y Top traders quedaron absorbidas por la
+  // Ficha del competidor, que muestra todo eso y más para cualquiera.
   const GRUPOS = [
-    ["CUÁNDO",        [["ventanas","🎯 Ventanas reales"],["horario","⏰ Horario"],["patron","📅 Patrones"]]],
-    ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"],["fill","⚡ Fill"]]],
-    ["CONTRA QUIÉN",  [["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"],["anunciantes","👥 Pares"],["traders","🏆 Top traders"]]],
+    ["CUÁNDO",        [["perfilhoras","🕐 Perfil por hora"]]],
+    ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"]]],
+    ["CONTRA QUIÉN",  [["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"]]],
   ];
 
   if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
@@ -4544,6 +4611,7 @@ function Inteligencia() {
 
       {seccion==="cruzar" && <CruzarOEsperar />}
       {seccion==="ficha" && <FichaAnunciante />}
+      {seccion==="perfilhoras" && <PerfilHoras />}
 
       {seccion==="horario" && horario && (
         <section className="chart-card">
@@ -6646,6 +6714,48 @@ def api_intel_ventanas_reales():
     return jsonify(rows)
 
 
+@app.route("/api/perfil_horas")
+def api_perfil_horas():
+    """Las 24 horas en UNA tabla: spread, flujo, indice, gap sugerido y que tan
+    seguido el semaforo dio verde. Reemplaza a las 3 vistas por hora que habia
+    antes (Ventanas reales / Horario / Patrones), que miraban lo mismo con
+    metodos peores y ventanas de datos mas cortas."""
+    filas = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM perfil_hora ORDER BY hora")
+                base = {int(r["hora"]): dict(r) for r in cur.fetchall()}
+                cur.execute("""
+                    SELECT hora, COUNT(*) n,
+                           COUNT(*) FILTER (WHERE color IN ('green','yellow')) ok
+                    FROM operativa_historial
+                    WHERE ts >= NOW() - INTERVAL '14 days' GROUP BY 1
+                """)
+                sem = {int(r["hora"]): r for r in cur.fetchall()}
+    except Exception as e:
+        print(f"[perfil_horas] {e}")
+        return jsonify({"filas": []})
+    for h in range(24):
+        b = base.get(h)
+        if not b:
+            continue
+        s = sem.get(h)
+        pct_ok = round(int(s["ok"]) / int(s["n"]) * 100, 1) if s and int(s["n"]) else None
+        filas.append({
+            "hora": h,
+            "indice": float(b["indice"] or 0),
+            "spread_med": float(b["spread_med"] or 0),
+            "flujo_ordenes": float(b["flujo_ordenes"] or 0),
+            "gap_sugerido": float(b["gap_sugerido"]) if b["gap_sugerido"] else None,
+            "pct_operable": pct_ok,
+            "muestras_semaforo": int(s["n"]) if s else 0,
+        })
+    return jsonify({"filas": filas,
+                    "nota": "indice = spread x flujo, normalizado a 100. El flujo varia 90x entre horas "
+                            "y el spread solo 3x, por eso el flujo manda. %operable sale del semaforo real."})
+
+
 @app.route("/api/plan_hoy")
 def api_plan_hoy():
     """PLAN DE HOY — la sintesis: que hacer AHORA, en una pantalla.
@@ -6688,18 +6798,22 @@ def api_plan_hoy():
     acciones = []
     if gap_sug and gap_actual:
         dif = gap_actual - gap_sug
+        ga = f"{gap_actual:.2f}".replace(".", ",")
+        gs = f"{gap_sug:.2f}".replace(".", ",")
         if abs(dif) >= 0.08:
-            acciones.append(f"Ajusta el gap: tenes {gap_actual}% y para esta hora conviene ~{gap_sug}%")
+            acciones.append(f"Ajusta el gap: tenes {ga}% y para esta hora conviene ~{gs}%")
         else:
-            acciones.append(f"Tu gap ({gap_actual}%) esta bien para esta hora")
+            acciones.append(f"Tu gap ({ga}%) esta bien para esta hora")
     if idx < 35:
         if mejor_prox and mejor_prox["indice"] >= 55:
             acciones.append(f"Hora floja: si podes, espera a las {mejor_prox['hora']:02d}h (indice {mejor_prox['indice']:.0f})")
         else:
             acciones.append("Hora floja y las proximas tampoco mejoran mucho")
     else:
+        # formato es-CL: coma decimal y 1 decimal (si no, "2.339" se lee como 2.339 ordenes)
+        ritmo_txt = f"{ritmo:.1f}".replace(".", ",") if ritmo else None
         acciones.append(f"Parate en posicion {pos_obj} o mejor" +
-                        (f" · el mercado ahi da ~{ritmo} ordenes/hora por pierna" if ritmo else ""))
+                        (f" · el mercado ahi da ~{ritmo_txt} ordenes/hora por pierna" if ritmo_txt else ""))
     return jsonify({
         "hora": hora, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
         "calidad": calidad, "calidad_txt": calidad_txt,
