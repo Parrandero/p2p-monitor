@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL18"
+VERSION       = "COL19"
 VERSION_FECHA = "2026-07-20"
 
 config = {
@@ -346,6 +346,19 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_mis_ord_ts ON mis_ordenes_reales(ts)")
+            # ── Perfil por hora del dia (COL19) ──
+            # Cachea el calculo pesado (spread x flujo por hora) que alimenta al
+            # Plan de hoy y al gap adaptativo. Se recalcula 1x/dia.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS perfil_hora (
+                    hora INTEGER PRIMARY KEY,
+                    spread_med NUMERIC,
+                    flujo_ordenes NUMERIC,
+                    indice NUMERIC,
+                    gap_sugerido NUMERIC,
+                    actualizado TIMESTAMP
+                )
+            """)
             # rol es CLAVE para calibrar: el monitor SOLO puede ver las ordenes
             # 'maker' (mis anuncios publicados en el libro). Las 'taker' (tomando
             # el anuncio de otro) son invisibles para el, asi que no deben contar
@@ -495,6 +508,71 @@ def recalibrar_ritmo():
     guardar_config_db({"RITMO_MEDIDO_ORD_H": tasa, "RITMO_MEDIDO_RANGO": f"{lo:02d}-{hi:02d}"})
     print(f"[RITMO] posicion {lo}-{hi}: {tasa} ordenes/hora por pierna (n={ordenes})")
     return tasa
+
+
+def recalibrar_horarios():
+    """Perfil de cada hora del dia: cuanto spread hay, cuanto flujo, que tan
+    buena es para farmear, y que gap conviene usar. Corre 1x/dia y se cachea
+    en perfil_hora (la consulta es pesada para hacerla en cada request).
+
+    HALLAZGO que motivo esto (medido 20-jul, 73 dias): el flujo varia 90x entre
+    horas (5 ordenes/hora a las 5h vs 449 a las 12h) mientras el spread solo
+    varia 3x (0,41% a la tarde vs 1,26% en la madrugada). Como el flujo domina,
+    la madrugada es una trampa: spread ancho pero mercado muerto. El indice
+    spread x flujo es lo que de verdad ordena las horas.
+
+    GAP SUGERIDO: sigue al spread mediano de esa hora. Un gap fijo queda
+    demasiado ancho al mediodia (spread 0,44%) y demasiado angosto de
+    madrugada (1,26%)."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL statement_timeout = '90s'")
+                cur.execute("""
+                    SELECT hora,
+                           percentile_cont(0.5) WITHIN GROUP (ORDER BY spread_pond_pct) sp
+                    FROM snapshots WHERE spread_pond_pct IS NOT NULL GROUP BY 1
+                """)
+                spread = {int(r["hora"]): float(r["sp"] or 0) for r in cur.fetchall()}
+                cur.execute("""
+                    SELECT EXTRACT(HOUR FROM ts)::int hora, SUM(ordenes) ord,
+                           COUNT(DISTINCT ts::date) dias
+                    FROM fills_estimados
+                    WHERE exchange='binance' AND metodo='directo'
+                      AND ts >= NOW() - INTERVAL '30 days'
+                    GROUP BY 1
+                """)
+                flujo = {int(r["hora"]): float(r["ord"] or 0) / max(1, int(r["dias"] or 1))
+                         for r in cur.fetchall()}
+                if not spread or not flujo:
+                    print("[HORARIOS] sin datos suficientes")
+                    return None
+                bruto = {h: spread.get(h, 0) * flujo.get(h, 0) for h in range(24)}
+                tope = max(bruto.values()) or 1
+                filas = []
+                now = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                for h in range(24):
+                    sp = round(spread.get(h, 0), 4)
+                    filas.append((h, sp, round(flujo.get(h, 0), 1),
+                                  round(bruto[h] / tope * 100, 1),
+                                  round(sp, 2) if sp else None, now))
+            with conn.cursor() as cur2:
+                cur2.executemany("""
+                    INSERT INTO perfil_hora
+                        (hora, spread_med, flujo_ordenes, indice, gap_sugerido, actualizado)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (hora) DO UPDATE SET
+                        spread_med=EXCLUDED.spread_med, flujo_ordenes=EXCLUDED.flujo_ordenes,
+                        indice=EXCLUDED.indice, gap_sugerido=EXCLUDED.gap_sugerido,
+                        actualizado=EXCLUDED.actualizado
+                """, filas)
+            conn.commit()
+        mejor = max(filas, key=lambda f: f[3])
+        print(f"[HORARIOS] recalculado · mejor hora {mejor[0]:02d}h (indice {mejor[3]})")
+        return filas
+    except Exception as e:
+        print(f"[HORARIOS] {e}")
+        return None
 
 
 def guardar_agregados_dia(fecha=None):
@@ -1479,6 +1557,10 @@ def ciclo_colector():
                     recalibrar_ritmo()
                 except Exception as e:
                     print(f"[RITMO diario] {e}")
+                try:
+                    recalibrar_horarios()
+                except Exception as e:
+                    print(f"[HORARIOS diario] {e}")
                 _ultima_purga = hoy
             print("[COLECTOR] Consultando Binance BUY...")
             raw_compra = obtener_anuncios("BUY")
@@ -4164,6 +4246,131 @@ function PrecioChart() {
 }
 
 /* ─────────── INTELIGENCIA DE MERCADO ─────────── */
+function FichaAnunciante() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [q, setQ] = React.useState("");
+  const [lista, setLista] = React.useState(null);
+  const [sel, setSel] = React.useState(null);
+  const [ficha, setFicha] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    fetch(B + "/api/anunciante?q=" + encodeURIComponent(q)).then(r => r.json())
+      .then(j => { if (!stop) setLista(j.lista || []); }).catch(() => {});
+    return () => { stop = true; };
+  }, [q]);
+  React.useEffect(() => {
+    if (!sel) { setFicha(null); return; }
+    let stop = false;
+    fetch(B + "/api/anunciante?nombre=" + encodeURIComponent(sel)).then(r => r.json())
+      .then(j => { if (!stop) setFicha(j); }).catch(() => {});
+    return () => { stop = true; };
+  }, [sel]);
+  const fN = (v) => v == null ? "—" : Number(v).toLocaleString("es-CL");
+  const boxSt = { flex: 1, minWidth: 130, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "9px 12px" };
+  const lbl = { fontSize: 9.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" };
+  const val = { fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)", margin: "3px 0 1px" };
+  return (
+    <section className="chart-card">
+      <div className="card-head">
+        <h3>Ficha del competidor</h3>
+        <span className="card-sub">órdenes reales del contador oficial · volumen y ticket estimados</span>
+      </div>
+      <input value={q} onChange={e => setQ(e.target.value)} placeholder="Buscar anunciante por nombre…"
+        style={{ width: "100%", maxWidth: 340, background: "var(--bg-2)", border: "1px solid var(--line)",
+                 color: "var(--text)", padding: "8px 11px", borderRadius: 9, fontFamily: "var(--mono)", fontSize: 12.5, marginBottom: 12 }} />
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-start" }}>
+        <div style={{ minWidth: 250, flex: "0 0 auto", maxHeight: 340, overflowY: "auto" }}>
+          {(lista || []).map(a => (
+            <div key={a.anunciante} onClick={() => setSel(a.anunciante)}
+              style={{ cursor: "pointer", padding: "6px 9px", borderRadius: 7, marginBottom: 2, fontSize: 12,
+                       background: sel === a.anunciante ? "var(--accent-soft)" : "transparent",
+                       border: "1px solid " + (sel === a.anunciante ? "var(--accent)" : "transparent"),
+                       display: "flex", justifyContent: "space-between", gap: 10 }}>
+              <span style={{ color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {a.merchant && <span className="merch">✦ </span>}{a.anunciante}
+              </span>
+              <span className="tnum" style={{ color: "var(--text-3)", whiteSpace: "nowrap" }}>{fN(a.ordenes)} órd</span>
+            </div>
+          ))}
+          {lista && lista.length === 0 && <div style={{ fontSize: 12, color: "var(--text-3)", padding: 8 }}>Sin resultados.</div>}
+        </div>
+        <div style={{ flex: 1, minWidth: 300 }}>
+          {!sel && <div style={{ fontSize: 12.5, color: "var(--text-3)", padding: "20px 0" }}>Elegí un anunciante de la lista para ver su ficha.</div>}
+          {sel && ficha && ficha.encontrado === false && <div style={{ fontSize: 12.5, color: "var(--text-3)" }}>Sin datos suficientes de {sel}.</div>}
+          {sel && ficha && ficha.encontrado && (
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 15, fontWeight: 600 }}>{ficha.merchant && <span className="merch">✦ </span>}{ficha.nombre}</span>
+                {ficha.dual_ahora && <span style={{ fontSize: 10, color: "var(--buy)", border: "1px solid var(--buy)", borderRadius: 5, padding: "1px 6px" }}>DUAL AHORA</span>}
+                {!ficha.en_libro_ahora && <span style={{ fontSize: 10.5, color: "var(--text-3)" }}>· no está en el libro ahora</span>}
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+                <div style={boxSt}>
+                  <div style={lbl}>Órdenes por día</div>
+                  <div style={val}>{fN(ficha.ordenes_dia_prom)}</div>
+                  <div style={{ fontSize: 10, color: "var(--text-3)" }}>contador oficial · {ficha.dias_observado} días</div>
+                </div>
+                <div style={boxSt}>
+                  <div style={lbl}>Volumen 30d</div>
+                  <div style={val}>{fN(ficha.volumen_30d)}</div>
+                  <div style={{ fontSize: 10, color: "var(--text-3)" }}>USDT (estimado)</div>
+                </div>
+                <div style={boxSt}>
+                  <div style={lbl}>Ticket medio</div>
+                  <div style={val}>{fN(ficha.ticket_medio)}</div>
+                  <div style={{ fontSize: 10, color: "var(--text-3)" }}>USDT por orden</div>
+                </div>
+                <div style={boxSt}>
+                  <div style={lbl}>Gap propio</div>
+                  <div style={{ ...val, color: ficha.gap_propio_pct ? "var(--warn)" : "var(--text-3)" }}>
+                    {ficha.gap_propio_pct != null ? ficha.gap_propio_pct + "%" : "—"}
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--text-3)" }}>{ficha.gap_propio_pct != null ? "su margen bruto" : "sólo si está dual"}</div>
+                </div>
+                {ficha.ganancia_30d_estimada_usdt != null && (
+                  <div style={boxSt}>
+                    <div style={lbl}>Ganancia 30d est.</div>
+                    <div style={{ ...val, color: "var(--buy)" }}>{fN(ficha.ganancia_30d_estimada_usdt)}</div>
+                    <div style={{ fontSize: 10, color: "var(--text-3)" }}>USDT, neto de comisión</div>
+                  </div>
+                )}
+              </div>
+              {ficha.en_libro_ahora && (
+                <div style={{ fontSize: 11.5, color: "var(--text-2)", marginBottom: 10 }}>
+                  {["venta", "compra"].map(k => ficha.posiciones[k] && (
+                    <span key={k} style={{ marginRight: 14 }}>
+                      <b style={{ color: k === "venta" ? "var(--buy)" : "var(--sell)" }}>{k === "venta" ? "vende" : "compra"}</b>
+                      {" "}#{ficha.posiciones[k].posicion} a ${fN(ficha.posiciones[k].precio)} · {fN(ficha.posiciones[k].disponible)} USDT
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="intel-scroll">
+                <table className="intel-table">
+                  <thead><tr><th>Fecha</th><th title="Órdenes completadas ese día, del contador oficial de Binance.">Órdenes</th><th title="Posición media en el libro ese día.">Pos. media</th><th title="Stock promedio publicado.">Stock</th></tr></thead>
+                  <tbody>{(ficha.serie || []).map(s => (
+                    <tr key={s.fecha}>
+                      <td className="tnum">{s.fecha}</td>
+                      <td className="tnum" style={{ fontWeight: 600 }}>{fN(s.ordenes)}</td>
+                      <td className="tnum">{s.pos_media == null ? "—" : "#" + s.pos_media}</td>
+                      <td className="tnum" style={{ color: "var(--text-3)" }}>{fN(s.stock)}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="intel-explain">
+        <b>Qué mirar:</b> el <b>gap propio</b> de los que más órdenes hacen es la referencia más útil que tenés — es el margen que el mercado les está pagando hoy por farmear. Si el tuyo está muy lejos, ajustalo.<br/>
+        <b>Órdenes por día</b> sale del contador oficial de Binance, no es estimación nuestra: es el dato más confiable de la ficha. El volumen y el ticket sí son estimados por el tracker.<br/>
+        <b>Ojo con la historia:</b> arranca el 19 de julio, que es cuando empezamos a congelar los agregados diarios. De acá en adelante se acumula sola.
+      </div>
+    </section>
+  );
+}
+
 function CruzarOEsperar() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [usdt, setUsdt] = React.useState(200);
@@ -4316,7 +4523,7 @@ function Inteligencia() {
   const GRUPOS = [
     ["CUÁNDO",        [["ventanas","🎯 Ventanas reales"],["horario","⏰ Horario"],["patron","📅 Patrones"]]],
     ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"],["fill","⚡ Fill"]]],
-    ["CONTRA QUIÉN",  [["farmers","🌾 Farmers"],["anunciantes","👥 Pares"],["traders","🏆 Top traders"]]],
+    ["CONTRA QUIÉN",  [["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"],["anunciantes","👥 Pares"],["traders","🏆 Top traders"]]],
   ];
 
   if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
@@ -4336,6 +4543,7 @@ function Inteligencia() {
       </div>
 
       {seccion==="cruzar" && <CruzarOEsperar />}
+      {seccion==="ficha" && <FichaAnunciante />}
 
       {seccion==="horario" && horario && (
         <section className="chart-card">
@@ -5420,6 +5628,77 @@ function AsistenteOperativo() {
   );
 }
 
+function PlanHoy() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  const [abierto, setAbierto] = React.useState(true);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/plan_hoy").then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => {});
+    load();
+    const id = setInterval(load, 120000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  if (!d || d.indice_hora == null) return null;
+  const tonos = { excelente: "var(--buy)", buena: "var(--buy)", floja: "var(--warn)", mala: "var(--sell)" };
+  const tono = tonos[d.calidad] || "var(--accent)";
+  const f = (x, n) => x == null ? "—" : Number(x).toFixed(n == null ? 2 : n);
+  return (
+    <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)",
+                  borderLeft: "4px solid " + tono, borderRadius: 14, padding: "13px 16px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Plan de hoy</span>
+        <span style={{ fontFamily: "var(--mono)", fontSize: 17, fontWeight: 600, color: tono }}>
+          {String(d.hora).padStart(2, "0")}h · hora {d.calidad}
+        </span>
+        <span style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--text-3)" }}>
+          índice {f(d.indice_hora, 0)}/100
+        </span>
+        <span title={d.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
+        <button onClick={() => setAbierto(!abierto)}
+          style={{ marginLeft: "auto", background: "transparent", border: "1px solid var(--line)",
+                   borderRadius: 7, color: "var(--text-3)", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+          {abierto ? "ocultar" : "ver detalle"}
+        </button>
+      </div>
+      <div style={{ fontSize: 13, color: "var(--text)", margin: "8px 0 0", lineHeight: 1.6 }}>
+        {(d.acciones || []).map((a, i) => (
+          <div key={i} style={{ display: "flex", gap: 8 }}>
+            <span style={{ color: tono }}>▸</span><span>{a}</span>
+          </div>
+        ))}
+      </div>
+      {abierto && (
+        <div style={{ marginTop: 12, display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 5 }}>Próximas horas</div>
+            <div style={{ display: "flex", gap: 4 }}>
+              {(d.proximas_horas || []).map(p => {
+                const c = p.indice >= 75 ? "var(--buy)" : p.indice >= 55 ? "var(--warn)" : p.indice >= 35 ? "var(--warn-low)" : "var(--sell)";
+                return (
+                  <div key={p.hora} style={{ textAlign: "center", minWidth: 40 }}>
+                    <div style={{ height: 34, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+                      <div style={{ width: 22, height: Math.max(3, p.indice / 100 * 34), background: c, borderRadius: 2 }} />
+                    </div>
+                    <div style={{ fontFamily: "var(--mono)", fontSize: 9.5, color: "var(--text-3)", marginTop: 3 }}>{String(p.hora).padStart(2, "0")}</div>
+                    <div style={{ fontFamily: "var(--mono)", fontSize: 9, color: c }}>{f(p.indice, 0)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div style={{ fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.7 }}>
+            <div>Gap sugerido para esta hora: <b style={{ color: "var(--text)" }}>{f(d.gap_sugerido)}%</b> <span style={{ color: "var(--text-3)" }}>(tenés {f(d.gap_actual)}%)</span></div>
+            <div>Spread típico de las {String(d.hora).padStart(2, "0")}h: <b style={{ color: "var(--text)" }}>{f(d.spread_hora_med, 3)}%</b> · ahora: <b style={{ color: "var(--text)" }}>{f(d.spread_ahora_pct, 3)}%</b></div>
+            <div>Posición objetivo: <b style={{ color: "var(--text)" }}>{d.posicion_objetivo}</b>{d.ritmo_ord_h ? <> · el mercado ahí da <b style={{ color: "var(--text)" }}>{f(d.ritmo_ord_h, 1)}</b> órd/h por pierna</> : null}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MiCampania() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [d, setD] = React.useState(null);
@@ -5623,7 +5902,7 @@ function EstrategiaPanel() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania };
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy };
 
 </script>
 <script type="text/babel">
@@ -5702,6 +5981,7 @@ function App() {
       <V.VolumenBar />
       {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
       <main className="content">
+        {tab === "tr" && <V.PlanHoy />}
         {tab === "tr" && <V.EstrategiaPanel />}
         {tab === "tr" && <V.MiCampania />}
         {tab === "tr" && <V.AsistenteOperativo />}
@@ -6364,6 +6644,197 @@ def api_intel_ventanas_reales():
         r["pct_operable"] = round(ok / n * 100, 1) if n else 0
         r["pct_verde"]    = round(int(r["verdes"] or 0) / n * 100, 1) if n else 0
     return jsonify(rows)
+
+
+@app.route("/api/plan_hoy")
+def api_plan_hoy():
+    """PLAN DE HOY — la sintesis: que hacer AHORA, en una pantalla.
+    Junta el perfil horario medido, el estado del libro, la curva de llenado
+    y el progreso de campana, y lo baja a instrucciones concretas."""
+    with config_lock:
+        c = dict(config)
+    now = datetime.now(SANTIAGO_TZ)
+    hora = now.hour
+    perfil, prox = {}, []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM perfil_hora ORDER BY hora")
+                filas = [dict(r) for r in cur.fetchall()]
+        por_hora = {int(f["hora"]): f for f in filas}
+        perfil = por_hora.get(hora, {})
+        # las proximas 6 horas, para saber si conviene quedarse o volver despues
+        for k in range(6):
+            h = (hora + k) % 24
+            f = por_hora.get(h)
+            if f:
+                prox.append({"hora": h, "indice": float(f["indice"] or 0),
+                             "gap_sugerido": float(f["gap_sugerido"] or 0) if f["gap_sugerido"] else None})
+    except Exception as e:
+        print(f"[plan_hoy] {e}")
+    idx = float(perfil.get("indice") or 0) if perfil else 0
+    gap_sug = float(perfil["gap_sugerido"]) if perfil.get("gap_sugerido") else None
+    gap_actual = float(c.get("GAP_OBJETIVO_BRUTO", 0) or 0)
+    if idx >= 75:   calidad, calidad_txt = "excelente", "de las mejores horas del dia"
+    elif idx >= 55: calidad, calidad_txt = "buena", "hora decente para operar"
+    elif idx >= 35: calidad, calidad_txt = "floja", "se puede, pero rinde poco"
+    else:           calidad, calidad_txt = "mala", "casi no hay flujo: no vale la pena"
+    mejor_prox = max(prox, key=lambda p: p["indice"]) if prox else None
+    ritmo = float(c.get("RITMO_MEDIDO_ORD_H", 0) or 0)
+    pos_obj = int(c.get("MI_POSICION_OBJETIVO", 15) or 15)
+    with data_lock:
+        snap = dict(ultimo_estado)
+    # accion concreta
+    acciones = []
+    if gap_sug and gap_actual:
+        dif = gap_actual - gap_sug
+        if abs(dif) >= 0.08:
+            acciones.append(f"Ajusta el gap: tenes {gap_actual}% y para esta hora conviene ~{gap_sug}%")
+        else:
+            acciones.append(f"Tu gap ({gap_actual}%) esta bien para esta hora")
+    if idx < 35:
+        if mejor_prox and mejor_prox["indice"] >= 55:
+            acciones.append(f"Hora floja: si podes, espera a las {mejor_prox['hora']:02d}h (indice {mejor_prox['indice']:.0f})")
+        else:
+            acciones.append("Hora floja y las proximas tampoco mejoran mucho")
+    else:
+        acciones.append(f"Parate en posicion {pos_obj} o mejor" +
+                        (f" · el mercado ahi da ~{ritmo} ordenes/hora por pierna" if ritmo else ""))
+    return jsonify({
+        "hora": hora, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "calidad": calidad, "calidad_txt": calidad_txt,
+        "indice_hora": round(idx, 1),
+        "spread_hora_med": round(float(perfil.get("spread_med") or 0), 4) if perfil else None,
+        "gap_sugerido": gap_sug, "gap_actual": gap_actual,
+        "posicion_objetivo": pos_obj,
+        "ritmo_ord_h": ritmo or None,
+        "proximas_horas": prox,
+        "mejor_proxima": mejor_prox,
+        "spread_ahora_pct": snap.get("spread_pond_pct"),
+        "estado_libro": snap.get("estado"),
+        "acciones": acciones,
+        "nota": "indice 0-100: que tan buena es la hora para farmear (spread x flujo, medido). "
+                "100 = la mejor hora del dia.",
+    })
+
+
+@app.route("/api/anunciante")
+def api_anunciante():
+    """FICHA DEL COMPETIDOR: todo lo que sabemos de un anunciante.
+    - ordenes/dia REALES (delta del contador oficial de Binance, no estimacion)
+    - volumen y ticket estimados por el tracker
+    - su gap propio si esta publicado en ambos lados AHORA
+    - ganancia bruta estimada = volumen x gap - comision
+    Sin ?nombre= devuelve el ranking para elegir a quien mirar."""
+    nombre = (request.args.get("nombre") or "").strip()
+    with config_lock:
+        com_maker = float(config.get("COM_MAKER_PCT", 0.19))
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL statement_timeout = '40s'")
+                if not nombre:
+                    q = (request.args.get("q") or "").strip()
+                    # OJO: ordenes_dia viene del contador POR CUENTA, asi que los
+                    # dos lados (BUY/SELL) traen el MISMO numero. Hay que tomar el
+                    # MAXIMO por fecha, nunca la suma: sumar duplicaria las ordenes
+                    # de todo anunciante que opere en ambos lados.
+                    cur.execute("""
+                        SELECT anunciante, SUM(ord_dia) ordenes,
+                               ROUND(AVG(pos)::numeric,1) pos,
+                               COUNT(*) dias, BOOL_OR(merch) merchant
+                        FROM (
+                            SELECT anunciante, fecha,
+                                   MAX(ordenes_dia) ord_dia, AVG(pos_media) pos,
+                                   BOOL_OR(es_merchant) merch
+                            FROM agregados_anunciante_dia
+                            WHERE exchange='binance'
+                              AND (%(q)s = '' OR anunciante ILIKE '%%' || %(q)s || '%%')
+                            GROUP BY 1,2
+                        ) x
+                        GROUP BY 1 HAVING SUM(ord_dia) > 0
+                        ORDER BY 2 DESC LIMIT 25
+                    """, {"q": q})
+                    return jsonify({"lista": [dict(r) for r in cur.fetchall()], "q": q})
+                # ── ficha ──
+                cur.execute("""
+                    SELECT fecha, tipo, apariciones, pos_media, pos_min, precio_medio,
+                           disp_medio, ordenes_dia, es_merchant
+                    FROM agregados_anunciante_dia
+                    WHERE exchange='binance' AND LOWER(anunciante)=LOWER(%(n)s)
+                    ORDER BY fecha DESC, tipo LIMIT 40
+                """, {"n": nombre})
+                hist = [dict(r) for r in cur.fetchall()]
+                cur.execute("""
+                    SELECT COUNT(*) fills, COALESCE(SUM(monto),0) vol,
+                           COALESCE(SUM(ordenes),0) ord,
+                           ROUND(AVG(monto/NULLIF(ordenes,0))::numeric) ticket,
+                           MIN(ts) desde, MAX(ts) hasta
+                    FROM fills_estimados
+                    WHERE exchange='binance' AND LOWER(anunciante)=LOWER(%(n)s)
+                      AND ts >= NOW() - INTERVAL '30 days'
+                """, {"n": nombre})
+                fl = dict(cur.fetchone() or {})
+    except Exception as e:
+        print(f"[anunciante] {e}")
+        return jsonify({"error": str(e)[:200]}), 500
+    if not hist and not fl.get("fills"):
+        return jsonify({"encontrado": False, "nombre": nombre})
+    # posicion y precio AHORA (libro en vivo) + gap propio si es dual
+    with data_lock:
+        snap = dict(ultimo_estado)
+    vivo = {}
+    for key, lado in (("detalle_compra", "venta"), ("detalle_venta", "compra")):
+        for row in (snap.get(key) or []):
+            if (row.get("anunciante") or "").strip().lower() == nombre.lower():
+                vivo[lado] = {"posicion": row.get("posicion"), "precio": row.get("precio"),
+                              "disponible": round(float(row.get("disponible") or 0))}
+    gap_propio = None
+    if "venta" in vivo and "compra" in vivo:
+        try:
+            pv, pc = float(vivo["venta"]["precio"]), float(vivo["compra"]["precio"])
+            if pv > 0 and pc > 0:
+                gap_propio = round((pv - pc) / pc * 100, 3)
+        except (ValueError, TypeError):
+            pass
+    # resumen diario (suma los dos lados por fecha)
+    por_fecha = {}
+    for h in hist:
+        d = por_fecha.setdefault(str(h["fecha"]), {"fecha": str(h["fecha"]), "ordenes": 0,
+                                                   "pos": [], "precio": [], "stock": 0})
+        # MAX y no suma: el contador es por CUENTA, los dos lados traen el mismo
+        # numero (ver comentario en la consulta de la lista).
+        d["ordenes"] = max(d["ordenes"], int(h["ordenes_dia"] or 0))
+        if h["pos_media"]: d["pos"].append(float(h["pos_media"]))
+        if h["precio_medio"]: d["precio"].append(float(h["precio_medio"]))
+        d["stock"] += float(h["disp_medio"] or 0)
+    serie = []
+    for d in sorted(por_fecha.values(), key=lambda x: x["fecha"], reverse=True):
+        serie.append({"fecha": d["fecha"], "ordenes": d["ordenes"],
+                      "pos_media": round(sum(d["pos"]) / len(d["pos"]), 1) if d["pos"] else None,
+                      "stock": round(d["stock"])})
+    ord_dia = round(sum(s["ordenes"] for s in serie) / len(serie), 1) if serie else None
+    vol30 = float(fl.get("vol") or 0)
+    # ganancia bruta estimada: solo tiene sentido si sabemos su gap
+    gan = None
+    if gap_propio and vol30:
+        gan = round(vol30 * (gap_propio - com_maker * 2) / 100)
+    return jsonify({
+        "encontrado": True, "nombre": nombre,
+        "merchant": any(h.get("es_merchant") for h in hist),
+        "dias_observado": len(serie),
+        "ordenes_dia_prom": ord_dia,
+        "volumen_30d": round(vol30),
+        "ordenes_30d_tracker": int(fl.get("ord") or 0),
+        "ticket_medio": float(fl["ticket"]) if fl.get("ticket") else None,
+        "en_libro_ahora": bool(vivo), "dual_ahora": len(vivo) == 2,
+        "posiciones": vivo, "gap_propio_pct": gap_propio,
+        "ganancia_30d_estimada_usdt": gan,
+        "serie": serie[:14],
+        "nota": ("ordenes_dia sale del contador OFICIAL de Binance (no es estimacion nuestra). "
+                 "El volumen y el ticket si son estimados por el tracker. La ganancia asume que "
+                 "opera su gap actual en las dos piernas y paga comision maker."),
+    })
 
 
 @app.route("/api/taker_maker")
@@ -7602,6 +8073,10 @@ def _boot():
         recalibrar_ritmo()     # y con el ritmo de mercado medido en tu posicion
     except Exception as e:
         print(f"[RITMO boot] {e}")
+    try:
+        recalibrar_horarios()  # perfil de cada hora (plan de hoy + gap adaptativo)
+    except Exception as e:
+        print(f"[HORARIOS boot] {e}")
     threading.Thread(target=ciclo_colector, daemon=True).start()
     threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
 
