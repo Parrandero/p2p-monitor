@@ -17,6 +17,11 @@ from contextlib import contextmanager
 app = Flask(__name__)
 SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
+# Version del codigo: se expone en /api/version y en el pie del dashboard, para
+# confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
+VERSION       = "COL17"
+VERSION_FECHA = "2026-07-20"
+
 config = {
     "MONEDA":               "USDT",
     "FIAT":                 "CLP",
@@ -45,8 +50,19 @@ config = {
     # ── Fills v2 (volumen/velocidad por fills confirmados) ──
     "FILL_VENTANA_MIN":     15,    # min para que 'completadas' confirme una caida (ventana de pago Binance)
     "FILL_CAP_USDT":        10000, # tope de sanidad por evento (antes 3000, ciego; ahora solo protege contra ediciones gigantes)
-    "FILL_TICKET_DEF":      272,   # ticket mediano de mercado (validado sobre 7d de datos reales) p/ fills enmascarados
-    "FILL_TICKET_DEF_BYBIT": 200,  # ticket mediano de Bybit (mas chico que Binance: p50=196 en datos jul)
+    # Ticket p/ estimar fills enmascarados. OJO (COL17): para estimar un TOTAL
+    # hay que usar la MEDIA (total = n x media), no la mediana. La distribucion
+    # de tickets es de cola pesada (medido 20-jul: p50=206, media cruda=561,
+    # media recortada al p95=408), asi que la mediana subestima el total y la
+    # media cruda se dispara por unos pocos gigantes -> se usa MEDIA RECORTADA.
+    # Estos valores son solo el arranque: recalibrar_tickets() los recalcula
+    # solo cada dia con los fills observados reales.
+    "FILL_TICKET_DEF":      408,   # media recortada p95 (binance), auto-calibrado a diario
+    "FILL_TICKET_DEF_BYBIT": 300,  # idem bybit (mercado mas chico)
+    "TICKET_AUTOCAL":       1,     # 1 = recalibrar solo a diario; 0 = fijo a mano
+    "TICKET_MIN_MUESTRAS":  200,   # no recalibrar con menos fills observados que esto
+    "TICKET_RANGO_MIN":     50,    # clamp de sanidad: un dia raro no puede envenenar el parametro
+    "TICKET_RANGO_MAX":     2000,
     "CAPITAL_OPERATIVO":    600,   # USDT de capital de trabajo p/ proyecciones del asistente (editable en el panel; persiste en DB)
     # ── Proyeccion realista (COL12) ──
     # La proyeccion vieja (10% de captura, giros ilimitados) era un techo teorico:
@@ -59,6 +75,10 @@ config = {
     # ── Mi posicion / carrera al verificado (COL14) ──
     "MI_NICKNAME":          "",    # nickname de Binance P2P: activa el seguimiento de MIS anuncios
     "MI_POSICION_OBJETIVO": 15,    # posicion objetivo en el libro (el plan farming dice top 10-20)
+    # Ritmo MEDIDO del mercado en esa posicion (ordenes/hora por pierna).
+    # Lo calcula recalibrar_ritmo() con fills observados; 0 = todavia sin medir.
+    "RITMO_MEDIDO_ORD_H":   0.0,
+    "RITMO_MEDIDO_RANGO":   "",
     # ── Umbrales del asistente (ahora configurables en caliente) ──
     "UMBRAL_ROT_LENTO":     0.7,   # ratio rotacion bajo el cual el mercado se considera lento
     "UMBRAL_ROT_DUAL":      1.0,   # ratio rotacion desde el cual habilita OPERAR DUAL pleno
@@ -91,12 +111,18 @@ CONFIG_TYPE_MAP = {
     "UMBRAL_ROT_DUAL":      float,
     "UMBRAL_PRESION_SESGO": float,
     "GAP_OBJETIVO_BRUTO":   float,
+    "TICKET_AUTOCAL":       int,
+    "TICKET_MIN_MUESTRAS":  int,
+    "TICKET_RANGO_MIN":     float,
+    "TICKET_RANGO_MAX":     float,
     "CAPTURA_REALISTA_PCT": float,
     "CAPTURA_VERIF_PCT":    float,
     "ORDENES_H_MAX":        int,
     "COMISION_BN_VERIF":    float,
     "MI_NICKNAME":          str,
     "MI_POSICION_OBJETIVO": int,
+    "RITMO_MEDIDO_ORD_H":   float,
+    "RITMO_MEDIDO_RANGO":   str,
 }
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -271,6 +297,53 @@ def init_db():
                     actualizado TIMESTAMP
                 )
             """)
+            # \u2500\u2500 Agregados diarios: preservan la historia antes de la purga \u2500\u2500
+            # ordenes_dia sale del contador OFICIAL de Binance, no es estimacion.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agregados_anunciante_dia (
+                    fecha DATE NOT NULL,
+                    exchange TEXT NOT NULL,
+                    anunciante TEXT NOT NULL,
+                    tipo TEXT NOT NULL,
+                    apariciones INTEGER,
+                    pos_media NUMERIC,
+                    pos_min INTEGER,
+                    precio_medio NUMERIC,
+                    disp_medio NUMERIC,
+                    comp_min INTEGER,
+                    comp_max INTEGER,
+                    ordenes_dia INTEGER,
+                    es_merchant BOOLEAN,
+                    PRIMARY KEY (fecha, exchange, anunciante, tipo)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_agr_fecha ON agregados_anunciante_dia(fecha)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_agr_anun ON agregados_anunciante_dia(anunciante, fecha)")
+            # \u2500\u2500 MIS ORDENES REALES (verdad de terreno para calibrar) \u2500\u2500
+            # Se importan del CSV de Binance. Es el unico caso donde sabemos que
+            # paso de verdad: comparar contra lo que el monitor infirio desde
+            # afuera es lo que permite medir (y corregir) el error del estimador.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mis_ordenes_reales (
+                    orden_id TEXT PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL,
+                    lado TEXT,
+                    usdt NUMERIC,
+                    clp NUMERIC,
+                    precio NUMERIC,
+                    estado TEXT,
+                    contraparte TEXT,
+                    importado TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_mis_ord_ts ON mis_ordenes_reales(ts)")
+            # rol es CLAVE para calibrar: el monitor SOLO puede ver las ordenes
+            # 'maker' (mis anuncios publicados en el libro). Las 'taker' (tomando
+            # el anuncio de otro) son invisibles para el, asi que no deben contar
+            # como fallos de deteccion. Sale del CSV: que columna de comision
+            # viene llena (Tarifa de creador = maker / Comision de tomador = taker).
+            cur.execute("ALTER TABLE mis_ordenes_reales ADD COLUMN IF NOT EXISTS rol TEXT")
+            cur.execute("ALTER TABLE mis_ordenes_reales ADD COLUMN IF NOT EXISTS comision NUMERIC")
         conn.commit()
     print("\u2705 Base de datos lista (snapshots + snapshots_detalle)")
 
@@ -299,6 +372,170 @@ def cargar_config_db():
                 pass
     if aplicados:
         print(f"[CONFIG] restaurada desde DB: {', '.join(aplicados)}")
+
+def recalibrar_tickets():
+    """AUTO-CALIBRACION del ticket usado para estimar fills enmascarados.
+
+    Estadistica (COL17): el ticket se usa para estimar un TOTAL de volumen
+    (total = n_ordenes x ticket), y para estimar un total el estimador correcto
+    es la MEDIA, no la mediana. Pero la distribucion de tickets tiene cola muy
+    pesada (medido: p50=206, media=561), asi que la media cruda la dominan unos
+    pocos gigantes. Solucion estandar: MEDIA RECORTADA (se descarta el 5% mas
+    alto) -> robusta y sin el sesgo hacia abajo de la mediana.
+
+    Se calcula SOLO con fills 'directo' (caida de stock observada), nunca con
+    los estimados, para no realimentar el propio error. Corre 1x/dia."""
+    with config_lock:
+        if not int(config.get("TICKET_AUTOCAL", 1)):
+            return {}
+        min_n = int(config.get("TICKET_MIN_MUESTRAS", 200))
+        lo    = float(config.get("TICKET_RANGO_MIN", 50))
+        hi    = float(config.get("TICKET_RANGO_MAX", 2000))
+    nuevos = {}
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                for ex, clave in (("binance", "FILL_TICKET_DEF"),
+                                  ("bybit",   "FILL_TICKET_DEF_BYBIT")):
+                    cur.execute("""
+                        WITH t AS (
+                            SELECT monto / NULLIF(ordenes, 0) AS v
+                            FROM fills_estimados
+                            WHERE exchange = %(ex)s AND metodo = 'directo'
+                              AND ts >= NOW() - INTERVAL '7 days' AND ordenes >= 1
+                        ), lim AS (
+                            SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY v) AS p95
+                            FROM t WHERE v BETWEEN 5 AND 5000
+                        )
+                        SELECT AVG(v) FILTER (WHERE v <= (SELECT p95 FROM lim)) AS media_rec,
+                               COUNT(*) AS n
+                        FROM t WHERE v BETWEEN 5 AND 5000
+                    """, {"ex": ex})
+                    r = cur.fetchone()
+                    if not r or not r["n"] or int(r["n"]) < min_n or r["media_rec"] is None:
+                        print(f"[TICKET {ex}] muestras insuficientes ({r['n'] if r else 0}<{min_n}), se mantiene el valor actual")
+                        continue
+                    val = max(lo, min(hi, round(float(r["media_rec"]))))
+                    with config_lock:
+                        anterior = config.get(clave)
+                        config[clave] = val
+                    nuevos[clave] = val
+                    print(f"[TICKET {ex}] auto-calibrado: {anterior} -> {val} (media recortada, n={r['n']})")
+    except Exception as e:
+        print(f"[TICKET recalibrar] {e}")
+        return {}
+    if nuevos:
+        guardar_config_db(nuevos)
+    return nuevos
+
+
+def recalibrar_ritmo():
+    """Mide cuantas ordenes/hora POR PIERNA da el mercado en la posicion
+    objetivo, con fills observados (misma logica que /api/inteligencia/
+    curva_llenado, pero cacheado: la consulta tarda ~2s y no puede correr en
+    cada request del asistente).
+
+    Se guarda en RITMO_MEDIDO_ORD_H y la proyeccion la usa junto al limite
+    humano ORDENES_H_MAX: lo que podes hacer = min(lo que el mercado te da,
+    lo que alcanzas a atender). Antes ese numero era una suposicion."""
+    with config_lock:
+        pos_obj = max(1, int(config.get("MI_POSICION_OBJETIVO", 15) or 15))
+        intervalo = float(config.get("INTERVALO_MIN", 2))
+    lo, hi = ((1, 3) if pos_obj <= 3 else (4, 7) if pos_obj <= 7 else
+              (8, 12) if pos_obj <= 12 else (13, 20) if pos_obj <= 20 else
+              (21, 30) if pos_obj <= 30 else (31, 50) if pos_obj <= 50 else (51, 80))
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL statement_timeout = '60s'")
+                cur.execute("""
+                    SELECT COUNT(*) AS obs FROM (
+                        SELECT snapshot_timestamp, tipo, anunciante, MIN(posicion) AS pos
+                        FROM snapshots_detalle
+                        WHERE snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                        GROUP BY 1,2,3
+                    ) d WHERE pos BETWEEN %(lo)s AND %(hi)s
+                """, {"lo": lo, "hi": hi})
+                obs = int((cur.fetchone() or {}).get("obs") or 0)
+                cur.execute("""
+                    SELECT COALESCE(SUM(f.ordenes), 0) AS ordenes
+                    FROM fills_estimados f
+                    JOIN (
+                        SELECT snapshot_timestamp, tipo, anunciante, MIN(posicion) AS pos
+                        FROM snapshots_detalle
+                        WHERE snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                        GROUP BY 1,2,3
+                    ) d ON d.anunciante = f.anunciante AND d.tipo = f.tipo
+                       AND d.snapshot_timestamp = f.ts
+                    WHERE f.exchange = 'binance' AND f.metodo = 'directo'
+                      AND f.ts >= NOW() - INTERVAL '7 days'
+                      AND d.pos BETWEEN %(lo)s AND %(hi)s
+                """, {"lo": lo, "hi": hi})
+                ordenes = int((cur.fetchone() or {}).get("ordenes") or 0)
+    except Exception as e:
+        print(f"[RITMO] {e}")
+        return None
+    horas = obs * intervalo / 60
+    if horas <= 0 or ordenes < 20:
+        print(f"[RITMO] muestras insuficientes (ordenes={ordenes}) — se mantiene el valor actual")
+        return None
+    tasa = round(ordenes / horas, 3)
+    with config_lock:
+        config["RITMO_MEDIDO_ORD_H"] = tasa
+        config["RITMO_MEDIDO_RANGO"] = f"{lo:02d}-{hi:02d}"
+    guardar_config_db({"RITMO_MEDIDO_ORD_H": tasa, "RITMO_MEDIDO_RANGO": f"{lo:02d}-{hi:02d}"})
+    print(f"[RITMO] posicion {lo}-{hi}: {tasa} ordenes/hora por pierna (n={ordenes})")
+    return tasa
+
+
+def guardar_agregados_dia(fecha=None):
+    """Congela el resumen diario ANTES de que la purga recicle el detalle top-80.
+    Sin esto perdemos la historia: snapshots_detalle solo guarda ~7 dias, asi
+    que todo analisis de competidores quedaba limitado a esa ventana movil.
+
+    Lo mas valioso que preserva: ordenes_dia = delta del contador OFICIAL de
+    Binance (monthOrderCount) por anunciante. Eso NO es estimacion nuestra, es
+    el numero real de ordenes que completo ese anunciante ese dia."""
+    total = 0
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for tabla, ex in (("snapshots_detalle", "binance"),
+                                  ("snapshots_detalle_bybit", "bybit")):
+                    cur.execute(f"SELECT to_regclass('public.{tabla}')")
+                    if cur.fetchone()[0] is None:
+                        continue
+                    cur.execute(f"""
+                        INSERT INTO agregados_anunciante_dia
+                            (fecha, exchange, anunciante, tipo, apariciones, pos_media,
+                             pos_min, precio_medio, disp_medio, comp_min, comp_max,
+                             ordenes_dia, es_merchant)
+                        SELECT snapshot_timestamp::date, %(ex)s, anunciante, tipo,
+                               COUNT(*), ROUND(AVG(posicion)::numeric, 1),
+                               MIN(posicion), ROUND(AVG(precio)::numeric, 2),
+                               ROUND(AVG(disponible)::numeric, 1),
+                               MIN(completadas), MAX(completadas),
+                               GREATEST(MAX(completadas) - MIN(completadas), 0),
+                               BOOL_OR(es_merchant)
+                        FROM {tabla}
+                        WHERE snapshot_timestamp::date = %(f)s
+                          AND anunciante IS NOT NULL AND anunciante <> ''
+                        GROUP BY 1,3,4
+                        ON CONFLICT (fecha, exchange, anunciante, tipo) DO UPDATE SET
+                            apariciones = EXCLUDED.apariciones, pos_media = EXCLUDED.pos_media,
+                            pos_min = EXCLUDED.pos_min, precio_medio = EXCLUDED.precio_medio,
+                            disp_medio = EXCLUDED.disp_medio, comp_min = EXCLUDED.comp_min,
+                            comp_max = EXCLUDED.comp_max, ordenes_dia = EXCLUDED.ordenes_dia,
+                            es_merchant = EXCLUDED.es_merchant
+                    """, {"ex": ex, "f": fecha or (datetime.now(SANTIAGO_TZ).date() - timedelta(days=1))})
+                    total += cur.rowcount
+            conn.commit()
+        if total:
+            print(f"[AGREGADOS] {total:,} filas anunciante/dia congeladas")
+    except Exception as e:
+        print(f"[AGREGADOS] {e}")
+    return total
+
 
 def guardar_config_db(cambios):
     """Persiste los cambios de config aplicados via POST /api/config."""
@@ -697,73 +934,129 @@ class FillTracker:
             return s[len(s) // 2]
         return defecto
 
-    def procesar(self, items, tipo, now_dt):
-        """items: [{anunciante, precio, disponible, completadas}, ...]
-        Devuelve filas listas para INSERT en fills_estimados."""
+    def procesar_par(self, items_por_lado, now_dt):
+        """Procesa los DOS lados (BUY/SELL) juntos en un ciclo. Devuelve filas
+        para INSERT en fills_estimados.
+        items_por_lado: {'BUY': [items...], 'SELL': [items...]} ya agrupados
+        por anunciante (_agrupar_items).
+
+        POR QUE JUNTOS (fix COL16): 'completadas' (monthOrderCount) es POR
+        CUENTA, no por anuncio. Una orden que se llena en un lado sube el
+        contador en los DOS anuncios del anunciante. Procesando cada lado por
+        separado, el lado que NO se movio veia 'el contador subio sin caida de
+        stock' e inventaba un fill 'enmascarado' fantasma (bug de anunciantes
+        duales; afectaba tanto Mi Posicion como el volumen v2 del mercado).
+
+        Dos arreglos:
+        - ANTI-FANTASMA: los enmascarados se resuelven en un 2do paso, restando
+          las ordenes que el OTRO lado de la cuenta ya explico con caida real.
+        - ANTI-CANCELADA: al confirmar, se toman como maximo d_comp pendientes,
+          los mas VIEJOS primero. Una orden cancelada (la caida mas nueva) queda
+          sin confirmar y luego revierte/expira sola, sin inflar el volumen."""
         cap, ventana_min, ticket_def = self._cfg()
-        fills, vistos = [], set()
         ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-        for it in items:
-            nombre = it.get("anunciante") or ""
-            if not nombre:
-                continue
-            key = (nombre, tipo)
-            vistos.add(key)
-            disp   = float(it.get("disponible") or 0)
-            comp   = int(it.get("completadas") or 0)
-            precio = float(it.get("precio") or 0)
-            st = self.est.get(key)
-            if st is None:
-                # primera vez que lo vemos: solo basear, no inferir nada
-                self.est[key] = {"disp": disp, "comp": comp, "ts": now_dt,
-                                 "pend": [], "tickets": deque(maxlen=20)}
-                continue
-            gap_min = (now_dt - st["ts"]).total_seconds() / 60
-            d_disp  = st["disp"] - disp
-            d_comp  = comp - st["comp"]
-            if d_comp < 0:
-                d_comp = 0   # rollover mensual del contador -> re-basear
-            if gap_min > 10:
-                # estuvo fuera del libro: los deltas ya no son confiables
-                st.update({"disp": disp, "comp": comp, "ts": now_dt, "pend": []})
-                continue
-            # 1) reversion: si disponible recupero el nivel previo de un
-            #    pendiente, fue cancelacion/edicion -> descartar ese pendiente
-            st["pend"] = [p for p in st["pend"] if disp < p["nivel_previo"] * 0.98]
-            # 2) expirar pendientes fuera de ventana (edicion/retiro)
-            st["pend"] = [p for p in st["pend"]
-                          if (now_dt - p["ts"]).total_seconds() / 60 <= ventana_min]
-            monto, ordenes, metodo = 0.0, 0, None
-            if d_comp > 0:
-                confirmado = sum(p["monto"] for p in st["pend"])
-                st["pend"] = []
-                if d_disp > 1:
-                    directo = min(d_disp, cap)
-                    if d_disp < 5000:
-                        st["tickets"].append(d_disp / d_comp)
-                    monto, metodo = confirmado + directo, "directo"
-                elif confirmado > 0:
-                    monto, metodo = confirmado, "directo"
-                else:
-                    # fill enmascarado por recarga en el mismo ciclo
-                    # (capeado: protege contra saltos falsos del contador)
-                    monto  = min(d_comp * self._ticket(st, ticket_def), cap)
-                    metodo = "enmascarado"
-                ordenes = d_comp
-            elif d_disp > 1:
-                # caida sin confirmacion todavia -> pendiente
-                st["pend"].append({"monto": min(d_disp, cap),
-                                   "nivel_previo": st["disp"], "ts": now_dt})
-            if monto > 0:
-                fills.append((ts_str, self.exchange, tipo, nombre,
-                              round(monto, 2), ordenes, metodo, precio))
-                rf = self.recent_fills.setdefault(key, deque(maxlen=60))
-                rf.append((now_dt, monto))
-            st.update({"disp": disp, "comp": comp, "ts": now_dt})
-        # limpiar estados de anunciantes ausentes hace >30 min
+        vistos = set()
+        seguros = []       # fills confirmados por evidencia real (stock/pendientes)
+        masc_cand = []     # candidatos a enmascarado, se resuelven en el paso 2
+        ordenes_por_stock = {}   # nombre -> ordenes explicadas por evidencia real (cuenta)
+
+        # ── Paso 1: stock + pendientes por (anunciante, lado) ──
+        for tipo in ("BUY", "SELL"):
+            for it in (items_por_lado.get(tipo) or []):
+                nombre = it.get("anunciante") or ""
+                if not nombre:
+                    continue
+                key = (nombre, tipo)
+                vistos.add(key)
+                disp   = float(it.get("disponible") or 0)
+                comp   = int(it.get("completadas") or 0)
+                precio = float(it.get("precio") or 0)
+                st = self.est.get(key)
+                if st is None:
+                    self.est[key] = {"disp": disp, "comp": comp, "ts": now_dt,
+                                     "pend": [], "tickets": deque(maxlen=20)}
+                    continue
+                gap_min = (now_dt - st["ts"]).total_seconds() / 60
+                d_disp  = st["disp"] - disp
+                d_comp  = comp - st["comp"]
+                if d_comp < 0:
+                    d_comp = 0   # rollover mensual del contador -> re-basear
+                if gap_min > 10:
+                    st.update({"disp": disp, "comp": comp, "ts": now_dt, "pend": []})
+                    continue
+                nivel_previo = st["disp"]
+                # reversion: si el stock recupero el nivel previo de un pendiente,
+                # fue cancelacion/edicion -> descartar ese pendiente
+                st["pend"] = [p for p in st["pend"] if disp < p["nivel_previo"] * 0.98]
+                # expirar pendientes fuera de ventana
+                st["pend"] = [p for p in st["pend"]
+                              if (now_dt - p["ts"]).total_seconds() / 60 <= ventana_min]
+                monto, metodo, ordenes_expl, resid = 0.0, None, 0, 0
+                if d_comp > 0:
+                    # ANTI-CANCELADA: confirmar como maximo d_comp pendientes, viejos primero
+                    st["pend"].sort(key=lambda p: p["ts"])
+                    n_conf = min(len(st["pend"]), d_comp)
+                    confirmado = sum(p["monto"] for p in st["pend"][:n_conf])
+                    st["pend"] = st["pend"][n_conf:]
+                    resid = d_comp - n_conf     # ordenes aun sin explicar por pendientes
+                    if confirmado > 0:
+                        monto, metodo, ordenes_expl = confirmado, "directo", n_conf
+                    if d_disp > 1:
+                        if resid > 0:
+                            # caida de ESTE ciclo explica las ordenes restantes
+                            directo = min(d_disp, cap)
+                            if d_disp < 5000:
+                                st["tickets"].append(d_disp / resid)
+                            monto += directo
+                            metodo = "directo"
+                            ordenes_expl += resid
+                            resid = 0
+                        else:
+                            # el contador ya quedo explicado por pendientes; esta
+                            # caida es NUEVA (aun sin confirmar) -> pendiente
+                            st["pend"].append({"monto": min(d_disp, cap),
+                                               "nivel_previo": nivel_previo, "ts": now_dt})
+                    if resid > 0:
+                        # ordenes sin caida ni pendiente -> candidato enmascarado
+                        # (se decide en el paso 2 mirando el otro lado de la cuenta)
+                        masc_cand.append({"key": key, "nombre": nombre, "tipo": tipo,
+                                          "precio": precio, "resid": resid, "st": st})
+                elif d_disp > 1:
+                    st["pend"].append({"monto": min(d_disp, cap),
+                                       "nivel_previo": nivel_previo, "ts": now_dt})
+                if monto > 0 and metodo:
+                    ordenes_por_stock[nombre] = ordenes_por_stock.get(nombre, 0) + ordenes_expl
+                    seguros.append({"key": key, "tipo": tipo, "nombre": nombre,
+                                    "monto": monto, "ordenes": ordenes_expl,
+                                    "metodo": metodo, "precio": precio})
+                st.update({"disp": disp, "comp": comp, "ts": now_dt})
+
+        # ── Paso 2: resolver enmascarados (anti-fantasma) ──
+        # Un incremento de contador de una cuenta DUAL ya explicado por una caida
+        # real en el otro lado NO es un fill nuevo: se resta y, si no queda
+        # residual, se suprime (era el fantasma).
+        for mc in masc_cand:
+            explicadas = ordenes_por_stock.get(mc["nombre"], 0)
+            residual = mc["resid"] - explicadas
+            if residual > 0:
+                monto = min(residual * self._ticket(mc["st"], ticket_def), cap)
+                if monto > 0:
+                    seguros.append({"key": mc["key"], "tipo": mc["tipo"], "nombre": mc["nombre"],
+                                    "monto": monto, "ordenes": residual,
+                                    "metodo": "enmascarado", "precio": mc["precio"]})
+
+        # ── Emitir ──
+        fills = []
+        for f in seguros:
+            if f["monto"] > 0:
+                fills.append((ts_str, self.exchange, f["tipo"], f["nombre"],
+                              round(f["monto"], 2), f["ordenes"], f["metodo"], f["precio"]))
+                rf = self.recent_fills.setdefault(f["key"], deque(maxlen=60))
+                rf.append((now_dt, f["monto"]))
+
+        # limpiar estados de anunciantes ausentes hace >30 min (ambos lados)
         muertos = [k for k, s in self.est.items()
-                   if k[1] == tipo and k not in vistos
-                   and (now_dt - s["ts"]).total_seconds() > 1800]
+                   if k not in vistos and (now_dt - s["ts"]).total_seconds() > 1800]
         for k in muertos:
             self.est.pop(k, None)
             self.recent_fills.pop(k, None)
@@ -1036,8 +1329,10 @@ def ciclo_colector_bybit():
                 guardar_detalle_bybit(ts, hora, raw_compra, raw_venta)
                 # ── Fills v2 (Bybit) ──
                 try:
-                    fills  = fill_tracker_bybit.procesar(_agrupar_items([_bybit_item(x) for x in raw_compra]), "BUY",  now_dt)
-                    fills += fill_tracker_bybit.procesar(_agrupar_items([_bybit_item(x) for x in raw_venta]),  "SELL", now_dt)
+                    fills = fill_tracker_bybit.procesar_par({
+                        "BUY":  _agrupar_items([_bybit_item(x) for x in raw_compra]),
+                        "SELL": _agrupar_items([_bybit_item(x) for x in raw_venta]),
+                    }, now_dt)
                     if fills:
                         guardar_fills(fills)
                 except Exception as e:
@@ -1155,11 +1450,26 @@ def ciclo_colector():
             # ── Purga diaria ──────────────────────────────────
             hoy = datetime.now(SANTIAGO_TZ).date()
             if _ultima_purga != hoy:
+                # OJO al orden: congelar los agregados ANTES de purgar el detalle,
+                # si no perdemos la historia que justamente queremos preservar.
+                try:
+                    guardar_agregados_dia(hoy - timedelta(days=1))
+                    guardar_agregados_dia(hoy)   # parcial del dia en curso
+                except Exception as e:
+                    print(f"[AGREGADOS diario] {e}")
                 purgar_detalle_antiguo(dias=7)
                 try:
                     purgar_fills_antiguos(dias=30)
                 except Exception as e:
                     print(f"[PURGA fills] {e}")
+                try:
+                    recalibrar_tickets()
+                except Exception as e:
+                    print(f"[TICKET diario] {e}")
+                try:
+                    recalibrar_ritmo()
+                except Exception as e:
+                    print(f"[RITMO diario] {e}")
                 _ultima_purga = hoy
             print("[COLECTOR] Consultando Binance BUY...")
             raw_compra = obtener_anuncios("BUY")
@@ -1185,8 +1495,10 @@ def ciclo_colector():
                 guardar_detalle(ts, hora, raw_compra, raw_venta)
                 # ── Fills v2: confirmar consumo cruzando con 'completadas' ──
                 try:
-                    fills  = fill_tracker.procesar(_agrupar_items(_items_binance(raw_compra)), "BUY",  now_dt)
-                    fills += fill_tracker.procesar(_agrupar_items(_items_binance(raw_venta)),  "SELL", now_dt)
+                    fills = fill_tracker.procesar_par({
+                        "BUY":  _agrupar_items(_items_binance(raw_compra)),
+                        "SELL": _agrupar_items(_items_binance(raw_venta)),
+                    }, now_dt)
                     if fills:
                         guardar_fills(fills)
                 except Exception as e:
@@ -3854,6 +4166,7 @@ function Inteligencia() {
   const [precioFill, setPrecioFill] = vS(null);
   const [ventanas, setVentanas] = vS(null);
   const [farmers, setFarmers] = vS(null);
+  const [curva, setCurva] = vS(null);
   const [loading, setLoading] = vS(true);
   const [seccion, setSeccion] = vS("horario");
 
@@ -3869,12 +4182,14 @@ function Inteligencia() {
       fetch(B+"/api/inteligencia/precio_vs_fill").then(r=>r.json()),
       fetch(B+"/api/inteligencia/ventanas_reales").then(r=>r.json()).catch(()=>[]),
       fetch(B+"/api/inteligencia/farmers").then(r=>r.json()).catch(()=>[]),
-    ]).then(([h,a,t,f,p,prof,pvf,vr,fa]) => {
+      fetch(B+"/api/inteligencia/curva_llenado").then(r=>r.json()).catch(()=>({filas:[]})),
+    ]).then(([h,a,t,f,p,prof,pvf,vr,fa,cl]) => {
       setHorario(h); setAnunciantes(a); setTraders(t); setFill(f); setPatron(p);
       setProfundidad(Array.isArray(prof) ? prof : (prof.datos || []));
       setPrecioFill(Array.isArray(pvf) ? pvf : (pvf.datos || []));
       setVentanas(Array.isArray(vr) ? vr : []);
       setFarmers(Array.isArray(fa) ? fa : []);
+      setCurva((cl && cl.filas) ? cl.filas : []);
       setLoading(false);
     }).catch(()=>setLoading(false));
   }, []);
@@ -3883,8 +4198,8 @@ function Inteligencia() {
   const fC = (v) => v != null ? "$"+parseFloat(v).toFixed(2) : "—";
 
   const SECS = [
-    ["horario","⏰ Horario"],["ventanas","🎯 Ventanas reales"],["farmers","🌾 Farmers"],
-    ["anunciantes","👥 Pares"],
+    ["horario","⏰ Horario"],["ventanas","🎯 Ventanas reales"],["curva","📍 Dónde pararme"],
+    ["farmers","🌾 Farmers"],["anunciantes","👥 Pares"],
     ["traders","🏆 Top traders"],["fill","⚡ Fill"],["patron","📅 Patrones"],
     ["profundidad","📊 Profundidad"],["preciofill","💡 Precio vs Fill"]
   ];
@@ -3969,6 +4284,44 @@ function Inteligencia() {
           <div className="intel-explain">
             <b>Qué es esto:</b> la versión MEDIDA de las "ventanas buenas". El plan de campaña dice 07-09h y 20-23h; esta tabla muestra qué dijo el semáforo de verdad, hora por hora, la última semana.<br/>
             <b>Qué hacer:</b> planificá las sesiones de farming en las horas con % operable alto. Si una ventana del plan sale roja acá, el plan se corrige con datos. Desconfiá de las horas con pocas muestras.
+          </div>
+        </section>
+      )}
+
+      {seccion==="curva" && curva && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Dónde pararme — curva de llenado</h3><span className="card-sub">7 días · solo fills OBSERVADOS · órdenes/hora por anuncio parado en ese rango</span></div>
+          {curva.length===0 && <div className="intel-loading">Sin datos suficientes todavía.</div>}
+          {curva.length>0 && (
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr>
+                <th title="Rango de posición en el libro (1 = mejor precio).">Posición</th>
+                <th title="Órdenes por hora que recibe UN anuncio parado en ese rango. Si publicás en los dos lados (dual), esperá el doble.">Órdenes/hora</th>
+                <th title="Margen de error al 95%. Si dos rangos se pisan dentro del margen, la diferencia entre ellos NO es real.">± error</th>
+                <th title="Cuánto tardás en promedio en llenar una orden parado ahí.">Min/orden</th>
+                <th title="Horas-anuncio observadas en ese rango: cuánta evidencia respalda el número.">Evidencia</th>
+                <th title="Cuántos anunciantes distintos pasaron por ese rango.">Anunciantes</th>
+              </tr></thead>
+              <tbody>{curva.map(r=>{
+                const oh = parseFloat(r.ordenes_hora||0);
+                const c = oh>=4?"#35e07a":oh>=2?"#ffd740":oh>=1?"#ff9100":"#ff5d6c";
+                return <tr key={r.rango} style={{borderLeft:`3px solid ${c}`}}>
+                  <td><b className="tnum">{r.rango}</b></td>
+                  <td className="tnum" style={{color:c,fontWeight:600}}>{oh.toFixed(2)}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>±{parseFloat(r.ic95||0).toFixed(2)}</td>
+                  <td className="tnum">{r.min_por_orden!=null?Math.round(r.min_por_orden)+" min":"—"}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{fN(Math.round(r.horas_exposicion))} h</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.anunciantes}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+          )}
+          <div className="intel-explain">
+            <b>Cómo leer esto:</b> es la tasa de llenado MEDIDA, no estimada — se usan solo los fills observados (caída de stock real), y se divide por las horas que hubo anuncios parados en cada rango. Sin esa división, los rangos con más gente parada parecerían mejores solo por ser más concurridos.<br/>
+            <b>El margen de error importa:</b> si dos rangos se pisan dentro del ±, la diferencia entre ellos no es real y podés elegir el que te convenga por precio.<br/>
+            <b>Qué hacer:</b> mirá dónde está el salto grande. Bajar de posición cuesta órdenes/hora, pero no siempre en forma pareja: hay tramos donde bajás sin perder casi nada (ahí ganás margen gratis) y un punto donde se cae en picada.
           </div>
         </section>
       )}
@@ -4947,9 +5300,13 @@ function AsistenteOperativo() {
 function MiCampania() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [d, setD] = React.useState(null);
+  const [cal, setCal] = React.useState(null);
   React.useEffect(() => {
     let stop = false;
-    const load = () => fetch(B + "/api/mi_posicion").then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
+    const load = () => {
+      fetch(B + "/api/mi_posicion").then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
+      fetch(B + "/api/calibracion").then(r => r.json()).then(j => { if (!stop) setCal(j); }).catch(() => {});
+    };
     load();
     const id = setInterval(load, 60000);
     return () => { stop = true; clearInterval(id); };
@@ -5008,6 +5365,34 @@ function MiCampania() {
           <div style={sub}>{fmt(pr.vol_pct_minima)}% de 0,5 BTC (mínimo) · {fmt(pr.vol_pct_comoda)}% de 1 BTC</div>
         </div>
       </div>
+      {cal && cal.resumen && cal.resumen.ordenes_maker_reales > 0 && (
+        <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--line-soft)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+            <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Calibración · realidad vs monitor</span>
+            <span title={cal.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
+            <span style={{ fontSize: 10.5, color: "var(--text-3)" }}>últimos {cal.resumen.dias} días · solo órdenes maker</span>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <div style={boxSt}>
+              <div style={lbl}>Detección</div>
+              <div style={val}>{fmt(cal.resumen.ordenes_detectadas)}/{fmt(cal.resumen.ordenes_maker_reales)}</div>
+              <div style={sub}>{cal.resumen.tasa_deteccion_pct != null ? fmt(cal.resumen.tasa_deteccion_pct) + "% de tus órdenes vistas" : "—"}</div>
+            </div>
+            <div style={boxSt}>
+              <div style={lbl}>Volumen real vs estimado</div>
+              <div style={val}>{fmt(cal.resumen.usdt_real)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>vs</span> {fmt(cal.resumen.usdt_monitor)}</div>
+              <div style={{ ...sub, color: cal.resumen.error_pct == null ? "var(--text-3)" : Math.abs(cal.resumen.error_pct) <= 5 ? "var(--buy)" : "var(--warn)" }}>
+                {cal.resumen.error_pct == null ? "—" : (cal.resumen.error_pct > 0 ? "+" : "") + fmt(cal.resumen.error_pct) + "% de error"}
+              </div>
+            </div>
+            <div style={boxSt}>
+              <div style={lbl}>Latencia de detección</div>
+              <div style={val}>{cal.resumen.latencia_media_min != null ? fmt(cal.resumen.latencia_media_min) + " min" : "—"}</div>
+              <div style={sub}>demora en confirmarte una orden</div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -5215,6 +5600,8 @@ function App() {
         <span>Próximo ciclo en <b className="tnum">{Math.ceil(secondsLeft)}s</b></span>
         <span className="foot-sep">·</span>
         <span className="foot-demo">Unión Austral Capital · USDT/CLP · Binance P2P</span>
+        <span className="foot-sep">·</span>
+        <span className="foot-demo tnum">{{VERSION}}</span>
       </footer>
 
       <TweaksPanel>
@@ -5251,7 +5638,13 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 # ──────────────────────────────────────────────
 @app.route("/")
 def index():
-    return Response(DASHBOARD, mimetype='text/html')
+    html = DASHBOARD.replace("{{VERSION}}", f"{VERSION} · {VERSION_FECHA}")
+    return Response(html, mimetype='text/html')
+
+@app.route("/api/version")
+def api_version():
+    """Version del codigo corriendo (para chequear deploys al instante)."""
+    return jsonify({"version": VERSION, "fecha": VERSION_FECHA})
 
 def _token_ok():
     """Autorizacion de los POST sensibles. Sin APP_TOKEN configurado no exige
@@ -5850,6 +6243,214 @@ def api_intel_ventanas_reales():
     return jsonify(rows)
 
 
+@app.route("/api/calibracion")
+def api_calibracion():
+    """CALIBRACION: mis ordenes REALES (importadas del CSV de Binance) contra
+    lo que el monitor infirio mirando el libro desde afuera.
+
+    Solo se evaluan las ordenes 'maker' completadas: las 'taker' son invisibles
+    para el monitor (cuando tomas el anuncio de otro no estas publicado en el
+    libro), asi que contarlas como no detectadas seria injusto y ensuciaria la
+    metrica.
+
+    El total se compara por PERIODO, no orden por orden: el monitor agrupa
+    varias ordenes en un mismo fill confirmado, asi que sumar 'fills que
+    matchean' contaria dos veces. Ademas devuelve la posicion en la que estaba
+    tu anuncio en ese momento -> permite atribuir cada orden a la estrategia
+    que estabas probando, sin que anotes nada a mano."""
+    try:
+        dias = max(1, min(90, int(request.args.get("dias", 30))))
+    except (ValueError, TypeError):
+        dias = 30
+    with config_lock:
+        nick = str(config.get("MI_NICKNAME") or "").strip()
+    if not nick:
+        return jsonify({"configurado": False, "nota": "defini tu nickname en el panel Estrategia"})
+    resumen, filas = {}, []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT to_regclass('public.mis_ordenes_reales')")
+                if cur.fetchone()["to_regclass"] is None:
+                    return jsonify({"configurado": True, "sin_datos": True,
+                                    "nota": "todavia no importaste el CSV (scripts/importar_mis_ordenes.bat)"})
+                # Totales del periodo: real (maker completada) vs monitor
+                cur.execute("""
+                    SELECT COUNT(*) AS n, COALESCE(SUM(usdt),0) AS usdt,
+                           COALESCE(SUM(comision),0) AS comision
+                    FROM mis_ordenes_reales
+                    WHERE rol='maker' AND estado='completada'
+                      AND ts >= NOW() - (%(d)s || ' days')::INTERVAL
+                """, {"d": dias})
+                r = cur.fetchone()
+                n_real, usdt_real = int(r["n"] or 0), float(r["usdt"] or 0)
+                cur.execute("""
+                    SELECT COUNT(*) AS n, COALESCE(SUM(monto),0) AS usdt,
+                           COALESCE(SUM(ordenes),0) AS ordenes
+                    FROM fills_estimados
+                    WHERE exchange='binance' AND LOWER(anunciante)=LOWER(%(n)s)
+                      AND ts >= NOW() - (%(d)s || ' days')::INTERVAL
+                """, {"n": nick, "d": dias})
+                r = cur.fetchone()
+                usdt_mon = float(r["usdt"] or 0)
+                ord_mon  = int(r["ordenes"] or 0)
+                # Cuantas ordenes reales tuvieron actividad detectada cerca
+                cur.execute("""
+                    SELECT o.orden_id, o.ts, o.lado, o.usdt, o.precio, o.contraparte,
+                           f.ts AS fill_ts, f.monto AS fill_monto, f.metodo,
+                           d.pos, d.precio AS precio_libro
+                    FROM mis_ordenes_reales o
+                    LEFT JOIN LATERAL (
+                        SELECT ts, monto, metodo FROM fills_estimados x
+                        WHERE x.exchange='binance' AND LOWER(x.anunciante)=LOWER(%(n)s)
+                          AND x.ts BETWEEN o.ts AND o.ts + INTERVAL '25 minutes'
+                        ORDER BY x.ts LIMIT 1
+                    ) f ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT MIN(posicion) AS pos, MIN(precio) AS precio
+                        FROM snapshots_detalle y
+                        WHERE LOWER(y.anunciante)=LOWER(%(n)s)
+                          AND y.snapshot_timestamp BETWEEN o.ts - INTERVAL '4 minutes' AND o.ts
+                    ) d ON TRUE
+                    WHERE o.rol='maker' AND o.estado='completada'
+                      AND o.ts >= NOW() - (%(d)s || ' days')::INTERVAL
+                    ORDER BY o.ts DESC LIMIT 100
+                """, {"n": nick, "d": dias})
+                for x in cur.fetchall():
+                    lat = None
+                    if x["fill_ts"] and x["ts"]:
+                        lat = round((x["fill_ts"] - x["ts"]).total_seconds() / 60, 1)
+                    filas.append({
+                        "orden_id": x["orden_id"], "ts": str(x["ts"]), "lado": x["lado"],
+                        "usdt": float(x["usdt"] or 0), "precio": float(x["precio"] or 0),
+                        "contraparte": x["contraparte"],
+                        "detectada": bool(x["fill_ts"]),
+                        "latencia_min": lat,
+                        "metodo": x["metodo"],
+                        "posicion": int(x["pos"]) if x["pos"] is not None else None,
+                    })
+    except Exception as e:
+        print(f"[calibracion] {e}")
+        return jsonify({"configurado": True, "error": str(e)[:200]})
+    detectadas = sum(1 for f in filas if f["detectada"])
+    lats = [f["latencia_min"] for f in filas if f["latencia_min"] is not None]
+    resumen = {
+        "dias": dias,
+        "ordenes_maker_reales": n_real,
+        "ordenes_detectadas": detectadas,
+        "tasa_deteccion_pct": round(detectadas / n_real * 100, 1) if n_real else None,
+        "usdt_real": round(usdt_real, 2),
+        "usdt_monitor": round(usdt_mon, 2),
+        "error_usdt": round(usdt_mon - usdt_real, 2),
+        "error_pct": round((usdt_mon - usdt_real) / usdt_real * 100, 1) if usdt_real else None,
+        "ordenes_monitor": ord_mon,
+        "latencia_media_min": round(sum(lats) / len(lats), 1) if lats else None,
+    }
+    return jsonify({
+        "configurado": True, "nick": nick, "resumen": resumen, "ordenes": filas,
+        "nota": ("Solo ordenes maker completadas (las taker el monitor no puede verlas). "
+                 "error_pct > 0 = el monitor sobrestima; < 0 = subestima. "
+                 "La posicion es la que tenia tu anuncio al momento de la orden: sirve para "
+                 "comparar estrategias sin anotar nada a mano."),
+    })
+
+
+@app.route("/api/inteligencia/curva_llenado")
+def api_intel_curva_llenado():
+    """CURVA DE LLENADO: ordenes por hora segun la POSICION en el libro.
+
+    Metodo (COL17):
+    - Solo fills 'directo' (caida de stock OBSERVADA). Los 'enmascarado' son
+      estimaciones nuestras: meterlos aca contaminaria el modelo con el propio
+      error del estimador.
+    - No se cuentan fills sueltos: se divide por la EXPOSICION (cuantas
+      horas-anunciante hubo paradas en cada rango). Contar sin normalizar
+      favoreceria los rangos donde simplemente hay mas gente parada.
+    - Se informa intervalo de confianza (Poisson) porque un rango con pocos
+      eventos no permite concluir nada.
+    Resultado: 'si me paro en la posicion N, cuantas ordenes/hora espero'.
+    Es el numero que reemplaza al ORDENES_H_MAX puesto a mano."""
+    try:
+        dias = max(1, min(14, int(request.args.get("dias", 7))))
+    except (ValueError, TypeError):
+        dias = 7
+    with config_lock:
+        intervalo = float(config.get("INTERVALO_MIN", 2))
+    BIN = """CASE WHEN pos<=3 THEN '01-03' WHEN pos<=7 THEN '04-07'
+                  WHEN pos<=12 THEN '08-12' WHEN pos<=20 THEN '13-20'
+                  WHEN pos<=30 THEN '21-30' WHEN pos<=50 THEN '31-50'
+                  ELSE '51-80' END"""
+    datos = {}
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL statement_timeout = '40s'")
+                # 1) EXPOSICION: cada aparicion de un anunciante en un ciclo
+                cur.execute(f"""
+                    SELECT {BIN} AS bin, COUNT(*) AS obs,
+                           COUNT(DISTINCT anunciante) AS anunciantes,
+                           ROUND(AVG(precio)::numeric, 2) AS precio_medio
+                    FROM (
+                        SELECT snapshot_timestamp, tipo, anunciante,
+                               MIN(posicion) AS pos, MIN(precio) AS precio
+                        FROM snapshots_detalle
+                        WHERE snapshot_timestamp >= NOW() - (%(d)s || ' days')::INTERVAL
+                        GROUP BY 1,2,3
+                    ) d GROUP BY 1
+                """, {"d": dias})
+                for r in cur.fetchall():
+                    datos[r["bin"]] = {"rango": r["bin"],
+                                       "horas_exposicion": round(float(r["obs"]) * intervalo / 60, 1),
+                                       "anunciantes": int(r["anunciantes"]),
+                                       "ordenes": 0, "eventos": 0, "volumen": 0}
+                # 2) EVENTOS observados en ese mismo rango de posicion.
+                #    El JOIN es exacto: el colector escribe el fill con el mismo
+                #    timestamp del snapshot que lo detecto.
+                cur.execute(f"""
+                    SELECT {BIN} AS bin, COUNT(*) AS eventos,
+                           COALESCE(SUM(f.ordenes),0) AS ordenes,
+                           ROUND(COALESCE(SUM(f.monto),0)) AS volumen
+                    FROM fills_estimados f
+                    JOIN (
+                        SELECT snapshot_timestamp, tipo, anunciante, MIN(posicion) AS pos
+                        FROM snapshots_detalle
+                        WHERE snapshot_timestamp >= NOW() - (%(d)s || ' days')::INTERVAL
+                        GROUP BY 1,2,3
+                    ) d
+                      ON d.anunciante = f.anunciante AND d.tipo = f.tipo
+                     AND d.snapshot_timestamp = f.ts
+                    WHERE f.exchange = 'binance' AND f.metodo = 'directo'
+                      AND f.ts >= NOW() - (%(d)s || ' days')::INTERVAL
+                    GROUP BY 1
+                """, {"d": dias})
+                for r in cur.fetchall():
+                    if r["bin"] in datos:
+                        datos[r["bin"]].update({"eventos": int(r["eventos"]),
+                                                "ordenes": int(r["ordenes"]),
+                                                "volumen": int(r["volumen"])})
+    except Exception as e:
+        print(f"[curva_llenado] {e}")
+        return jsonify({"filas": [], "error": "consulta pesada, reintentar"})
+    filas = []
+    for bin_ in sorted(datos):
+        d = datos[bin_]
+        h, n = d["horas_exposicion"], d["ordenes"]
+        tasa = (n / h) if h > 0 else None
+        # IC 95% Poisson sobre el conteo de ordenes (aprox normal)
+        ic = (1.96 * (n ** 0.5) / h) if (h > 0 and n > 0) else None
+        d["ordenes_hora"]  = round(tasa, 3) if tasa is not None else None
+        d["ic95"]          = round(ic, 3) if ic is not None else None
+        d["confiable"]     = bool(n >= 20)
+        d["min_por_orden"] = round(60 / tasa, 1) if tasa else None
+        filas.append(d)
+    return jsonify({
+        "dias": dias, "filas": filas,
+        "nota": ("ordenes/hora POR ANUNCIANTE parado en ese rango, medido solo con fills "
+                 "observados. min_por_orden = cuanto tardarias en promedio en llenar una. "
+                 "Los rangos con menos de 20 ordenes no son concluyentes (confiable=false)."),
+    })
+
+
 @app.route("/api/inteligencia/farmers")
 def api_intel_farmers():
     """RADAR DE FARMERS: anunciantes con MUCHAS ordenes chicas — los que ya
@@ -6308,9 +6909,21 @@ def api_operativa():
     # Escenario "hoy" usa la comision vigente; "verificado" la Bronce (0,32% RT,
     # NO 0,20%: el 50% de descuento es nivel Oro, 60 BTC/mes).
     bruto_pct    = gan + com_total                     # spread bruto ponderado actual
-    ticket_ref   = stats["p50"] or float(c.get("FILL_TICKET_DEF", 272))
+    ticket_ref   = stats["p50"] or float(c.get("FILL_TICKET_DEF", 408))
+    # DOS limites reales, y manda el menor (COL17):
+    #  1. lo que el MERCADO te da en tu posicion -> ritmo MEDIDO (fills observados)
+    #  2. lo que VOS alcanzas a atender a mano   -> ORDENES_H_MAX
+    # Antes habia un solo numero y era una suposicion.
     ordenes_max  = max(1, int(c.get("ORDENES_H_MAX", 8)))
-    tope_manual  = ordenes_max * ticket_ref            # USDT/h atendibles a mano
+    ritmo_medido = float(c.get("RITMO_MEDIDO_ORD_H", 0) or 0)   # por pierna
+    mercado_ord_h = ritmo_medido * 2 if ritmo_medido > 0 else None   # dual = 2 piernas
+    if mercado_ord_h:
+        ordenes_efectivas = min(ordenes_max, mercado_ord_h)
+        limite_ordenes = "mercado" if mercado_ord_h < ordenes_max else "tu tiempo"
+    else:
+        ordenes_efectivas = ordenes_max
+        limite_ordenes = "tu tiempo (ritmo de mercado aun sin medir)"
+    tope_manual  = ordenes_efectivas * ticket_ref       # USDT/h alcanzables
     com_verif_rt = float(c.get("COMISION_BN_VERIF", 0.0016)) * 2 * 100
     esc_real = []
     for nombre, com_rt, cap_pct in (
@@ -6384,6 +6997,10 @@ def api_operativa():
             "capital_usdt": capital,
             "ticket_ref_usdt": round(ticket_ref),
             "ordenes_h_max": ordenes_max,
+            "ritmo_medido_ord_h": ritmo_medido or None,
+            "ritmo_medido_rango": c.get("RITMO_MEDIDO_RANGO") or None,
+            "ordenes_h_efectivas": round(ordenes_efectivas, 2),
+            "limite_ordenes": limite_ordenes,
             "tope_manual_usdt_h": round(tope_manual),
             "spread_bruto_pct": round(bruto_pct, 4),
             "escenarios": esc_real,
@@ -6730,6 +7347,14 @@ def _boot():
     init_pool()
     init_db()
     cargar_config_db()   # restaura el preset/config guardado (sobrevive reinicios)
+    try:
+        recalibrar_tickets()   # arranca con el ticket medido, no con el default
+    except Exception as e:
+        print(f"[TICKET boot] {e}")
+    try:
+        recalibrar_ritmo()     # y con el ritmo de mercado medido en tu posicion
+    except Exception as e:
+        print(f"[RITMO boot] {e}")
     threading.Thread(target=ciclo_colector, daemon=True).start()
     threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
 
