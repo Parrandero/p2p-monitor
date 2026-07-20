@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL17"
+VERSION       = "COL18"
 VERSION_FECHA = "2026-07-20"
 
 config = {
@@ -72,6 +72,13 @@ config = {
     "CAPTURA_VERIF_PCT":    3.0,   # % estimado al estar verificado (mejor ranking/confianza)
     "ORDENES_H_MAX":        8,     # ordenes/hora maximas atendibles a mano desde el telefono
     "COMISION_BN_VERIF":    0.0016, # por pierna al verificarse Bronce (-20% -> 0.32% ida y vuelta)
+    # ── Comision TAKER: es un MONTO FIJO, no un porcentaje (COL18) ──
+    # Medido en el historial real de ordenes (CSV Binance): 0.07 USDT constante
+    # en ordenes de 21, 66, 157, 190 y 223 USDT. La maker en cambio es 0.19%
+    # proporcional. Consecuencia: arriba de cierto tamano CRUZAR paga menos
+    # comision que publicar, y la ventaja crece con el tamano de la orden.
+    "COM_TAKER_FIJA_USDT":  0.07,  # comision taker por orden (monto fijo)
+    "COM_MAKER_PCT":        0.19,  # comision maker % por pierna (medida, no supuesta)
     # ── Mi posicion / carrera al verificado (COL14) ──
     "MI_NICKNAME":          "",    # nickname de Binance P2P: activa el seguimiento de MIS anuncios
     "MI_POSICION_OBJETIVO": 15,    # posicion objetivo en el libro (el plan farming dice top 10-20)
@@ -123,6 +130,8 @@ CONFIG_TYPE_MAP = {
     "MI_POSICION_OBJETIVO": int,
     "RITMO_MEDIDO_ORD_H":   float,
     "RITMO_MEDIDO_RANGO":   str,
+    "COM_TAKER_FIJA_USDT":  float,
+    "COM_MAKER_PCT":        float,
 }
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -4155,6 +4164,111 @@ function PrecioChart() {
 }
 
 /* ─────────── INTELIGENCIA DE MERCADO ─────────── */
+function CruzarOEsperar() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [usdt, setUsdt] = React.useState(200);
+  const [d, setD] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/taker_maker?usdt=" + usdt)
+      .then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
+    load();
+    const id = setInterval(load, 30000);
+    return () => { stop = true; clearInterval(id); };
+  }, [usdt]);
+  const f = (x, n) => x == null ? "—" : Number(x).toFixed(n == null ? 3 : n);
+  if (!d || d.error) return <div className="intel-loading">Esperando datos del libro…</div>;
+  const u = d.umbral || {}, lib = d.libro || {};
+  const cruzarGana = u.ventaja_cruzar_pct > 0;
+  const tono = cruzarGana ? "var(--buy)" : "var(--warn)";
+  return (
+    <section className="chart-card">
+      <div className="card-head">
+        <h3>Cruzar o esperar</h3>
+        <span className="card-sub">comisión taker FIJA ({d.comisiones.taker_fija_usdt} USDT) vs maker {d.comisiones.maker_pct}% · en vivo</span>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 14 }}>
+        <span style={{ fontSize: 11.5, color: "var(--text-3)" }}>Tamaño de la orden:</span>
+        {[50, 100, 200, 500, 1000].map(v => (
+          <button key={v} className={"pr-btn" + (usdt === v ? " on" : "")} onClick={() => setUsdt(v)}>{v} USDT</button>
+        ))}
+      </div>
+
+      <div style={{ background: "var(--bg-2)", border: "1px solid " + tono, borderLeft: "4px solid " + tono, borderRadius: 12, padding: "14px 16px", marginBottom: 14 }}>
+        <div style={{ fontFamily: "var(--mono)", fontSize: 18, fontWeight: 600, color: tono, marginBottom: 4 }}>
+          {cruzarGana ? "CRUZAR sale más barato" : "PUBLICAR y esperar sale más barato"}
+        </div>
+        <div style={{ fontSize: 12.5, color: "var(--text-2)", lineHeight: 1.6 }}>
+          Con el spread actual de <b>{f(lib.spread_pct)}%</b>, cruzar conviene en órdenes desde <b>{d.umbral.tamano_equilibrio_usdt || "—"} USDT</b>.
+          Para esta orden de {d.usdt_evaluado} USDT la diferencia es de <b style={{ color: tono }}>{u.ventaja_cruzar_pct > 0 ? "+" : ""}{f(u.ventaja_cruzar_pct)}%</b> a favor de {cruzarGana ? "cruzar" : "publicar"}.
+        </div>
+        <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}>
+          Umbral: cruzar gana mientras el spread sea menor a {f(u.spread_limite_pct)}% · libro: compra ${f(lib.ask, 2)} / venta ${f(lib.bid, 2)}
+        </div>
+      </div>
+
+      <div className="muros-cols">
+        {(d.piernas || []).map(p => (
+          <div key={p.pierna} style={{ background: "var(--bg-1)", border: "1px solid var(--line)", borderRadius: 10, padding: "12px 14px" }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
+              Para {p.pierna}
+            </div>
+            {["cruzar", "esperar"].map(k => {
+              const o = p[k], gana = p.conviene === k;
+              return (
+                <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, padding: "8px 10px", borderRadius: 8, marginBottom: 6,
+                  background: gana ? "var(--buy-soft)" : "var(--bg-2)", border: "1px solid " + (gana ? "var(--buy)" : "var(--line-soft)") }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12, color: "var(--text)", fontWeight: gana ? 600 : 400 }}>
+                      {gana ? "✓ " : ""}{k === "cruzar" ? "Cruzar" : "Publicar y esperar"}
+                    </div>
+                    <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>{o.accion} · ${f(o.precio, 2)}</div>
+                    <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>
+                      comisión {o.comision_usdt} USDT · {o.demora_min === 0 ? "instantáneo" : (o.demora_min ? "~" + o.demora_min + " min de espera" : "espera desconocida")}
+                    </div>
+                  </div>
+                  <div className="tnum" style={{ fontSize: 14, color: gana ? "var(--buy)" : "var(--text-2)", whiteSpace: "nowrap" }}>{f(o.costo_total_pct)}%</div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Los 4 caminos de una vuelta completa</div>
+        <div className="intel-scroll">
+          <table className="intel-table">
+            <thead><tr>
+              <th title="Combinación de cómo hacés cada pierna.">Camino</th>
+              <th title="Qué implica.">Cómo</th>
+              <th title="Costo total de la vuelta (comisiones + spread), en % sobre el precio medio. Menos es mejor.">Costo vuelta</th>
+              <th title="Cuánto tardarías en completar la vuelta, según la curva de llenado medida.">Demora</th>
+              <th title="Vueltas por hora teóricas si sólo dependiera del tiempo de llenado.">Vueltas/h</th>
+            </tr></thead>
+            <tbody>{(d.caminos || []).map((c, i) => (
+              <tr key={c.nombre} style={{ borderLeft: `3px solid ${i === 0 ? "var(--buy)" : "var(--line)"}` }}>
+                <td style={{ fontWeight: i === 0 ? 700 : 400 }}>{i === 0 ? "★ " : ""}{c.nombre}</td>
+                <td style={{ color: "var(--text-3)", fontSize: 11 }}>{c.detalle}</td>
+                <td className="tnum" style={{ color: i === 0 ? "var(--buy)" : "var(--text)", fontWeight: 600 }}>{f(c.costo_vuelta_pct)}%</td>
+                <td className="tnum">{c.demora_estimada_min == null ? "—" : c.demora_estimada_min === 0 ? "instantáneo" : "~" + c.demora_estimada_min + " min"}</td>
+                <td className="tnum" style={{ color: "var(--text-3)" }}>{c.ordenes_h_teoricas == null ? "sin límite" : c.ordenes_h_teoricas}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="intel-explain">
+        <b>De dónde sale esto:</b> la comisión taker es un <b>monto fijo</b> (0,07 USDT medidos en tus propias órdenes), mientras la maker es un <b>porcentaje</b> (0,19%). Por eso el que conviene depende del tamaño: cuanto más grande la orden, más barato sale cruzar. La cuenta es <b>spread + comisión_fija/monto vs 0,19%</b>.<br/>
+        <b>OJO, el supuesto importante:</b> "publicar y esperar" acá asume que te llenás <b>al precio del líder</b>, o sea compitiendo de igual a igual. Si publicás con un gap más ancho (como el 0,6% del farming) capturás más margen, pero llenás más lento. Esta comparación es <b>a igual velocidad</b>.<br/>
+        <b>Para la campaña:</b> las órdenes cruzadas <b>también suman</b> al contador de Merchant y llenan al instante. Si te falta volumen y te sobra spread barato, cruzar compra tiempo.
+      </div>
+    </section>
+  );
+}
+
 function Inteligencia() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [horario, setHorario] = vS(null);
@@ -4197,22 +4311,31 @@ function Inteligencia() {
   const fN = (v) => v != null ? Number(v).toLocaleString("es-CL") : "—";
   const fC = (v) => v != null ? "$"+parseFloat(v).toFixed(2) : "—";
 
-  const SECS = [
-    ["horario","⏰ Horario"],["ventanas","🎯 Ventanas reales"],["curva","📍 Dónde pararme"],
-    ["farmers","🌾 Farmers"],["anunciantes","👥 Pares"],
-    ["traders","🏆 Top traders"],["fill","⚡ Fill"],["patron","📅 Patrones"],
-    ["profundidad","📊 Profundidad"],["preciofill","💡 Precio vs Fill"]
+  // Agrupadas por DECISIÓN, no por origen del dato (COL18). El grupo se
+  // muestra como separador para que se entienda qué pregunta responde cada una.
+  const GRUPOS = [
+    ["CUÁNDO",        [["ventanas","🎯 Ventanas reales"],["horario","⏰ Horario"],["patron","📅 Patrones"]]],
+    ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"],["fill","⚡ Fill"]]],
+    ["CONTRA QUIÉN",  [["farmers","🌾 Farmers"],["anunciantes","👥 Pares"],["traders","🏆 Top traders"]]],
   ];
 
   if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
 
   return (
     <div className="view">
-      <div className="intel-tabs">
-        {SECS.map(([k,lbl])=>(
-          <button key={k} className={"intel-tab"+(seccion===k?" active":"")} onClick={()=>setSeccion(k)}>{lbl}</button>
+      <div className="intel-tabs" style={{alignItems:"center"}}>
+        {GRUPOS.map(([grupo, items], gi)=>(
+          <React.Fragment key={grupo}>
+            <span style={{fontSize:9.5,color:"var(--text-3)",textTransform:"uppercase",letterSpacing:"0.12em",
+                          marginLeft: gi ? 10 : 0, marginRight:2, whiteSpace:"nowrap"}}>{grupo}</span>
+            {items.map(([k,lbl])=>(
+              <button key={k} className={"intel-tab"+(seccion===k?" active":"")} onClick={()=>setSeccion(k)}>{lbl}</button>
+            ))}
+          </React.Fragment>
         ))}
       </div>
+
+      {seccion==="cruzar" && <CruzarOEsperar />}
 
       {seccion==="horario" && horario && (
         <section className="chart-card">
@@ -6241,6 +6364,130 @@ def api_intel_ventanas_reales():
         r["pct_operable"] = round(ok / n * 100, 1) if n else 0
         r["pct_verde"]    = round(int(r["verdes"] or 0) / n * 100, 1) if n else 0
     return jsonify(rows)
+
+
+@app.route("/api/taker_maker")
+def api_taker_maker():
+    """CRUZAR o ESPERAR: compara, pierna por pierna, si conviene tomar el
+    anuncio de otro (taker) o publicar el tuyo y esperar (maker).
+
+    LA MATEMATICA (COL18)
+    La comision taker es un MONTO FIJO (0,07 USDT medidos) y la maker es un
+    PORCENTAJE (0,19%). Entonces el que conviene depende del TAMANO:
+      - costo de cruzar   = medio spread (pagas el precio del otro) + fija/X
+      - costo de esperar  = -medio spread (lo GANAS vos) + 0,19%
+      - diferencia        = spread + fija/X - 0,19
+    => CRUZAR conviene cuando:  spread% < 0,19 - (0,07/X x 100)
+    => y el tamano a partir del cual conviene:  X = 7 / (0,19 - spread%)
+
+    Ademas del costo esta el TIEMPO: cruzar llena al instante, esperar tarda
+    lo que diga la curva de llenado medida. Por eso, aun empatando en costo,
+    cruzar puede convenir (y para la campana, mas ordenes por hora).
+    Params: ?usdt=200 (tamano de la orden a evaluar)."""
+    with config_lock:
+        c = dict(config)
+    try:
+        usdt = float(request.args.get("usdt", 0)) or float(c.get("FILL_TICKET_DEF", 408))
+    except (ValueError, TypeError):
+        usdt = float(c.get("FILL_TICKET_DEF", 408))
+    usdt = max(5.0, min(100000.0, usdt))
+    with data_lock:
+        snap = dict(ultimo_estado)
+    ask = float(snap.get("mejor_vendedor_tab_compra") or 0)   # mas barato para COMPRAR USDT
+    bid = float(snap.get("mejor_comprador_tab_venta") or 0)   # mas alto que PAGAN por tu USDT
+    if not ask or not bid:
+        return jsonify({"error": "sin datos del libro aun"}), 503
+    mid = (ask + bid) / 2
+    spread_pct = (ask - bid) / mid * 100
+    fija    = float(c.get("COM_TAKER_FIJA_USDT", 0.07))
+    mak_pct = float(c.get("COM_MAKER_PCT", 0.19))
+    fija_pct = fija / usdt * 100                 # la fija expresada en % de ESTA orden
+    ritmo    = float(c.get("RITMO_MEDIDO_ORD_H", 0) or 0)
+    espera_min = round(60 / ritmo, 0) if ritmo > 0 else None
+
+    # Umbral: cruzar conviene si el spread es menor que el ahorro de comision
+    ahorro_com = mak_pct - fija_pct              # lo que te ahorras en comision al cruzar
+    ventaja    = ahorro_com - spread_pct         # >0 => cruzar sale mas barato
+    tam_equilibrio = round(fija * 100 / (mak_pct - spread_pct)) if spread_pct < mak_pct else None
+
+    def pierna(nombre, tab_cruzar, tab_publicar, precio_cruzar, precio_publicar):
+        """Costo de cada opcion para una pierna, en % sobre el mid."""
+        costo_cruzar  = round(abs(precio_cruzar - mid) / mid * 100 + fija_pct, 4)
+        costo_esperar = round(-abs(mid - precio_publicar) / mid * 100 + mak_pct, 4)
+        conviene = "cruzar" if costo_cruzar < costo_esperar else "esperar"
+        return {
+            "pierna": nombre,
+            "cruzar": {
+                "accion": f"tomas un anuncio en {tab_cruzar}",
+                "precio": round(precio_cruzar, 2),
+                "comision_usdt": round(fija, 3),
+                "comision_pct": round(fija_pct, 4),
+                "costo_total_pct": costo_cruzar,
+                "demora_min": 0,
+            },
+            "esperar": {
+                "accion": f"publicas tu anuncio en {tab_publicar}",
+                "precio": round(precio_publicar, 2),
+                "comision_usdt": round(usdt * mak_pct / 100, 3),
+                "comision_pct": mak_pct,
+                "costo_total_pct": costo_esperar,
+                "demora_min": espera_min,
+            },
+            "conviene": conviene,
+            "diferencia_pct": round(costo_esperar - costo_cruzar, 4),
+        }
+
+    # Al publicar (maker) el supuesto es que te llenas al precio del lider del
+    # lado contrario: es el escenario competitivo realista.
+    piernas = [
+        pierna("comprar USDT", "tab Compra", "tab Venta",  ask, bid),
+        pierna("vender USDT",  "tab Venta",  "tab Compra", bid, ask),
+    ]
+
+    # Los 4 caminos de la vuelta completa (comprar + vender)
+    pc, pv = piernas[0], piernas[1]
+    caminos = []
+    for nom, desc, kc, kv in (
+        ("Dual maker",  "publicas los dos anuncios y esperas (farming clasico)", "esperar", "esperar"),
+        ("Cruzar compra", "compras al instante, vendes publicando",              "cruzar",  "esperar"),
+        ("Cruzar venta",  "compras publicando, vendes al instante",              "esperar", "cruzar"),
+        ("Doble cruce",   "las dos al instante (maxima velocidad)",              "cruzar",  "cruzar"),
+    ):
+        costo = pc[kc]["costo_total_pct"] + pv[kv]["costo_total_pct"]
+        dem   = [pc[kc]["demora_min"], pv[kv]["demora_min"]]
+        dem_tot = None if any(d is None for d in dem) else sum(dem)
+        caminos.append({
+            "nombre": nom, "detalle": desc,
+            "compra": kc, "venta": kv,
+            "costo_vuelta_pct": round(costo, 4),
+            "demora_estimada_min": dem_tot,
+            "ordenes_h_teoricas": round(60 / dem_tot, 1) if dem_tot else None,
+        })
+    caminos.sort(key=lambda x: x["costo_vuelta_pct"])
+    barato = caminos[0]
+
+    return jsonify({
+        "usdt_evaluado": round(usdt),
+        "libro": {"ask": round(ask, 2), "bid": round(bid, 2), "mid": round(mid, 2),
+                  "spread_pct": round(spread_pct, 4)},
+        "comisiones": {"taker_fija_usdt": fija, "taker_pct_en_esta_orden": round(fija_pct, 4),
+                       "maker_pct": mak_pct},
+        "umbral": {
+            "spread_limite_pct": round(ahorro_com, 4),
+            "ventaja_cruzar_pct": round(ventaja, 4),
+            "tamano_equilibrio_usdt": tam_equilibrio,
+            "veredicto": ("cruzar sale mas barato que publicar" if ventaja > 0
+                          else "publicar sale mas barato que cruzar"),
+        },
+        "piernas": piernas,
+        "caminos": caminos,
+        "mas_barato": barato["nombre"],
+        "espera_maker_min": espera_min,
+        "nota": ("Costos en % sobre el precio medio. 'Esperar' asume que te llenas al precio "
+                 "del lider (escenario competitivo) y que la espera es la de la curva medida; "
+                 "si no te llenas, el costo real es mayor. Las ordenes taker TAMBIEN suman al "
+                 "contador de Merchant."),
+    })
 
 
 @app.route("/api/calibracion")
