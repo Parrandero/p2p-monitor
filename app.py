@@ -78,7 +78,12 @@ config = {
     # proporcional. Consecuencia: arriba de cierto tamano CRUZAR paga menos
     # comision que publicar, y la ventaja crece con el tamano de la orden.
     "COM_TAKER_FIJA_USDT":  0.07,  # comision taker por orden (monto fijo)
-    "COM_MAKER_PCT":        0.19,  # comision maker % por pierna (medida, no supuesta)
+    # Comision maker NOMINAL de Binance: 0,20% por pierna. En las ordenes propias
+    # se midio 0,19% efectivo, pero eso es por REDONDEO: Binance trunca la
+    # comision a 2 decimales (74,16 x 0,2% = 0,148 -> cobra 0,14). El nominal es
+    # 0,20% y es el que corresponde usar; el efectivo es apenas menor en ordenes
+    # chicas. Los descuentos por nivel se aplican sobre este 0,20%.
+    "COM_MAKER_PCT":        0.20,  # % por pierna (nominal Binance)
     # ── Mi posicion / carrera al verificado (COL14) ──
     "MI_NICKNAME":          "",    # nickname de Binance P2P: activa el seguimiento de MIS anuncios
     "MI_POSICION_OBJETIVO": 15,    # posicion objetivo en el libro (el plan farming dice top 10-20)
@@ -156,8 +161,14 @@ _pool = None
 
 def init_pool():
     global _pool
-    _pool = pg_pool.ThreadedConnectionPool(2, 10, DATABASE_URL)
-    print("✅ Connection pool listo (2-10 conexiones)")
+    # OJO (fix COL19): los timestamps se GUARDAN en hora de Chile (naive), pero
+    # el servidor de Railway corre en UTC. Sin esto, cualquier consulta que use
+    # NOW() comparaba contra un reloj 4 horas adelantado y las ventanas salían
+    # recortadas (un "ultimas 24h" traía en realidad 20h). Fijando la zona de la
+    # sesion, NOW() devuelve hora de Chile y todo cuadra.
+    _pool = pg_pool.ThreadedConnectionPool(
+        2, 10, DATABASE_URL, options="-c timezone=America/Santiago")
+    print("✅ Connection pool listo (2-10 conexiones, TZ America/Santiago)")
 
 @contextmanager
 def get_conn():
@@ -4165,12 +4176,18 @@ function PrecioChart() {
           // 1) intensidad del sombreado según qué tan buena es cada hora
           //    (índice medido spread × flujo). Si el perfil aún no está,
           //    cae a un sombreado plano de 9 a 16h.
+          // Ámbar, y sólo en las horas que valen: por debajo de 45 de índice no
+          // se pinta nada. Así quedan BANDAS nítidas en vez de un degradado
+          // parejo que no se distingue del fondo.
           const pintar = (t) => {
             const h = new Date(t * 1000).getUTCHours();
-            let inten;
-            if (perfil && perfil[h] != null) inten = (perfil[h] / 100) * 0.13;
-            else inten = (h >= 9 && h <= 16) ? 0.07 : 0;
-            return "rgba(91,141,239," + inten.toFixed(3) + ")";
+            let idx;
+            if (perfil && perfil[h] != null) idx = perfil[h];
+            else idx = (h >= 9 && h <= 16) ? 80 : 0;   // respaldo si no hay perfil
+            if (idx < 45) return "rgba(0,0,0,0)";       // hora floja: transparente
+            // 45→100 se mapea a 0,06→0,20 de opacidad
+            const op = 0.06 + ((idx - 45) / 55) * 0.14;
+            return "rgba(224,146,42," + op.toFixed(3) + ")";
           };
           const banda = chart.addHistogramSeries({
             priceScaleId: "", priceLineVisible: false, lastValueVisible: false,
