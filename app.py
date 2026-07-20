@@ -26,10 +26,11 @@ config = {
     "FILTRO_MIN_TASA":      90.0,
     "ALERTA_SPREAD":        0.8,
     "SPREAD_MINIMO":        0.2,
-    # Comisión Binance P2P por operación (cada lado).
-    # Usuario regular: ~0.35% por lado.
-    # Merchant verificado LATAM: ~0.18% por lado → 0.36% total round-trip.
-    "COMISION_BN":          0.002,   # Binance maker CLP = 0.2% (fuente: pagina de fees del usuario)
+    # Comisión Binance P2P maker CLP: 0.2% por pierna → 0.4% ida y vuelta (no verificado).
+    # El descuento verificado es POR NIVEL, no fijo: Bronce -20% → 0.32% RT (donde se
+    # arranca), Plata -30% → 0.28% (>6 BTC/mes), Oro -50% → 0.20% (>60 BTC/mes).
+    # Al verificarse (Bronce): cambiar COMISION_BN a 0.0016 desde el panel/API.
+    "COMISION_BN":          0.002,   # por pierna (0.2% maker CLP, no verificado)
     "COM_BINANCE_MAKER":    0.002,   # Binance maker CLP 0.2%
     "COM_BINANCE_TAKER":    0.001,   # Binance taker CLP 0.1%
     "COM_BYBIT_MAKER":      0.0,     # Bybit CLP: sin comision al publicar
@@ -46,7 +47,18 @@ config = {
     "FILL_CAP_USDT":        10000, # tope de sanidad por evento (antes 3000, ciego; ahora solo protege contra ediciones gigantes)
     "FILL_TICKET_DEF":      272,   # ticket mediano de mercado (validado sobre 7d de datos reales) p/ fills enmascarados
     "FILL_TICKET_DEF_BYBIT": 200,  # ticket mediano de Bybit (mas chico que Binance: p50=196 en datos jul)
-    "CAPITAL_OPERATIVO":    2000,  # USDT de capital de trabajo p/ proyecciones del asistente operativo
+    "CAPITAL_OPERATIVO":    600,   # USDT de capital de trabajo p/ proyecciones del asistente (editable en el panel; persiste en DB)
+    # ── Proyeccion realista (COL12) ──
+    # La proyeccion vieja (10% de captura, giros ilimitados) era un techo teorico:
+    # daba 15.000 CLP/h y ~29 giros/h, imposible a mano. Estos parametros arman
+    # el numero REALISTA: captura chica y tope de ordenes/hora atendibles.
+    "CAPTURA_REALISTA_PCT": 2.0,   # % del flujo que captura un anunciante nuevo sin verificar
+    "CAPTURA_VERIF_PCT":    3.0,   # % estimado al estar verificado (mejor ranking/confianza)
+    "ORDENES_H_MAX":        8,     # ordenes/hora maximas atendibles a mano desde el telefono
+    "COMISION_BN_VERIF":    0.0016, # por pierna al verificarse Bronce (-20% -> 0.32% ida y vuelta)
+    # ── Mi posicion / carrera al verificado (COL14) ──
+    "MI_NICKNAME":          "",    # nickname de Binance P2P: activa el seguimiento de MIS anuncios
+    "MI_POSICION_OBJETIVO": 15,    # posicion objetivo en el libro (el plan farming dice top 10-20)
     # ── Umbrales del asistente (ahora configurables en caliente) ──
     "UMBRAL_ROT_LENTO":     0.7,   # ratio rotacion bajo el cual el mercado se considera lento
     "UMBRAL_ROT_DUAL":      1.0,   # ratio rotacion desde el cual habilita OPERAR DUAL pleno
@@ -58,7 +70,41 @@ config = {
 }
 config_lock = threading.Lock()
 
+# Claves de config editables en caliente (POST /api/config). Estas mismas claves
+# se PERSISTEN en la tabla config_persistente: sobreviven reinicios de Railway
+# (antes un redeploy volvia todo a los defaults y el preset Farming se perdia solo).
+CONFIG_TYPE_MAP = {
+    "FILTRO_MIN_USDT":      float,
+    "FILTRO_MIN_ORD":       int,
+    "FILTRO_MIN_TASA":      float,
+    "INTERVALO_MIN":        int,
+    "COMISION_BN":          float,
+    "SPREAD_MIN_OPERATIVO": float,
+    "ALERTA_SPREAD":        float,
+    "SPREAD_MINIMO":        float,
+    "FILL_VENTANA_MIN":     float,
+    "FILL_CAP_USDT":        float,
+    "FILL_TICKET_DEF":      float,
+    "FILL_TICKET_DEF_BYBIT": float,
+    "CAPITAL_OPERATIVO":    float,
+    "UMBRAL_ROT_LENTO":     float,
+    "UMBRAL_ROT_DUAL":      float,
+    "UMBRAL_PRESION_SESGO": float,
+    "GAP_OBJETIVO_BRUTO":   float,
+    "CAPTURA_REALISTA_PCT": float,
+    "CAPTURA_VERIF_PCT":    float,
+    "ORDENES_H_MAX":        int,
+    "COMISION_BN_VERIF":    float,
+    "MI_NICKNAME":          str,
+    "MI_POSICION_OBJETIVO": int,
+}
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
+# Si APP_TOKEN esta seteado (variable de entorno en Railway), los POST sensibles
+# (/api/config, /api/mantenimiento/vaciar) exigen el header X-App-Token con ese
+# valor. Sin APP_TOKEN todo sigue abierto (retrocompatible). La URL publica de
+# Railway la escanean bots: sin esto, cualquiera podia cambiar la estrategia.
+APP_TOKEN    = os.environ.get("APP_TOKEN", "")
 URL     = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 HEADERS = {"Content-Type": "application/json"}
 
@@ -212,20 +258,65 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_operativa_ts ON operativa_historial(ts)")
+            # Contexto de la decision: con que minimo y gap estaba configurado el
+            # asistente al decidir. Sin esto, la calibracion no puede distinguir
+            # decisiones en modo Farming (min -0.2) de decisiones en modo normal.
+            cur.execute("ALTER TABLE operativa_historial ADD COLUMN IF NOT EXISTS min_op NUMERIC")
+            cur.execute("ALTER TABLE operativa_historial ADD COLUMN IF NOT EXISTS gap NUMERIC")
+            # \u2500\u2500 Config persistente (sobrevive reinicios/redeploys) \u2500\u2500
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS config_persistente (
+                    clave TEXT PRIMARY KEY,
+                    valor TEXT,
+                    actualizado TIMESTAMP
+                )
+            """)
         conn.commit()
     print("\u2705 Base de datos lista (snapshots + snapshots_detalle)")
 
-def reset_db():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS snapshots_detalle")
-            cur.execute("DROP TABLE IF EXISTS snapshots")
-        conn.commit()
-    init_db()
-    with data_lock:
-        ultimo_estado.clear()
-        prev_detalle_raw.clear()
-    print("\u2705 Base de datos reseteada")
+def cargar_config_db():
+    """Aplica sobre config los valores guardados en config_persistente.
+    Se llama una vez al boot: asi el preset activo (ej. Farming) sobrevive
+    los reinicios de Railway en vez de volver silenciosamente a los defaults."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT clave, valor FROM config_persistente")
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[CONFIG carga] {e}")
+        return
+    aplicados = []
+    with config_lock:
+        for clave, valor in rows:
+            cast = CONFIG_TYPE_MAP.get(clave)
+            if cast is None:
+                continue
+            try:
+                config[clave] = cast(valor)
+                aplicados.append(f"{clave}={config[clave]}")
+            except (ValueError, TypeError):
+                pass
+    if aplicados:
+        print(f"[CONFIG] restaurada desde DB: {', '.join(aplicados)}")
+
+def guardar_config_db(cambios):
+    """Persiste los cambios de config aplicados via POST /api/config."""
+    if not cambios:
+        return
+    try:
+        now = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany("""
+                    INSERT INTO config_persistente (clave, valor, actualizado)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (clave) DO UPDATE
+                    SET valor = EXCLUDED.valor, actualizado = EXCLUDED.actualizado
+                """, [(k, str(v), now) for k, v in cambios.items()])
+            conn.commit()
+    except Exception as e:
+        print(f"[CONFIG guarda] {e}")
 
 def guardar_snapshot(m, tabla="snapshots"):
     with get_conn() as conn:
@@ -967,6 +1058,35 @@ def ciclo_colector_bybit():
             intervalo = config["INTERVALO_MIN"]
         time.sleep(intervalo * 60)
 
+def decidir_operativa(gan, min_op, ratio, presion, rot_lento, rot_dual, sesgo_min):
+    """Arbol de decision del asistente — UNICA fuente (lo usan api_operativa y
+    _registrar_operativa; antes estaba duplicado y podia desincronizarse).
+    Devuelve (decision, color, razon).
+    ratio None = sin datos de rotacion (tracker recien arrancado tras un
+    reinicio): NO asumir mercado agil — degradar a paciente, no dar verde ciego."""
+    if ratio is None:
+        if gan >= min_op:
+            return ("OPERAR DUAL (paciente)", "yellow",
+                    f"Spread neto {gan}% sobre tu minimo ({min_op}%), pero todavia no hay datos de rotacion (colector recien iniciado): entra con paciencia")
+        return ("ESPERAR", "red",
+                f"Spread neto {gan}% bajo tu minimo ({min_op}%) y sin datos de rotacion aun — mejor conservar el capital")
+    if gan >= min_op and ratio >= rot_dual:
+        return ("OPERAR DUAL", "green",
+                f"Spread neto {gan}% sobre tu minimo ({min_op}%) y mercado rotando {ratio}x su promedio de 12h")
+    if gan >= min_op and ratio >= rot_lento:
+        return ("OPERAR DUAL (paciente)", "yellow",
+                f"Spread neto {gan}% es operable, pero la rotacion esta en {ratio}x del promedio (umbral dual: {rot_dual}x): los fills tardaran mas de lo habitual")
+    if gan >= min_op:
+        return ("SOLO PIERNA CON FLUJO", "orange",
+                f"Spread neto {gan}% pero mercado lento ({ratio}x): no bloquees capital en dual; opera solo el lado que la presion favorece")
+    if ratio >= rot_dual and abs(presion - 50) >= sesgo_min:
+        lado = "VENTA" if presion > 50 else "COMPRA"
+        return (f"SOLO {lado}", "orange",
+                f"Spread neto {gan}% bajo tu minimo, pero el flujo esta {ratio}x acelerado y {presion}% cargado a la compra: una sola pierna del lado con demanda puede pagar")
+    return ("ESPERAR", "red",
+            f"Spread neto {gan}% bajo tu minimo ({min_op}%) y rotacion {ratio}x — mejor conservar el capital para la proxima ventana")
+
+
 _ultimo_reg_operativa = [None]   # throttle del registro (1 fila cada 5 min)
 
 def _registrar_operativa(snap):
@@ -1007,22 +1127,14 @@ def _registrar_operativa(snap):
     uprom = v12 / (hp * 60) if v12 else 0
     ratio   = round(um30 / uprom, 2) if uprom else None
     presion = round(v60b / v60 * 100, 1) if v60 else 50.0
-    if gan >= min_op and (ratio is None or ratio >= rot_dual):
-        decision, color = "OPERAR DUAL", "green"
-    elif gan >= min_op and ratio >= rot_lento:
-        decision, color = "OPERAR DUAL (paciente)", "yellow"
-    elif gan >= min_op:
-        decision, color = "SOLO PIERNA CON FLUJO", "orange"
-    elif ratio is not None and ratio >= rot_dual and abs(presion - 50) >= sesgo_min:
-        decision, color = ("SOLO VENTA" if presion > 50 else "SOLO COMPRA"), "orange"
-    else:
-        decision, color = "ESPERAR", "red"
+    decision, color, _razon = decidir_operativa(gan, min_op, ratio, presion, rot_lento, rot_dual, sesgo_min)
+    gap_cfg = float(c.get("GAP_OBJETIVO_BRUTO", 0) or 0)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO operativa_historial (ts, hora, decision, color, spread_neto, ratio, presion)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-            """, (f(now), now.hour, decision, color, round(gan, 4), ratio, presion))
+                INSERT INTO operativa_historial (ts, hora, decision, color, spread_neto, ratio, presion, min_op, gap)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (f(now), now.hour, decision, color, round(gan, 4), ratio, presion, min_op, gap_cfg))
         conn.commit()
     _ultimo_reg_operativa[0] = now
 
@@ -1655,6 +1767,29 @@ window.P2P_CONFIG = {
   intervaloMin: 2,   // debe coincidir con INTERVALO_MIN del backend (para la velocidad)
 };
 
+/* POST autenticado: si el backend tiene APP_TOKEN (env var en Railway), los POST
+   sensibles piden el header X-App-Token. Este helper lo agrega desde localStorage;
+   ante un 401 lo pide UNA vez con prompt() y reintenta. Sin APP_TOKEN en el
+   backend, funciona igual que un fetch comun. */
+window.P2P_AUTH = {
+  post: function (url, body) {
+    var mk = function (tk) {
+      var h = { "Content-Type": "application/json" };
+      if (tk) h["X-App-Token"] = tk;
+      return fetch(url, { method: "POST", headers: h, body: body ? JSON.stringify(body) : undefined });
+    };
+    var tk = "";
+    try { tk = localStorage.getItem("ua_app_token") || ""; } catch (e) {}
+    return mk(tk).then(function (r) {
+      if (r.status !== 401) return r;
+      var nuevo = window.prompt("Token de administración (APP_TOKEN de Railway):");
+      if (!nuevo) return r;
+      try { localStorage.setItem("ua_app_token", nuevo); } catch (e) {}
+      return mk(nuevo);
+    });
+  }
+};
+
 </script>
 <script>
 /* ============================================================
@@ -2079,7 +2214,7 @@ window.P2P_CONFIG = {
   }
 
   function createLiveEngine({ baseUrl = "", pollMs = 30000, intervaloMin = 5 } = {}) {
-    const B = baseUrl.replace(/\/$/, "");
+    const B = baseUrl.replace(/\\/$/, "");
     let snap = null, history = [], heatmap = [], count = 0, vel = null, velHist = [], lastVelTs = null;
     let cycleStart = Date.now();
     const subs = new Set();
@@ -3717,6 +3852,8 @@ function Inteligencia() {
   const [patron, setPatron] = vS(null);
   const [profundidad, setProfundidad] = vS(null);
   const [precioFill, setPrecioFill] = vS(null);
+  const [ventanas, setVentanas] = vS(null);
+  const [farmers, setFarmers] = vS(null);
   const [loading, setLoading] = vS(true);
   const [seccion, setSeccion] = vS("horario");
 
@@ -3730,10 +3867,14 @@ function Inteligencia() {
       fetch(B+"/api/inteligencia/precio_patron").then(r=>r.json()),
       fetch(B+"/api/inteligencia/profundidad").then(r=>r.json()),
       fetch(B+"/api/inteligencia/precio_vs_fill").then(r=>r.json()),
-    ]).then(([h,a,t,f,p,prof,pvf]) => {
+      fetch(B+"/api/inteligencia/ventanas_reales").then(r=>r.json()).catch(()=>[]),
+      fetch(B+"/api/inteligencia/farmers").then(r=>r.json()).catch(()=>[]),
+    ]).then(([h,a,t,f,p,prof,pvf,vr,fa]) => {
       setHorario(h); setAnunciantes(a); setTraders(t); setFill(f); setPatron(p);
       setProfundidad(Array.isArray(prof) ? prof : (prof.datos || []));
       setPrecioFill(Array.isArray(pvf) ? pvf : (pvf.datos || []));
+      setVentanas(Array.isArray(vr) ? vr : []);
+      setFarmers(Array.isArray(fa) ? fa : []);
       setLoading(false);
     }).catch(()=>setLoading(false));
   }, []);
@@ -3742,7 +3883,8 @@ function Inteligencia() {
   const fC = (v) => v != null ? "$"+parseFloat(v).toFixed(2) : "—";
 
   const SECS = [
-    ["horario","⏰ Horario"],["anunciantes","👥 Pares"],
+    ["horario","⏰ Horario"],["ventanas","🎯 Ventanas reales"],["farmers","🌾 Farmers"],
+    ["anunciantes","👥 Pares"],
     ["traders","🏆 Top traders"],["fill","⚡ Fill"],["patron","📅 Patrones"],
     ["profundidad","📊 Profundidad"],["preciofill","💡 Precio vs Fill"]
   ];
@@ -3759,12 +3901,12 @@ function Inteligencia() {
 
       {seccion==="horario" && horario && (
         <section className="chart-card">
-          <div className="card-head"><h3>Ventanas operativas por hora</h3><span className="card-sub">últimos 7 días · spread neto merchant verificado (−0.36%)</span></div>
+          <div className="card-head"><h3>Ventanas operativas por hora</h3><span className="card-sub">últimos 7 días · spread neto con la comisión vigente (hoy 0,4% · al verificarte Bronce 0,32%)</span></div>
           <div className="intel-scroll">
             <table className="intel-table">
               <thead><tr>
                 <th title="Hora del día en horario Santiago (Chile)">Hora</th>
-                <th title="Ganancia neta estimada por vuelta: diferencia entre precio compra y venta, descontando la comisión merchant verificado de 0.36% (0.18% × 2 lados). Ej: +1.2% significa que por cada 1.000 USDT ganás $12.">Spread neto</th>
+                <th title="Ganancia neta estimada por vuelta: diferencia entre precio compra y venta, descontando la comisión configurada (hoy 0,4% = 0,2% × 2 piernas; al verificarte Bronce baja a 0,32%). Ej: +1.2% significa que por cada 1.000 USDT ganás $12.">Spread neto</th>
                 <th title="USDT disponibles en el lado de compra (Tab Compra). Cuánto hay para vender. Mayor número = más fácil llenar tu orden de venta.">Liq. Compra</th>
                 <th title="USDT disponibles en el lado de venta (Tab Venta). Cuánto hay para comprar. Mayor número = más fácil reponerte de USDT.">Liq. Venta</th>
                 <th title="Cantidad de snapshots tomados en esa hora. Más muestras = dato más confiable.">Muestras</th>
@@ -3788,6 +3930,82 @@ function Inteligencia() {
           <div className="intel-explain">
             <b>Cómo leer esta tabla:</b> buscá las horas con semáforo 🔥 o ✅ — ahí es donde conviene operar porque la diferencia entre lo que te pagan por vender USDT y lo que pagás por comprarlos es suficiente para cubrir la comisión y ganar. Las horas ❌ tienen spread casi cero: mover capital ahí es trabajar para no ganar nada.<br/>
             <b>Qué hacer:</b> si tu turno libre empieza a las 04h, mirá si el spread neto supera +0.5% antes de publicar tu anuncio. Si está en rojo, esperá una hora.
+          </div>
+        </section>
+      )}
+
+      {seccion==="ventanas" && ventanas && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Ventanas reales (semáforo medido)</h3><span className="card-sub">últimos 7 días · decisiones del asistente cada ~5 min · % del tiempo operable por hora</span></div>
+          {ventanas.length === 0 && <div className="intel-loading">Todavía no hay decisiones registradas. El asistente graba una cada ~5 min desde que el monitor está vivo.</div>}
+          {ventanas.length > 0 && (
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr>
+                <th title="Hora del día en horario Santiago (Chile)">Hora</th>
+                <th title="% del tiempo con semáforo verde o amarillo (OPERAR DUAL pleno o paciente). Es la probabilidad medida de encontrar ventana a esa hora.">% operable</th>
+                <th title="% del tiempo con verde pleno (OPERAR DUAL).">% verde</th>
+                <th title="Spread neto promedio de esa hora (con la comisión vigente al decidir).">Spread neto med.</th>
+                <th title="Rotación promedio vs el promedio de las 12h previas (1x = normal, menos = lento).">Rotación med.</th>
+                <th title="Presión compradora promedio (50% = equilibrado; más = domina la compra).">Presión med.</th>
+                <th title="Decisiones registradas en esa hora (~12/día con el monitor vivo). Pocas muestras = dato débil.">Muestras</th>
+              </tr></thead>
+              <tbody>{ventanas.map(r=>{
+                const po = parseFloat(r.pct_operable||0);
+                const color = po>=60?"#35e07a":po>=30?"#ffd740":po>0?"#ff9100":"#ff5d6c";
+                return <tr key={r.hora} style={{borderLeft:`3px solid ${color}`}}>
+                  <td><b className="tnum">{String(r.hora).padStart(2,"0")}h</b></td>
+                  <td style={{color,fontWeight:600}} className="tnum">{po.toFixed(0)}%</td>
+                  <td className="tnum">{parseFloat(r.pct_verde||0).toFixed(0)}%</td>
+                  <td className="tnum">{r.spread_neto_med!=null?(parseFloat(r.spread_neto_med)>=0?"+":"")+parseFloat(r.spread_neto_med).toFixed(3)+"%":"—"}</td>
+                  <td className="tnum">{r.rotacion_med!=null?parseFloat(r.rotacion_med).toFixed(2)+"x":"—"}</td>
+                  <td className="tnum">{r.presion_med!=null?parseFloat(r.presion_med).toFixed(0)+"%":"—"}</td>
+                  <td className="tnum" style={{color:"var(--text-3)"}}>{r.muestras}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+          )}
+          <div className="intel-explain">
+            <b>Qué es esto:</b> la versión MEDIDA de las "ventanas buenas". El plan de campaña dice 07-09h y 20-23h; esta tabla muestra qué dijo el semáforo de verdad, hora por hora, la última semana.<br/>
+            <b>Qué hacer:</b> planificá las sesiones de farming en las horas con % operable alto. Si una ventana del plan sale roja acá, el plan se corrige con datos. Desconfiá de las horas con pocas muestras.
+          </div>
+        </section>
+      )}
+
+      {seccion==="farmers" && farmers && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Radar de farmers</h3><span className="card-sub">anunciantes con muchas órdenes chicas (7d) · tu competencia directa en la campaña</span></div>
+          {farmers.length===0 && <div className="intel-loading">Sin farmers detectados todavía (necesita fills acumulados de varios días).</div>}
+          {farmers.length>0 && (
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr>
+                <th title="Nickname del anunciante en Binance P2P.">Anunciante</th>
+                <th title="Órdenes por día detectadas (promedio 7 días). Los que más giran son los que mejor farmean.">Órd/día</th>
+                <th title="Tamaño mediano de sus órdenes en USDT. Chico = táctica farming (muchas vueltas, poco margen).">Ticket</th>
+                <th title="Volumen total detectado en 7 días (USDT).">Vol 7d</th>
+                <th title="¿Está publicado AHORA en ambos lados (compra y venta)? Esa es la táctica dual del plan.">Dual</th>
+                <th title="Su gap propio AHORA: precio de su venta vs precio de su compra. Es el gap que a él le funciona — referencia directa para tu gap objetivo.">Gap propio</th>
+                <th title="Posición actual de su anuncio de venta (en tab Compra) y de compra (en tab Venta). El plan dice pararse top 10-20.">Pos. (V/C)</th>
+              </tr></thead>
+              <tbody>{farmers.map(r=>(
+                <tr key={r.anunciante}>
+                  <td style={{fontWeight:600}}>{r.anunciante}</td>
+                  <td className="tnum">{fN(r.ordenes_dia)}</td>
+                  <td className="tnum">{fN(r.ticket_med)}</td>
+                  <td className="tnum">{fN(r.vol_7d)}</td>
+                  <td>{r.dual?<span style={{color:"var(--buy)"}}>✓ dual</span>:<span style={{color:"var(--text-3)"}}>—</span>}</td>
+                  <td className="tnum" style={{color:"var(--warn)",fontWeight:600}}>{r.gap_propio_pct!=null?r.gap_propio_pct+"%":"—"}</td>
+                  <td className="tnum">{r.pos_venta!=null?"#"+r.pos_venta:"—"} / {r.pos_compra!=null?"#"+r.pos_compra:"—"}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+          )}
+          <div className="intel-explain">
+            <b>Qué es esto:</b> los que YA hacen lo que estás por hacer — muchas órdenes chicas por día, el modelo Inversiones_MH. El monitor los detecta por sus fills confirmados.<br/>
+            <b>Qué hacer:</b> mirá el <b>gap propio</b> de los duales activos: ese es el gap que el mercado está pagando hoy por farmear. Si tu gap objetivo (0,6%) queda muy lejos del de ellos, ajustalo. Y copiales la posición: si los que más giran están #8-#15, ahí es donde pasa el flujo.
           </div>
         </section>
       )}
@@ -3929,7 +4147,7 @@ function Inteligencia() {
           </div>
           <div className="intel-explain">
             <b>Cómo leer esta tabla:</b> muestra el precio promedio y el spread disponible para cada combinación de día y hora. Te permite ver si hay días sistemáticamente mejores que otros.<br/>
-            <b>P. Compra vs P. Venta:</b> la diferencia entre ambos es la brecha que el mercado ofrece. Si P. Compra = $922 y P. Venta = $916, el spread bruto es ~0.65% — de ahí se descuenta tu comisión (0.36% merchant verificado) y te queda tu ganancia neta.<br/>
+            <b>P. Compra vs P. Venta:</b> la diferencia entre ambos es la brecha que el mercado ofrece. Si P. Compra = $922 y P. Venta = $916, el spread bruto es ~0.65% — de ahí se descuenta tu comisión (0,4% hoy; 0,32% al verificarte Bronce) y te queda tu ganancia neta.<br/>
             <b>Qué hacer:</b> buscá las combinaciones día+hora con spread verde (>+0.5%) — esas son tus ventanas óptimas según el día de la semana. Si el lunes a las 05h siempre tiene +2%, priorizá operar a esa hora cuando tenés el lunes libre.
           </div>
         </section>
@@ -4041,7 +4259,7 @@ function Backup() {
     if (!window.confirm("¿Vaciar las listas conservando las últimas 24h? Hacé el backup ANTES. No borra precios, volumen ni historial.")) return;
     setMsg("Vaciando…");
     try {
-      const r = await fetch(B + "/api/mantenimiento/vaciar", { method: "POST" });
+      const r = await window.P2P_AUTH.post(B + "/api/mantenimiento/vaciar");
       const d = await r.json();
       setMsg(d.ok ? "🧹 Vaciando en segundo plano — mirá el ALMACENAMIENTO de arriba, en unos segundos baja. No cierres la app." : "No se pudo iniciar el vaciado.");
     } catch (e) { setMsg("No se pudo iniciar el vaciado."); }
@@ -4683,6 +4901,9 @@ function AsistenteOperativo() {
   const tone = toneMap[d.color] || "var(--accent)";
   const m = d.mercado || {}, p = d.precios || {}, lim = d.limites, pr = d.proyeccion || {};
   const esc10 = (pr.escenarios_captura || []).find(e => e.captura_pct === 10);
+  const prReal = d.proyeccion_realista || null;
+  const escHoy = prReal ? (prReal.escenarios || []).find(e => e.nombre === "hoy") : null;
+  const escVer = prReal ? (prReal.escenarios || []).find(e => e.nombre === "verificado") : null;
   const box = (label, val, sub) => (
     <div style={{ flex: 1, minWidth: 150, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" }}>
       <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
@@ -4703,18 +4924,90 @@ function AsistenteOperativo() {
         {box("Comprar a (flujo)", fmt(p.flujo_comprar), "margen " + fmt(p.margen_compra_pct) + "% \u00b7 agresivo: " + fmt(p.agresivo_comprar))}
         {lim && box("L\u00edmites orden", fmt(lim.min_clp) + " \u2013 " + fmt(lim.max_clp) + " CLP", "ticket real p25-p90: " + fmt(lim.ticket_p25_usdt) + "\u2013" + fmt(lim.ticket_p90_usdt) + " USDT")}
         {box("Presi\u00f3n compra", fmt(m.presion_compra_pct) + "%", "flujo " + fmt(m.flujo_usdt_h) + " USDT/h \u00b7 " + (m.vs_promedio_12h == null ? "\u2014" : m.vs_promedio_12h + "x") + " vs 12h")}
-        {esc10 && box("Proyecci\u00f3n (10% captura)", fmt(esc10.ganancia_h_clp) + " CLP/h", fmt(esc10.usdt_h) + " USDT/h \u00b7 " + fmt(esc10.giros_h) + " giros/h con " + fmt(pr.capital_usdt) + " USDT")}
+        {escHoy && box("Proyecci\u00f3n realista",
+          <span style={{ color: escHoy.clp_h != null && escHoy.clp_h < 0 ? "var(--sell)" : "var(--text)" }}>{fmt(escHoy.clp_h)} CLP/h</span>,
+          "verificado: " + (escVer ? fmt(escVer.clp_h) : "\u2014") + " CLP/h \u00b7 ~" + fmt(escHoy.ordenes_h) + " \u00f3rd/h \u00b7 techo te\u00f3rico 10%: " + (esc10 ? fmt(esc10.ganancia_h_clp) : "\u2014"))}
+        {!escHoy && esc10 && box("Proyecci\u00f3n (10% captura)", fmt(esc10.ganancia_h_clp) + " CLP/h", fmt(esc10.usdt_h) + " USDT/h \u00b7 " + fmt(esc10.giros_h) + " giros/h con " + fmt(pr.capital_usdt) + " USDT")}
       </div>
       {d.vacios_liquidez && d.vacios_liquidez.length > 0 && (
         <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }} title="Competidores con stock para menos de 30 min al ritmo actual de fills. Cuando se agoten, su hueco en el libro queda libre: ventana para subir tu precio y aun asi llenar.">Por agotarse \u26a1</span>
           {d.vacios_liquidez.map((x, i) => (
-            <span key={i} style={{ fontSize: 11.5, fontFamily: "var(--mono)", background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 7, padding: "3px 9px", color: "var(--text-2)" }}>
-              <b style={{ color: x.tipo === "BUY" ? "var(--buy)" : "var(--sell)" }}>{x.tipo}</b> {x.anunciante} \u00b7 ~{fmt(x.min_restantes)} min
+            <span key={i} title={"Posici\u00f3n " + fmt(x.posicion) + " del tab " + (x.tipo === "BUY" ? "Compra" : "Venta") + " \u00b7 consume " + fmt(x.velocidad_usdt_min) + " USDT/min. Cuando se agote, su precio queda libre: hueco para pararte ah\u00ed."}
+              style={{ fontSize: 11.5, fontFamily: "var(--mono)", background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 7, padding: "3px 9px", color: "var(--text-2)", cursor: "default" }}>
+              <b style={{ color: x.tipo === "BUY" ? "var(--buy)" : "var(--sell)" }}>{x.tipo === "BUY" ? "COMPRA" : "VENTA"}</b> {x.anunciante} \u00b7 ${fmt(x.precio)} \u00b7 quedan {fmt(x.disponible)} USDT \u00b7 ~{fmt(x.min_restantes)} min
             </span>
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function MiCampania() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/mi_posicion").then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
+    load();
+    const id = setInterval(load, 60000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  if (!d || !d.configurado) return null;
+  const fmt = (x) => x == null ? "—" : Number(x).toLocaleString("es-CL");
+  const pr = d.progreso || {};
+  const bar = (pct, tone) => (
+    <div className="hbar" style={{ marginTop: 5 }}>
+      <div className="hbar-fill" style={{ width: Math.min(100, pct || 0) + "%", background: tone }} />
+    </div>
+  );
+  const boxSt = { flex: 1, minWidth: 170, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" };
+  const lbl = { fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" };
+  const val = { fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)", margin: "3px 0 1px", fontVariantNumeric: "tabular-nums" };
+  const sub = { fontSize: 10.5, color: "var(--text-3)" };
+  const adBox = (a) => (
+    <div key={a.rol} style={boxSt}>
+      <div style={lbl}>{a.rol} <span style={{ opacity: 0.7 }}>(tab {a.tab})</span></div>
+      {!a.publicado && <div style={{ ...val, color: "var(--text-3)" }}>fuera del top-80</div>}
+      {!a.publicado && <div style={sub}>sin anuncio publicado o muy abajo en el libro</div>}
+      {a.publicado && (
+        <div style={{ ...val, color: a.en_objetivo ? "var(--buy)" : "var(--warn)" }}>
+          #{a.posicion} · ${fmt(a.precio)}
+        </div>
+      )}
+      {a.publicado && (
+        <div style={sub}>
+          stock {fmt(a.disponible)} USDT
+          {a.en_objetivo ? " · ✓ en objetivo (top " + a.posicion_objetivo + ")" : ""}
+          {!a.en_objetivo && a.precio_sugerido ? " · reajustá a $" + fmt(a.precio_sugerido) + " p/ top " + a.posicion_objetivo : ""}
+        </div>
+      )}
+    </div>
+  );
+  return (
+    <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderLeft: "4px solid var(--accent)", borderRadius: 14, padding: "13px 16px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Carrera al verificado</span>
+        <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--accent)", fontWeight: 600 }}>{d.nick}</span>
+        <span title={d.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
+        {!d.en_libro && <span style={{ fontSize: 11, color: "var(--text-3)" }}>· no aparecés en el libro ahora</span>}
+      </div>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        {(d.anuncios || []).map(adBox)}
+        <div style={boxSt}>
+          <div style={lbl}>Órdenes 30d (meta 300)</div>
+          <div style={val}>{fmt(pr.ordenes_30d)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>/ 300</span></div>
+          {bar(pr.ordenes_pct, "var(--accent)")}
+          <div style={sub}>{pr.ordenes_ganadas_7d != null ? "+" + fmt(pr.ordenes_ganadas_7d) + " esta semana" : "contador oficial de Binance"}</div>
+        </div>
+        <div style={boxSt}>
+          <div style={lbl}>Volumen 30d estimado</div>
+          <div style={val}>{fmt(pr.vol_30d_estimado)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span></div>
+          {bar(pr.vol_pct_minima, "var(--buy)")}
+          <div style={sub}>{fmt(pr.vol_pct_minima)}% de 0,5 BTC (mínimo) · {fmt(pr.vol_pct_comoda)}% de 1 BTC</div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -4725,22 +5018,27 @@ function EstrategiaPanel() {
   const [gap, setGap] = React.useState("");
   const [cap, setCap] = React.useState("");
   const [minop, setMinop] = React.useState("");
+  const [nickI, setNickI] = React.useState("");
   const [msg, setMsg] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const load = () => fetch(B + "/api/config").then(r => r.json()).then(d => {
     setCfg(d);
     setGap(String(d.GAP_OBJETIVO_BRUTO != null ? d.GAP_OBJETIVO_BRUTO : 1.25));
-    setCap(String(d.CAPITAL_OPERATIVO != null ? d.CAPITAL_OPERATIVO : 760));
+    setCap(String(d.CAPITAL_OPERATIVO != null ? d.CAPITAL_OPERATIVO : 600));
     setMinop(String(d.SPREAD_MIN_OPERATIVO != null ? d.SPREAD_MIN_OPERATIVO : 0.28));
+    setNickI(String(d.MI_NICKNAME || ""));
   }).catch(() => {});
   React.useEffect(() => { load(); }, []);
   const base = { UMBRAL_ROT_LENTO: 0.5, UMBRAL_ROT_DUAL: 0.8, UMBRAL_PRESION_SESGO: 15 };
   const aplicar = (body, nombre) => {
     if (busy) return;
     setBusy(true); setMsg("Aplicando...");
-    fetch(B + "/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
-      .then(r => r.json())
-      .then(() => { setMsg("\u2713 Aplicado: " + nombre); load(); setBusy(false); setTimeout(() => setMsg(""), 5000); })
+    window.P2P_AUTH.post(B + "/api/config", body)
+      .then(r => r.json().then(d => ({ ok: r.ok && d && d.ok !== false, d })))
+      .then(({ ok }) => {
+        if (!ok) { setMsg("\u2717 No se aplic\u00f3 (\u00bftoken?)"); setBusy(false); return; }
+        setMsg("\u2713 Aplicado: " + nombre); load(); setBusy(false); setTimeout(() => setMsg(""), 5000);
+      })
       .catch(() => { setMsg("\u2717 Error al aplicar"); setBusy(false); });
   };
   const presets = [
@@ -4798,6 +5096,17 @@ function EstrategiaPanel() {
             Aplicar
           </button>
         </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center", background: "var(--bg-2)", border: "1px solid var(--line)", borderRadius: 10, padding: "6px 10px" }}
+          title="Tu nickname de Binance P2P. Activa el panel 'Carrera al verificado': posición de tus anuncios, sugerencia de reprecio y progreso hacia Merchant.">
+          <span style={{ fontSize: 10, color: "var(--text-3)" }}>mi nick</span>
+          <input value={nickI} onChange={e => setNickI(e.target.value)} placeholder="(sin configurar)"
+            style={{ width: 110, background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12, padding: "4px 6px" }} />
+          <button disabled={busy}
+            onClick={() => aplicar({ MI_NICKNAME: nickI.trim() }, nickI.trim() ? "nick " + nickI.trim() : "nick borrado")}
+            style={{ cursor: "pointer", borderRadius: 7, padding: "5px 12px", border: "1px solid var(--accent)", background: "var(--accent-soft)", color: "var(--accent)", fontSize: 11.5, fontFamily: "var(--mono)" }}>
+            Guardar
+          </button>
+        </div>
       </div>
       <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 8 }}>
         El "m\u00ednimo sem\u00e1foro" es el margen NETO m\u00ednimo (ya con comisi\u00f3n) para que diga OPERAR. Farming lo baja a -0,2%: farmea \u00f3rdenes aceptando una p\u00e9rdida m\u00ednima, para reputaci\u00f3n. Pod\u00e9s editar gap, m\u00edn y capital a mano.
@@ -4806,7 +5115,7 @@ function EstrategiaPanel() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel };
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania };
 
 </script>
 <script type="text/babel">
@@ -4886,6 +5195,7 @@ function App() {
       {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
       <main className="content">
         {tab === "tr" && <V.EstrategiaPanel />}
+        {tab === "tr" && <V.MiCampania />}
         {tab === "tr" && <V.AsistenteOperativo />}
         {tab === "tr" && <V.VelocidadMercado />}
         {tab === "tr" && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
@@ -4942,6 +5252,15 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 @app.route("/")
 def index():
     return Response(DASHBOARD, mimetype='text/html')
+
+def _token_ok():
+    """Autorizacion de los POST sensibles. Sin APP_TOKEN configurado no exige
+    nada (retrocompatible). Con APP_TOKEN, el request debe traer el header
+    X-App-Token con el mismo valor (el frontend lo pide 1 vez y lo guarda
+    en localStorage)."""
+    if not APP_TOKEN:
+        return True
+    return request.headers.get("X-App-Token", "") == APP_TOKEN
 
 def clean(data):
     out = {}
@@ -5497,6 +5816,100 @@ def api_intel_rotacion():
     })
 
 
+@app.route("/api/inteligencia/ventanas_reales")
+def api_intel_ventanas_reales():
+    """VENTANAS REALES: % del tiempo con semaforo operable por hora, medido
+    sobre las decisiones registradas del asistente (operativa_historial, 7d,
+    una decision cada ~5 min). Es la version MEDIDA de las 'ventanas buenas'
+    del plan de campana (07-09h / 20-23h): sirve para validarlas o corregirlas."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT hora,
+                           COUNT(*) AS muestras,
+                           COUNT(*) FILTER (WHERE color = 'green')  AS verdes,
+                           COUNT(*) FILTER (WHERE color = 'yellow') AS amarillos,
+                           COUNT(*) FILTER (WHERE color = 'orange') AS naranjas,
+                           ROUND(AVG(spread_neto)::numeric, 3) AS spread_neto_med,
+                           ROUND(AVG(ratio)::numeric, 2)       AS rotacion_med,
+                           ROUND(AVG(presion)::numeric, 1)     AS presion_med
+                    FROM operativa_historial
+                    WHERE ts >= NOW() - INTERVAL '7 days'
+                    GROUP BY hora ORDER BY hora
+                """)
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[ventanas_reales] {e}")
+        return jsonify([])
+    for r in rows:
+        n = int(r["muestras"] or 0)
+        ok = int(r["verdes"] or 0) + int(r["amarillos"] or 0)
+        r["pct_operable"] = round(ok / n * 100, 1) if n else 0
+        r["pct_verde"]    = round(int(r["verdes"] or 0) / n * 100, 1) if n else 0
+    return jsonify(rows)
+
+
+@app.route("/api/inteligencia/farmers")
+def api_intel_farmers():
+    """RADAR DE FARMERS: anunciantes con MUCHAS ordenes chicas — los que ya
+    corren la misma campana de farming que nosotros. Ritmo y ticket salen de
+    fills_estimados (7d); del libro EN VIVO sale a que precio/posicion estan
+    parados ahora y su gap propio si estan publicados en ambos lados (dual).
+    Para copiarles la tactica: gap y posicion de los que ya ganaron la carrera."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT anunciante,
+                           SUM(ordenes)               AS ordenes_7d,
+                           ROUND(SUM(monto)::numeric) AS vol_7d,
+                           ROUND((SUM(monto) / NULLIF(SUM(ordenes), 0))::numeric) AS ticket_med,
+                           COUNT(DISTINCT DATE(ts))   AS dias_activo
+                    FROM fills_estimados
+                    WHERE exchange = 'binance' AND ts >= NOW() - INTERVAL '7 days'
+                      AND anunciante IS NOT NULL AND anunciante <> ''
+                    GROUP BY anunciante
+                    HAVING SUM(ordenes) >= 30
+                       AND (SUM(monto) / NULLIF(SUM(ordenes), 0)) <= 600
+                    ORDER BY SUM(ordenes) DESC
+                    LIMIT 15
+                """)
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[farmers] {e}")
+        return jsonify([])
+    with data_lock:
+        snap = dict(ultimo_estado)
+    # indice del libro vivo: en detalle_compra estan sus anuncios de VENTA
+    # (los que te venden USDT) y en detalle_venta sus anuncios de COMPRA
+    idx = {}
+    for key, lado in (("detalle_compra", "venta"), ("detalle_venta", "compra")):
+        for row in (snap.get(key) or []):
+            nom = (row.get("anunciante") or "").strip().lower()
+            if nom:
+                idx.setdefault(nom, {})[lado] = row
+    for r in rows:
+        info = idx.get((r["anunciante"] or "").strip().lower(), {})
+        v, cmp_ = info.get("venta"), info.get("compra")
+        r["pos_venta"]      = v.get("posicion")   if v else None
+        r["precio_venta"]   = v.get("precio")     if v else None
+        r["pos_compra"]     = cmp_.get("posicion") if cmp_ else None
+        r["precio_compra"]  = cmp_.get("precio")   if cmp_ else None
+        r["dual"] = bool(v and cmp_)
+        gap = None
+        if v and cmp_:
+            try:
+                pv, pc = float(v.get("precio") or 0), float(cmp_.get("precio") or 0)
+                if pv > 0 and pc > 0:
+                    gap = round((pv - pc) / pc * 100, 3)
+            except (ValueError, TypeError):
+                pass
+        r["gap_propio_pct"] = gap
+        r["ordenes_dia"] = round(float(r["ordenes_7d"] or 0) / 7.0, 1)
+    return jsonify(rows)
+
+
 @app.route("/api/bybit/estado")
 def api_bybit_estado():
     with data_lock:
@@ -5843,23 +6256,8 @@ def api_operativa():
     ratio    = round(usdt_min_30m / usdt_min_prom, 2) if usdt_min_prom else None
     presion  = round(stats["vol_60m_buy"] / stats["vol_60m"] * 100, 1) if stats["vol_60m"] else 50.0
 
-    # ── decision ──
-    if gan >= min_op and (ratio is None or ratio >= rot_dual):
-        decision, color = "OPERAR DUAL", "green"
-        razon = f"Spread neto {gan}% sobre tu minimo ({min_op}%)" + (f" y mercado rotando {ratio}x su promedio de 12h" if ratio else "")
-    elif gan >= min_op and ratio >= rot_lento:
-        decision, color = "OPERAR DUAL (paciente)", "yellow"
-        razon = f"Spread neto {gan}% es operable, pero la rotacion esta en {ratio}x del promedio (umbral dual: {rot_dual}x): los fills tardaran mas de lo habitual"
-    elif gan >= min_op:
-        decision, color = "SOLO PIERNA CON FLUJO", "orange"
-        razon = f"Spread neto {gan}% pero mercado lento ({ratio}x): no bloquees capital en dual; opera solo el lado que la presion favorece"
-    elif ratio is not None and ratio >= rot_dual and abs(presion - 50) >= sesgo_min:
-        lado = "VENTA" if presion > 50 else "COMPRA"
-        decision, color = f"SOLO {lado}", "orange"
-        razon = f"Spread neto {gan}% bajo tu minimo, pero el flujo esta {ratio}x acelerado y {presion}% cargado a la compra: una sola pierna del lado con demanda puede pagar"
-    else:
-        decision, color = "ESPERAR", "red"
-        razon = f"Spread neto {gan}% bajo tu minimo ({min_op}%)" + (f" y rotacion {ratio}x" if ratio else "") + " — mejor conservar el capital para la proxima ventana"
+    # ── decision (arbol unificado en decidir_operativa) ──
+    decision, color, razon = decidir_operativa(gan, min_op, ratio, presion, rot_lento, rot_dual, sesgo_min)
 
     # ── precios asimetricos por presion ──
     # presion alta compradora -> tu anuncio de VENTA se llena solo: tomale mas
@@ -5890,7 +6288,7 @@ def api_operativa():
             "nota": "min cubre el p25 del ticket real (farming de ordenes); max en el p90 o tu capital, lo que sea menor",
         }
 
-    # ── proyeccion por capital ──
+    # ── proyeccion por capital (TECHO teorico; queda como referencia chica) ──
     flujo_h = round(usdt_min_30m * 60)
     escenarios = []
     for cap_pct in (5, 10, 20):
@@ -5900,6 +6298,41 @@ def api_operativa():
             "usdt_h": round(capturado),
             "giros_h": round(capturado / capital, 2) if capital else None,
             "ganancia_h_clp": round(capturado * gan / 100 * mid) if mid and gan > 0 else 0,
+        })
+
+    # ── proyeccion REALISTA (COL12): el numero principal ──
+    # Dos limites reales que el techo teorico ignoraba:
+    #  1. captura: sin verificar competis por ~2% del flujo, no 10%.
+    #  2. tiempo: a mano no se atienden mas de ORDENES_H_MAX ordenes/hora
+    #     (el techo teorico daba ~29 giros/h, fisicamente imposible).
+    # Escenario "hoy" usa la comision vigente; "verificado" la Bronce (0,32% RT,
+    # NO 0,20%: el 50% de descuento es nivel Oro, 60 BTC/mes).
+    bruto_pct    = gan + com_total                     # spread bruto ponderado actual
+    ticket_ref   = stats["p50"] or float(c.get("FILL_TICKET_DEF", 272))
+    ordenes_max  = max(1, int(c.get("ORDENES_H_MAX", 8)))
+    tope_manual  = ordenes_max * ticket_ref            # USDT/h atendibles a mano
+    com_verif_rt = float(c.get("COMISION_BN_VERIF", 0.0016)) * 2 * 100
+    esc_real = []
+    for nombre, com_rt, cap_pct in (
+        ("hoy",        com_total,    float(c.get("CAPTURA_REALISTA_PCT", 2.0))),
+        ("verificado", com_verif_rt, float(c.get("CAPTURA_VERIF_PCT", 3.0))),
+    ):
+        neto_pct  = round(bruto_pct - com_rt, 4)
+        capturado = flujo_h * cap_pct / 100
+        usdt_h    = min(capturado, tope_manual)
+        # clp_h puede ser NEGATIVO (en farming aceptas perder unos pesos por
+        # las ordenes): se muestra tal cual, es el costo real de la campana.
+        clp_h = round(usdt_h * neto_pct / 100 * mid) if mid else None
+        esc_real.append({
+            "nombre": nombre,
+            "comision_rt_pct": round(com_rt, 4),
+            "captura_pct": cap_pct,
+            "neto_pct": neto_pct,
+            "usdt_h": round(usdt_h),
+            "giros_h": round(usdt_h / capital, 1) if capital else None,
+            "ordenes_h": round(usdt_h / ticket_ref, 1) if ticket_ref else None,
+            "clp_h": clp_h,
+            "limitado_por": "tiempo" if capturado > tope_manual else "captura",
         })
 
     # ── vacios de liquidez: competidores por agotarse ──
@@ -5914,6 +6347,7 @@ def api_operativa():
                     vacios.append({
                         "tipo": lado, "anunciante": row.get("anunciante"),
                         "posicion": row.get("posicion"),
+                        "precio": row.get("precio"),
                         "disponible": round(disp),
                         "velocidad_usdt_min": vel,
                         "min_restantes": round(mins, 1),
@@ -5944,9 +6378,120 @@ def api_operativa():
             "capital_usdt": capital,
             "ganancia_por_giro_clp": round(capital * gan / 100 * mid) if mid and gan > 0 else 0,
             "escenarios_captura": escenarios,
-            "nota": "estimacion: ganancia = flujo capturado x spread neto; asume reciclado continuo del capital",
+            "nota": "TECHO teorico (referencia): asume capturar 5-20% del flujo con reciclado continuo e ilimitado del capital",
+        },
+        "proyeccion_realista": {
+            "capital_usdt": capital,
+            "ticket_ref_usdt": round(ticket_ref),
+            "ordenes_h_max": ordenes_max,
+            "tope_manual_usdt_h": round(tope_manual),
+            "spread_bruto_pct": round(bruto_pct, 4),
+            "escenarios": esc_real,
+            "nota": "numero principal: captura realista (~2% sin verificar) + tope de ordenes/hora atendibles a mano. 'verificado' = Bronce 0,32% RT y algo mas de captura. clp_h negativo = costo de farmear a ese spread.",
         },
         "vacios_liquidez": vacios,
+    })
+
+
+@app.route("/api/mi_posicion")
+def api_mi_posicion():
+    """MI POSICION + carrera al verificado. Usa datos que el colector YA junta:
+    - mis anuncios en el top-80 (posicion, precio, stock) desde ultimo_estado;
+    - mis ordenes 30d desde 'completadas' (= monthOrderCount oficial de Binance);
+    - mi volumen estimado desde fills_estimados (filtrado por mi nickname).
+    OJO semantica: mi anuncio de VENTA aparece en el tab Compra del libro
+    (tradeType BUY) y mi anuncio de COMPRA en el tab Venta (tradeType SELL)."""
+    with config_lock:
+        nick    = str(config.get("MI_NICKNAME") or "").strip()
+        pos_obj = max(1, int(config.get("MI_POSICION_OBJETIVO", 15) or 15))
+    if not nick:
+        return jsonify({"configurado": False,
+                        "nota": "defini tu nickname en el panel Estrategia para activar el seguimiento"})
+    with data_lock:
+        snap = dict(ultimo_estado)
+    anuncios = []
+    for key, rol, tab in (("detalle_compra", "VENDO USDT", "Compra"),
+                          ("detalle_venta",  "COMPRO USDT", "Venta")):
+        detalle = snap.get(key) or []
+        mio = next((r for r in detalle
+                    if (r.get("anunciante") or "").strip().lower() == nick.lower()), None)
+        if not mio:
+            anuncios.append({"rol": rol, "tab": tab, "publicado": False})
+            continue
+        pos = int(mio.get("posicion") or 0)
+        sugerido = None
+        if pos > pos_obj and len(detalle) >= pos_obj:
+            p_ref = float(detalle[pos_obj - 1].get("precio") or 0)
+            if p_ref > 0:
+                # tab Compra ordena ascendente (mejorar = bajar precio);
+                # tab Venta ordena descendente (mejorar = subir precio)
+                sugerido = round(p_ref - 0.01, 2) if key == "detalle_compra" else round(p_ref + 0.01, 2)
+        anuncios.append({
+            "rol": rol, "tab": tab, "publicado": True,
+            "posicion": pos,
+            "precio": mio.get("precio"),
+            "disponible": round(float(mio.get("disponible") or 0)),
+            "en_objetivo": bool(pos and pos <= pos_obj),
+            "posicion_objetivo": pos_obj,
+            "precio_sugerido": sugerido,
+        })
+    prog = {"ordenes_30d": None, "ordenes_hace_7d": None, "vol_30d_estimado": 0,
+            "vol_7d_estimado": 0, "fills_detectados_30d": 0}
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT MAX(completadas) AS o
+                    FROM snapshots_detalle
+                    WHERE LOWER(anunciante) = LOWER(%(n)s)
+                      AND snapshot_timestamp >= NOW() - INTERVAL '24 hours'
+                """, {"n": nick})
+                r = cur.fetchone()
+                if r and r["o"] is not None:
+                    prog["ordenes_30d"] = int(r["o"])
+                cur.execute("""
+                    SELECT MAX(completadas) AS o
+                    FROM snapshots_detalle
+                    WHERE LOWER(anunciante) = LOWER(%(n)s)
+                      AND snapshot_timestamp BETWEEN NOW() - INTERVAL '8 days'
+                                                 AND NOW() - INTERVAL '6 days'
+                """, {"n": nick})
+                r = cur.fetchone()
+                if r and r["o"] is not None:
+                    prog["ordenes_hace_7d"] = int(r["o"])
+                cur.execute("""
+                    SELECT COALESCE(SUM(monto)   FILTER (WHERE ts >= NOW() - INTERVAL '30 days'), 0) AS v30,
+                           COALESCE(SUM(monto)   FILTER (WHERE ts >= NOW() - INTERVAL '7 days'), 0)  AS v7,
+                           COALESCE(SUM(ordenes) FILTER (WHERE ts >= NOW() - INTERVAL '30 days'), 0) AS f30
+                    FROM fills_estimados
+                    WHERE exchange = 'binance' AND LOWER(anunciante) = LOWER(%(n)s)
+                """, {"n": nick})
+                r = cur.fetchone()
+                prog["vol_30d_estimado"] = round(float(r["v30"] or 0))
+                prog["vol_7d_estimado"]  = round(float(r["v7"] or 0))
+                prog["fills_detectados_30d"] = int(r["f30"] or 0)
+    except Exception as e:
+        print(f"[mi_posicion] {e}")
+    meta_min, meta_comoda, meta_ord = 32000, 64000, 300
+    v30 = prog["vol_30d_estimado"]
+    o30 = prog["ordenes_30d"]
+    return jsonify({
+        "configurado": True, "nick": nick,
+        "en_libro": any(a.get("publicado") for a in anuncios),
+        "anuncios": anuncios,
+        "progreso": {
+            **prog,
+            "ordenes_meta": meta_ord,
+            "ordenes_pct": round(o30 / meta_ord * 100, 1) if o30 else None,
+            "ordenes_ganadas_7d": (o30 - prog["ordenes_hace_7d"])
+                                  if (o30 is not None and prog["ordenes_hace_7d"] is not None) else None,
+            "meta_minima_usdt": meta_min, "meta_comoda_usdt": meta_comoda,
+            "vol_pct_minima": round(v30 / meta_min * 100, 1) if v30 else 0,
+            "vol_pct_comoda": round(v30 / meta_comoda * 100, 1) if v30 else 0,
+        },
+        "nota": ("ordenes_30d = contador oficial de Binance (30d moviles, aparece cuando estas en el top-80). "
+                 "volumen = estimacion del monitor por fills detectados; validalo contra la pagina de Merchant. "
+                 "metas: 0,5 BTC ~ 32.000 USDT (minimo real) / 1 BTC ~ 64.000 (comodo) + 300 ordenes."),
     })
 
 
@@ -5990,48 +6535,28 @@ def api_count():
 def api_config():
     global config
     if request.method == "POST":
+        if not _token_ok():
+            return jsonify({"ok": False, "error": "token requerido o invalido"}), 401
         data = request.get_json() or {}
-        type_map = {
-            "FILTRO_MIN_USDT":      float,
-            "FILTRO_MIN_ORD":       int,
-            "FILTRO_MIN_TASA":      float,
-            "INTERVALO_MIN":        int,
-            "COMISION_BN":          float,
-            "SPREAD_MIN_OPERATIVO": float,
-            "ALERTA_SPREAD":        float,
-            "SPREAD_MINIMO":        float,
-            "FILL_VENTANA_MIN":     float,
-            "FILL_CAP_USDT":        float,
-            "FILL_TICKET_DEF":      float,
-            "FILL_TICKET_DEF_BYBIT": float,
-            "CAPITAL_OPERATIVO":    float,
-            "UMBRAL_ROT_LENTO":     float,
-            "UMBRAL_ROT_DUAL":      float,
-            "UMBRAL_PRESION_SESGO": float,
-            "GAP_OBJETIVO_BRUTO":   float,
-        }
-        errores = {}
+        errores, aplicados = {}, {}
         with config_lock:
-            for k, cast in type_map.items():
+            for k, cast in CONFIG_TYPE_MAP.items():
                 if k in data:
                     try:
                         config[k] = cast(data[k])
+                        aplicados[k] = config[k]
                     except (ValueError, TypeError):
                         errores[k] = "valor invalido"
+        guardar_config_db(aplicados)   # persiste: sobrevive reinicios de Railway
         if errores:
             return jsonify({"ok": False, "errores": errores}), 400
         return jsonify({"ok": True})
     with config_lock:
         return jsonify(dict(config))
 
-
-@app.route("/api/reset", methods=["POST"])
-def api_reset():
-    try:
-        reset_db()
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# NOTA: /api/reset (drop de snapshots) se ELIMINO en COL11: era destructivo,
+# estaba abierto a cualquiera que conociera la URL y no se usaba desde la UI.
+# Para liberar disco esta /api/mantenimiento/vaciar (conserva 24h y precios).
 
 
 @app.route("/api/export/detalle")
@@ -6155,29 +6680,43 @@ def api_export_todo():
 def api_vaciar_listas():
     """Vacia las listas top-80 conservando las ultimas 24h (para el solape).
     Corre EN SEGUNDO PLANO para no colgar la peticion (el colector sigue vivo).
-    NO toca snapshots (precios), fills_estimados ni operativa_historial."""
+    NO toca snapshots (precios), fills_estimados ni operativa_historial.
+    FIX COL11: la version COL9/COL10 llamaba get_conn() sin 'with' (es un
+    contextmanager) -> AttributeError silencioso en el worker: respondia ok
+    pero NO vaciaba nada. Ahora usa el pool correctamente."""
+    if not _token_ok():
+        return jsonify({"ok": False, "error": "token requerido o invalido"}), 401
     def _worker():
         horas = 24
         try:
-            conn = get_conn(); conn.autocommit = True
-            cur = conn.cursor()
-            try: cur.execute("SET lock_timeout = '25s'")
-            except Exception: pass
-            for t in ("snapshots_detalle", "snapshots_detalle_bybit"):
-                try:
-                    cur.execute(f"SELECT to_regclass('public.{t}')")
-                    if cur.fetchone()[0] is None:
-                        continue
-                    cur.execute("DROP TABLE IF EXISTS _keep_tmp")
-                    cur.execute(f"CREATE TEMP TABLE _keep_tmp AS SELECT * FROM {t} "
-                                f"WHERE snapshot_timestamp >= NOW() - INTERVAL '{horas} hours'")
-                    cur.execute(f"TRUNCATE TABLE {t}")
-                    cur.execute(f"INSERT INTO {t} SELECT * FROM _keep_tmp")
-                    cur.execute("DROP TABLE _keep_tmp")
-                    print(f"[VACIAR] {t}: OK (conservadas 24h)")
-                except Exception as e:
-                    print(f"[VACIAR {t}] {e}")
-            conn.close()
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute("SET lock_timeout = '25s'")
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                    for t in ("snapshots_detalle", "snapshots_detalle_bybit"):
+                        try:
+                            cur.execute(f"SELECT to_regclass('public.{t}')")
+                            if cur.fetchone()[0] is None:
+                                continue
+                            cur.execute("DROP TABLE IF EXISTS _keep_tmp")
+                            cur.execute(f"CREATE TEMP TABLE _keep_tmp AS SELECT * FROM {t} "
+                                        f"WHERE snapshot_timestamp >= NOW() - INTERVAL '{horas} hours'")
+                            cur.execute(f"TRUNCATE TABLE {t}")
+                            cur.execute(f"INSERT INTO {t} SELECT * FROM _keep_tmp")
+                            cur.execute("DROP TABLE _keep_tmp")
+                            conn.commit()
+                            print(f"[VACIAR] {t}: OK (conservadas 24h)")
+                        except Exception as e:
+                            conn.rollback()
+                            print(f"[VACIAR {t}] {e}")
+                    try:
+                        cur.execute("SET lock_timeout = DEFAULT")
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
         except Exception as e:
             print(f"[VACIAR] {e}")
     threading.Thread(target=_worker, daemon=True).start()
@@ -6187,15 +6726,16 @@ def api_vaciar_listas():
 # ──────────────────────────────────────────────
 #  INICIO
 # ──────────────────────────────────────────────
-if __name__ == "__main__":
+def _boot():
     init_pool()
     init_db()
+    cargar_config_db()   # restaura el preset/config guardado (sobrevive reinicios)
     threading.Thread(target=ciclo_colector, daemon=True).start()
     threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
+
+if __name__ == "__main__":
+    _boot()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 else:
-    init_pool()
-    init_db()
-    threading.Thread(target=ciclo_colector, daemon=True).start()
-    threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
+    _boot()
