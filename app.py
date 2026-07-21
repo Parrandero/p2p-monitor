@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL19"
+VERSION       = "COL20"
 VERSION_FECHA = "2026-07-20"
 
 config = {
@@ -1057,6 +1057,13 @@ class FillTracker:
         seguros = []       # fills confirmados por evidencia real (stock/pendientes)
         masc_cand = []     # candidatos a enmascarado, se resuelven en el paso 2
         ordenes_por_stock = {}   # nombre -> ordenes explicadas por evidencia real (cuenta)
+        # PRESUPUESTO DE ORDENES POR CUENTA (fix COL20). El contador es por
+        # cuenta: si el anunciante opera en los dos lados, AMBOS ven el mismo
+        # d_comp y cada uno atribuia esas ordenes -> se contaban dos veces.
+        # Medido antes del fix: 73.340 ordenes contadas contra 49.162 reales
+        # (149%). Ahora el delta de la cuenta es un presupuesto que los lados
+        # CONSUMEN, no un numero que cada uno copia.
+        presupuesto = {}
 
         # ── Paso 1: stock + pendientes por (anunciante, lado) ──
         for tipo in ("BUY", "SELL"):
@@ -1082,6 +1089,12 @@ class FillTracker:
                 if gap_min > 10:
                     st.update({"disp": disp, "comp": comp, "ts": now_dt, "pend": []})
                     continue
+                # el delta pertenece a la CUENTA, no a este anuncio: se toma del
+                # presupuesto comun para no contarlo dos veces en cuentas duales
+                if nombre not in presupuesto:
+                    presupuesto[nombre] = d_comp
+                d_comp_cuenta = d_comp          # lo que subio el contador de la cuenta
+                d_comp = min(d_comp, presupuesto[nombre])
                 nivel_previo = st["disp"]
                 # reversion: si el stock recupero el nivel previo de un pendiente,
                 # fue cancelacion/edicion -> descartar ese pendiente
@@ -1119,11 +1132,18 @@ class FillTracker:
                         # (se decide en el paso 2 mirando el otro lado de la cuenta)
                         masc_cand.append({"key": key, "nombre": nombre, "tipo": tipo,
                                           "precio": precio, "resid": resid, "st": st})
+                elif d_comp_cuenta > 0 and d_disp > 1:
+                    # El contador de la cuenta SI subio, pero las ordenes ya se
+                    # atribuyeron al otro lado. Esta caida de stock es real: se
+                    # cuenta su VOLUMEN con ordenes=0, para no duplicar el conteo
+                    # pero tampoco perder plata que efectivamente se movio.
+                    monto, metodo, ordenes_expl = min(d_disp, cap), "directo", 0
                 elif d_disp > 1:
                     st["pend"].append({"monto": min(d_disp, cap),
                                        "nivel_previo": nivel_previo, "ts": now_dt})
                 if monto > 0 and metodo:
                     ordenes_por_stock[nombre] = ordenes_por_stock.get(nombre, 0) + ordenes_expl
+                    presupuesto[nombre] = max(0, presupuesto[nombre] - ordenes_expl)
                     seguros.append({"key": key, "tipo": tipo, "nombre": nombre,
                                     "monto": monto, "ordenes": ordenes_expl,
                                     "metodo": metodo, "precio": precio})
@@ -4321,6 +4341,104 @@ function PrecioChart() {
 }
 
 /* ─────────── INTELIGENCIA DE MERCADO ─────────── */
+function BaseCompetidores({ onElegir }) {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  const [orden, setOrden] = React.useState({ col: "ordenes_dia", desc: true });
+  const [q, setQ] = React.useState("");
+  const [soloMerchant, setSoloMerchant] = React.useState(false);
+  const [soloDual, setSoloDual] = React.useState(false);
+  const [soloLibro, setSoloLibro] = React.useState(false);
+  React.useEffect(() => {
+    let stop = false;
+    fetch(B + "/api/competidores").then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => {});
+    return () => { stop = true; };
+  }, []);
+  if (!d) return <div className="intel-loading">Cargando base de competidores…</div>;
+  const fN = (v) => v == null ? "—" : Number(v).toLocaleString("es-CL");
+
+  // COLS: [clave, etiqueta, ayuda, formateador]
+  const COLS = [
+    ["anunciante", "Anunciante", "Nickname en Binance P2P. ✦ = merchant verificado.", null],
+    ["ordenes_dia", "Órd/día", "Órdenes completadas por día. Sale del contador OFICIAL de Binance: es el dato más confiable de la tabla.", fN],
+    ["volumen_dia", "Vol/día", "USDT movidos por día. Se calcula como órdenes oficiales × ticket observado, porque el conteo directo se pierde las operaciones de quien recarga el stock al instante.", fN],
+    ["ticket", "Ticket", "Tamaño típico de sus órdenes en USDT. Estimado.", fN],
+    ["capital", "Capital", "USDT que tiene publicados en el libro (suma de ambos lados).", fN],
+    ["giros_dia", "Giros/día", "Cuántas veces rota su capital por día = volumen diario ÷ capital. Mide qué tan intensamente lo trabaja.", (v) => v == null ? "—" : v],
+    ["pos_media", "Pos. media", "Posición promedio en el libro. 1 = mejor precio.", (v) => v == null ? "—" : "#" + v],
+    ["cobertura_h", "Cobertura", "En cuántas horas distintas del día apareció publicado. 24 = siempre presente.", (v) => v + "h"],
+    ["deteccion_pct", "Detección", "Qué porcentaje de su volumen alcanzamos a ver directamente. Bajo (<30%) significa que recarga el stock al instante y se nos escapa: ahí el Vol/día es más incierto. Alto (>80%) = muy confiable.", (v) => v == null ? "—" : v + "%"],
+    ["gap_propio", "Gap propio", "Su margen bruto AHORA: diferencia entre su precio de venta y el de compra. Sólo se puede calcular si está publicado en ambos lados en este momento.", (v) => v == null ? "—" : v + "%"],
+    ["ganancia_mes_est", "Gan/mes est.", "Estimación gruesa: volumen × su gap actual − comisión. Asume que sostiene ese gap todo el mes, así que es optimista.", fN],
+  ];
+
+  let filas = (d.filas || []).filter(r =>
+    (!q || r.anunciante.toLowerCase().indexOf(q.toLowerCase()) >= 0) &&
+    (!soloMerchant || r.merchant) && (!soloDual || r.dual_ahora) && (!soloLibro || r.en_libro));
+  filas = filas.slice().sort((a, b) => {
+    const va = a[orden.col], vb = b[orden.col];
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    if (typeof va === "string") return orden.desc ? vb.localeCompare(va) : va.localeCompare(vb);
+    return orden.desc ? vb - va : va - vb;
+  });
+  const clic = (c) => setOrden(o => o.col === c ? { col: c, desc: !o.desc } : { col: c, desc: true });
+  const chip = (activo, set, txt) => (
+    <button onClick={() => set(v => !v)} className={"pr-btn" + (activo ? " on" : "")}>{txt}</button>
+  );
+
+  return (
+    <section className="chart-card">
+      <div className="card-head">
+        <h3>Base de competidores</h3>
+        <span className="card-sub">{d.total} anunciantes · últimos {d.dias} días · clic en cualquier columna para ordenar</span>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="Buscar por nombre…"
+          style={{ background: "var(--bg-2)", border: "1px solid var(--line)", color: "var(--text)",
+                   padding: "7px 11px", borderRadius: 9, fontFamily: "var(--mono)", fontSize: 12.5, minWidth: 190 }} />
+        {chip(soloMerchant, setSoloMerchant, "✦ solo verificados")}
+        {chip(soloDual, setSoloDual, "solo duales ahora")}
+        {chip(soloLibro, setSoloLibro, "solo en el libro ahora")}
+        <span style={{ fontSize: 11.5, color: "var(--text-3)", marginLeft: "auto" }}>{filas.length} resultados</span>
+      </div>
+      <div className="intel-scroll" style={{ maxHeight: 460, overflowY: "auto" }}>
+        <table className="intel-table">
+          <thead><tr>{COLS.map(([c, lbl, ayuda]) => (
+            <th key={c} title={ayuda} onClick={() => clic(c)}
+              style={{ cursor: "pointer", whiteSpace: "nowrap", userSelect: "none",
+                       color: orden.col === c ? "var(--accent)" : undefined,
+                       position: "sticky", top: 0, background: "var(--bg-1)" }}>
+              {lbl}{orden.col === c ? (orden.desc ? " ▼" : " ▲") : ""}
+            </th>
+          ))}</tr></thead>
+          <tbody>{filas.map(r => (
+            <tr key={r.anunciante} onClick={() => onElegir && onElegir(r.anunciante)}
+              style={{ cursor: onElegir ? "pointer" : "default" }}
+              title={onElegir ? "Ver ficha completa de " + r.anunciante : undefined}>
+              {COLS.map(([c, lbl, ayuda, fmt], i) => (
+                <td key={c} className={i ? "tnum" : undefined}
+                  style={i === 0 ? { fontWeight: 600, whiteSpace: "nowrap" } : undefined}>
+                  {i === 0
+                    ? <>{r.merchant && <span className="merch">✦ </span>}{r.anunciante}
+                        {r.dual_ahora && <span style={{ fontSize: 9, color: "var(--buy)" }}> dual</span>}</>
+                    : (fmt ? fmt(r[c]) : r[c])}
+                </td>
+              ))}
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+      <div className="intel-explain">
+        <b>Cuánto confiar en cada columna:</b> <b>Órd/día</b> sale del contador oficial de Binance — es dato duro. <b>Capital, posición y cobertura</b> se observan directo del libro. <b>Ticket</b> es estimado, y <b>Vol/día</b> se calcula como órdenes × ticket (el conteo directo subestima mucho a quienes recargan al instante). <b>Gap propio y Gan/mes</b> sólo aparecen si el anunciante está publicado en ambos lados ahora mismo, y la ganancia asume que sostiene ese gap todo el mes (optimista).<br/>
+        <b>Cómo usarla:</b> ordená por <b>Giros/día</b> para encontrar a los que exprimen poco capital (el modelo más parecido al tuyo), o por <b>Gap propio</b> entre los duales para ver qué margen está pagando el mercado hoy. Clic en una fila abre su ficha completa.
+      </div>
+    </section>
+  );
+}
+
 function PerfilHoras() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [d, setD] = React.useState(null);
@@ -4382,12 +4500,14 @@ function PerfilHoras() {
   );
 }
 
-function FichaAnunciante() {
+function FichaAnunciante({ inicial }) {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [q, setQ] = React.useState("");
   const [lista, setLista] = React.useState(null);
-  const [sel, setSel] = React.useState(null);
+  const [sel, setSel] = React.useState(inicial || null);
   const [ficha, setFicha] = React.useState(null);
+  // si llega uno elegido desde la Base de competidores, abrirlo
+  React.useEffect(() => { if (inicial) setSel(inicial); }, [inicial]);
   React.useEffect(() => {
     let stop = false;
     fetch(B + "/api/anunciante?q=" + encodeURIComponent(q)).then(r => r.json())
@@ -4628,6 +4748,7 @@ function Inteligencia() {
   const [curva, setCurva] = vS(null);
   const [loading, setLoading] = vS(true);
   const [seccion, setSeccion] = vS("perfilhoras");
+  const [fichaSel, setFichaSel] = vS(null);   // anunciante elegido desde la base
 
   vE(() => {
     setLoading(true);
@@ -4665,7 +4786,7 @@ function Inteligencia() {
   const GRUPOS = [
     ["CUÁNDO",        [["perfilhoras","🕐 Perfil por hora"]]],
     ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"]]],
-    ["CONTRA QUIÉN",  [["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"]]],
+    ["CONTRA QUIÉN",  [["basecomp","🗂️ Base de competidores"],["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"]]],
   ];
 
   if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
@@ -4685,8 +4806,9 @@ function Inteligencia() {
       </div>
 
       {seccion==="cruzar" && <CruzarOEsperar />}
-      {seccion==="ficha" && <FichaAnunciante />}
+      {seccion==="ficha" && <FichaAnunciante inicial={fichaSel} />}
       {seccion==="perfilhoras" && <PerfilHoras />}
+      {seccion==="basecomp" && <BaseCompetidores onElegir={(n) => { setFichaSel(n); setSeccion("ficha"); }} />}
 
       {seccion==="horario" && horario && (
         <section className="chart-card">
@@ -6904,6 +7026,144 @@ def api_plan_hoy():
         "acciones": acciones,
         "nota": "indice 0-100: que tan buena es la hora para farmear (spread x flujo, medido). "
                 "100 = la mejor hora del dia.",
+    })
+
+
+@app.route("/api/competidores")
+def api_competidores():
+    """BASE DE COMPETIDORES: una fila por anunciante con todo lo observable,
+    para ordenar y filtrar por cualquier caracteristica.
+
+    Cada columna dice de donde sale, porque la confianza es distinta:
+      - ordenes/dia  -> contador OFICIAL de Binance (dato duro, no estimacion)
+      - volumen/ticket -> estimado por el tracker (solo fills 'directo')
+      - capital, posicion, cobertura -> observado del libro
+      - dual y gap propio -> del libro EN VIVO (ahora mismo)
+    Params: ?dias=7 (ventana de analisis)"""
+    try:
+        dias = max(2, min(14, int(request.args.get("dias", 7))))
+    except (ValueError, TypeError):
+        dias = 7
+    filas = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL statement_timeout = '60s'")
+                cur.execute("""
+                    WITH d AS (
+                        SELECT anunciante, tipo,
+                               COUNT(*) apar,
+                               AVG(posicion) pos,
+                               AVG(disponible) stock,
+                               BOOL_OR(es_merchant) merch,
+                               MAX(completadas) - MIN(completadas) ord_per,
+                               COUNT(DISTINCT snapshot_timestamp::date) dias,
+                               COUNT(DISTINCT EXTRACT(HOUR FROM snapshot_timestamp)) horas
+                        FROM snapshots_detalle
+                        WHERE snapshot_timestamp >= NOW() - (%(d)s || ' days')::INTERVAL
+                          AND anunciante IS NOT NULL AND anunciante <> ''
+                        GROUP BY 1,2
+                    ), a AS (
+                        -- OJO: ord_per sale del contador POR CUENTA, los dos lados
+                        -- traen el mismo numero -> MAX, nunca SUM.
+                        SELECT anunciante, MAX(ord_per) ordenes, COUNT(*) lados,
+                               SUM(stock) capital, AVG(pos) pos_media, MIN(pos) pos_mejor,
+                               BOOL_OR(merch) merch, MAX(dias) dias, MAX(horas) horas
+                        FROM d GROUP BY 1
+                    ), f AS (
+                        -- volumen: TODOS los metodos (v2 completo). El ticket en
+                        -- cambio solo de 'directo', que es tamano observado y no
+                        -- estimado (si no, se realimentaria el propio supuesto).
+                        SELECT anunciante,
+                               SUM(monto) vol,
+                               SUM(monto) FILTER (WHERE metodo='directo') vol_obs,
+                               AVG(monto / NULLIF(ordenes,0)) FILTER (WHERE metodo='directo') ticket
+                        FROM fills_estimados
+                        WHERE exchange='binance'
+                          AND ts >= NOW() - (%(d)s || ' days')::INTERVAL
+                        GROUP BY 1
+                    )
+                    SELECT a.*, f.vol, f.vol_obs, f.ticket
+                    FROM a LEFT JOIN f ON f.anunciante = a.anunciante
+                    WHERE a.dias >= 2
+                    ORDER BY a.ordenes DESC NULLS LAST
+                    LIMIT 400
+                """, {"d": dias})
+                crudo = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[competidores] {e}")
+        return jsonify({"filas": [], "error": str(e)[:200]})
+
+    # estado EN VIVO: quien esta publicado ahora y con que gap propio
+    with data_lock:
+        snap = dict(ultimo_estado)
+    vivo = {}
+    for key, lado in (("detalle_compra", "venta"), ("detalle_venta", "compra")):
+        for row in (snap.get(key) or []):
+            n = (row.get("anunciante") or "").strip().lower()
+            if n:
+                vivo.setdefault(n, {})[lado] = row
+
+    with config_lock:
+        com_maker = float(config.get("COM_MAKER_PCT", 0.20))
+    for r in crudo:
+        nom = (r["anunciante"] or "").strip()
+        dias_obs = max(1, int(r["dias"] or 1))
+        ordenes = float(r["ordenes"] or 0)
+        vol = float(r["vol"] or 0)
+        cap = float(r["capital"] or 0)
+        v = vivo.get(nom.lower(), {})
+        gap = None
+        if "venta" in v and "compra" in v:
+            try:
+                pv, pc = float(v["venta"]["precio"]), float(v["compra"]["precio"])
+                if pv > 0 and pc > 0:
+                    gap = round((pv - pc) / pc * 100, 3)
+            except (ValueError, TypeError):
+                pass
+        vol_dia = vol / dias_obs                      # v2 completo (todos los metodos)
+        vol_obs_dia = float(r["vol_obs"] or 0) / dias_obs   # solo lo visto directo
+        ord_dia = ordenes / dias_obs
+        tk = float(r["ticket"]) if r["ticket"] else None
+        # Dos estimaciones del volumen, cada una con su debilidad:
+        #  - v2 (vol_dia): suma lo que el tracker registro, incluyendo lo que
+        #    estimo cuando el anunciante recargo al instante.
+        #  - implicito: ordenes OFICIALES x ticket observado.
+        # Medido sobre 12 anunciantes grandes: v2 da el 90% del implicito en
+        # agregado, pero por anunciante va del 7% al 187%. Se toma el promedio
+        # de ambas cuando hay las dos, que es mas estable que cualquiera sola.
+        vol_impl = (ord_dia * tk) if (tk and ord_dia) else None
+        if vol_impl and vol_dia:
+            vol_ref = (vol_impl + vol_dia) / 2
+        else:
+            vol_ref = vol_impl or vol_dia
+        filas.append({
+            "anunciante": nom,
+            "merchant": bool(r["merch"]),
+            "ordenes_dia": round(ord_dia, 1),
+            "volumen_dia": round(vol_ref) if vol_ref else 0,
+            "volumen_observado": round(vol_obs_dia),
+            # cuanto del volumen se VIO directamente (vs se estimo): indicador
+            # de confianza de la fila, no un error
+            "deteccion_pct": round(vol_obs_dia / vol_ref * 100) if (vol_ref and vol_ref > 0) else None,
+            "ticket": round(tk) if tk else None,
+            "capital": round(cap),
+            "pos_media": round(float(r["pos_media"]), 1) if r["pos_media"] else None,
+            "pos_mejor": round(float(r["pos_mejor"])) if r["pos_mejor"] else None,
+            "cobertura_h": int(r["horas"] or 0),
+            "lados": int(r["lados"] or 0),
+            "giros_dia": round(vol_ref / cap, 1) if (cap > 0 and vol_ref) else None,
+            "en_libro": bool(v),
+            "dual_ahora": len(v) == 2,
+            "gap_propio": gap,
+            # ganancia bruta estimada: solo si sabemos su gap (esta dual ahora)
+            "ganancia_mes_est": round(vol_ref * 30 * (gap - com_maker * 2) / 100) if (gap and vol_ref) else None,
+        })
+    return jsonify({
+        "dias": dias, "filas": filas, "total": len(filas),
+        "nota": ("ordenes_dia sale del contador oficial de Binance. volumen y ticket son "
+                 "estimados por el tracker (solo fills observados). gap y dual son del libro "
+                 "EN VIVO, por eso solo aparecen si el anunciante esta publicado ahora."),
     })
 
 
