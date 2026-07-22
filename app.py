@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL20"
-VERSION_FECHA = "2026-07-20"
+VERSION       = "COL21"
+VERSION_FECHA = "2026-07-22"
 
 config = {
     "MONEDA":               "USDT",
@@ -6302,11 +6302,25 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 </html>"""
 
 # ──────────────────────────────────────────────
+#  DASHBOARD BETA (COL21) — copia de trabajo para el rediseño.
+#  Arranca IDENTICA a DASHBOARD a proposito: la ruta /beta se prueba primero
+#  sin ningun cambio visual, y el rediseño se va editando SOLO aca adentro.
+#  La ruta "/" y la variable DASHBOARD de arriba no se tocan.
+# ──────────────────────────────────────────────
+DASHBOARD_BETA = DASHBOARD
+
+# ──────────────────────────────────────────────
 #  RUTAS
 # ──────────────────────────────────────────────
 @app.route("/")
 def index():
     html = DASHBOARD.replace("{{VERSION}}", f"{VERSION} · {VERSION_FECHA}")
+    return Response(html, mimetype='text/html')
+
+@app.route("/beta")
+def index_beta():
+    """Version beta del dashboard, para probar el rediseno sin afectar '/'."""
+    html = DASHBOARD_BETA.replace("{{VERSION}}", f"{VERSION} · {VERSION_FECHA}")
     return Response(html, mimetype='text/html')
 
 @app.route("/api/version")
