@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL22"
-VERSION_FECHA = "2026-07-23"
+VERSION       = "COL23"
+VERSION_FECHA = "2026-07-24"
 
 config = {
     "MONEDA":               "USDT",
@@ -2671,6 +2671,9 @@ window.P2P_AUTH = {
       "precio_maker_vender", "precio_maker_comprar", "ganancia_neta_pct",
     ].forEach((k) => { if (s[k] != null) s[k] = num(s[k]); });
     if (!s.estado) { const c = P.clasificar(num(s.spread_pond_pct)); s.estado = c.estado; s.color = c.color; }
+    // momento en que ESTE cliente recibio el snapshot: sirve para hacer avanzar
+    // en vivo la edad server-side (edad_seg) sin depender del reloj del equipo.
+    s._recibido = Date.now();
     return ensureDetalle(s);
   }
 
@@ -2759,11 +2762,35 @@ window.P2P_AUTH = {
     refresh("init");
     const id = setInterval(() => refresh("cycle"), pollMs);
 
+    // AUTO-RECUPERACION (COL23): los navegadores CONGELAN los setInterval de las
+    // pestañas en segundo plano (Brave/Chrome, y mas si el equipo se durmio). Al
+    // volver a la pestaña, el timer puede tardar en re-disparar y la pagina se
+    // ve "colgada" mostrando el ultimo dato viejo ("SIN DATOS EN VIVO / hace 1h")
+    // aunque el backend este perfecto. Estos listeners fuerzan un refresh
+    // INMEDIATO cuando la pestaña vuelve al frente o se recupera la red.
+    const despertar = () => {
+      if (!stopped && (typeof document === "undefined" || document.visibilityState === "visible")) {
+        refresh("wake");
+      }
+    };
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", despertar);
+    if (typeof window !== "undefined") {
+      window.addEventListener("focus", despertar);
+      window.addEventListener("online", despertar);
+    }
+
     return {
       get state() { return { snap, history, heatmap, count, vel, cycleStart, cycleMs: pollMs }; },
       subscribe(fn) { subs.add(fn); if (snap) fn({ snap, history, heatmap, count, vel, cycleStart, cycleMs: pollMs, type: "init" }); return () => subs.delete(fn); },
       forceCycle: () => refresh("cycle"),
-      stop() { stopped = true; clearInterval(id); if (demoEng) demoEng.stop(); },
+      stop() {
+        stopped = true; clearInterval(id); if (demoEng) demoEng.stop();
+        if (typeof document !== "undefined") document.removeEventListener("visibilitychange", despertar);
+        if (typeof window !== "undefined") {
+          window.removeEventListener("focus", despertar);
+          window.removeEventListener("online", despertar);
+        }
+      },
     };
   }
 
@@ -3475,8 +3502,19 @@ function TopBar({ snap, secondsLeft, cycleMs }) {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
-  const ts = snap.timestamp ? Date.parse(String(snap.timestamp).replace(" ", "T")) : null;
-  const ageSec = ts ? Math.max(0, (now - ts) / 1000) : null;
+  // EDAD del dato: preferimos la que calcula el SERVIDOR (edad_seg), que no
+  // depende del reloj de este dispositivo. Se la aumenta con los segundos
+  // transcurridos desde que llego el snapshot, para que el contador avance en
+  // vivo sin volver a pedirle al server cada segundo. Fallback (dato viejo sin
+  // edad_seg): la cuenta de antes con el reloj local.
+  const recibido = snap._recibido || now;
+  let ageSec;
+  if (snap.edad_seg != null) {
+    ageSec = snap.edad_seg + Math.max(0, (now - recibido) / 1000);
+  } else {
+    const ts = snap.timestamp ? Date.parse(String(snap.timestamp).replace(" ", "T")) : null;
+    ageSec = ts ? Math.max(0, (now - ts) / 1000) : null;
+  }
   const fresh = ageSec != null && ageSec < 180;   // < 3 min = en vivo
   const dead  = ageSec == null || ageSec >= 360;   // > 6 min = colector parado
   const tone  = dead ? "sell" : fresh ? "buy" : "warn";
@@ -6817,6 +6855,17 @@ def api_estado():
     with data_lock:
         snap["detalle_compra"] = ultimo_estado.get("detalle_compra", [])
         snap["detalle_venta"]  = ultimo_estado.get("detalle_venta",  [])
+    # EDAD calculada por el SERVIDOR (COL23): cuantos segundos hace que se guardo
+    # el snapshot, segun el reloj del server. Asi la frescura NO depende del reloj
+    # del dispositivo del usuario. Antes el cliente hacia now - timestamp con su
+    # propio reloj; si estaba en otra zona horaria (ej. viajar Chile->Argentina),
+    # todo se veia "hace 1h" y disparaba "SIN DATOS EN VIVO" con el backend sano.
+    try:
+        ts = datetime.strptime(str(snap.get("timestamp"))[:19], "%Y-%m-%d %H:%M:%S")
+        ts = ts.replace(tzinfo=SANTIAGO_TZ)
+        snap["edad_seg"] = max(0, round((datetime.now(SANTIAGO_TZ) - ts).total_seconds()))
+    except Exception:
+        snap["edad_seg"] = None
     return jsonify(snap)
 
 @app.route("/api/historial")
