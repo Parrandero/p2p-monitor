@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL21"
-VERSION_FECHA = "2026-07-22"
+VERSION       = "COL22"
+VERSION_FECHA = "2026-07-23"
 
 config = {
     "MONEDA":               "USDT",
@@ -99,6 +99,17 @@ config = {
                                    # semaforo: los duales rentables capturan 1.3-1.7% bruto
                                    # (mediana 1.50%) parados profundo en el libro, aunque el
                                    # spread instantaneo de la punta sea menor
+    # ── Banda de inventario (COL22) ──────────────────────────────
+    # Politica, NO un numero medido: sale del capital (~700-1.000) y del ticket
+    # (30-60). Doctrina maxima 7: nunca parar cargado de un solo lado.
+    #   40-60%  -> zona comoda: farmear dual como maker.
+    #   fuera de 40-60 -> correccion: repreciar AGRESIVO el lado corto (todavia maker).
+    #   <30 o >70      -> limite duro: cruzar como TAKER si o si.
+    # A futuro el monitor la afina solo viendo con que % se queda trabado.
+    "INV_BANDA_MIN":        40,
+    "INV_BANDA_MAX":        60,
+    "INV_DURO_MIN":         30,
+    "INV_DURO_MAX":         70,
 }
 config_lock = threading.Lock()
 
@@ -137,6 +148,10 @@ CONFIG_TYPE_MAP = {
     "RITMO_MEDIDO_RANGO":   str,
     "COM_TAKER_FIJA_USDT":  float,
     "COM_MAKER_PCT":        float,
+    "INV_BANDA_MIN":        float,
+    "INV_BANDA_MAX":        float,
+    "INV_DURO_MIN":         float,
+    "INV_DURO_MAX":         float,
 }
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -357,6 +372,44 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_mis_ord_ts ON mis_ordenes_reales(ts)")
+            # ── INVENTARIO EN VIVO (COL22) ──────────────────────────────
+            # Diseño HIBRIDO: el monitor NO puede saber el saldo solo (no ve el
+            # banco ni las ordenes taker, que no dejan anuncio en el libro).
+            #  1. ANCLA = la verdad. El usuario pega sus saldos reales.
+            #  2. ESTIMACION = ancla + movimientos desde el ts del ancla.
+            #  3. Al re-anclar se ve el DRIFT (estimado vs real) = calibracion gratis.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS inventario_ancla (
+                    id SERIAL PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL,
+                    usdt NUMERIC NOT NULL,
+                    clp NUMERIC NOT NULL,
+                    precio_ref NUMERIC,
+                    nota TEXT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_inv_ancla_ts ON inventario_ancla(ts DESC)")
+            # Movimientos MANUALES (taker / externo). Los 'maker' NO se guardan
+            # aca: se derivan en vivo de fills_estimados para que no haya doble
+            # conteo ni drift si un fill se corrige despues.
+            # El tipo importa porque son economicamente distintos:
+            #   maker  -> trade, comision 0,20% en USDT, cuenta P&L y reputacion
+            #   taker  -> trade, comision 0,07 USDT fija, cuenta para los 300
+            #   externo-> deposito/retiro: NO es P&L, solo mueve el saldo
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS movimientos_inventario (
+                    id SERIAL PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL,
+                    tipo TEXT NOT NULL,
+                    lado TEXT,
+                    usdt NUMERIC,
+                    clp NUMERIC,
+                    precio NUMERIC,
+                    nota TEXT,
+                    creado TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_mov_inv_ts ON movimientos_inventario(ts)")
             # ── Perfil por hora del dia (COL19) ──
             # Cachea el calculo pesado (spread x flujo por hora) que alimenta al
             # Plan de hoy y al gap adaptativo. Se recalcula 1x/dia.
@@ -6167,7 +6220,403 @@ function EstrategiaPanel() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy };
+/* ============================================================
+   MI INVENTARIO EN VIVO (COL22)
+   Hibrido: el ancla es la verdad (saldos pegados a mano), lo de al lado es
+   estimacion (ancla + ordenes detectadas). Nunca se confunde uno con otro.
+   ============================================================ */
+const INV_ZONA_COLOR = { comoda: "var(--buy)", correccion: "var(--warn)", dura: "var(--sell)" };
+
+function invFmt(n, dec) {
+  if (n == null) return "—";
+  return Number(n).toLocaleString("es-CL", { minimumFractionDigits: dec || 0, maximumFractionDigits: dec || 0 });
+}
+
+function ChipBalance() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/inventario").then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => {});
+    load();
+    const id = setInterval(load, 60000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  if (!d || !d.configurado) return null;
+  const tono = INV_ZONA_COLOR[d.zona] || "var(--text-3)";
+  const etiqueta = d.zona === "comoda" ? "en banda"
+    : (d.reequilibrio.lado_corto === "usdt" ? "corto de USDT" : "cargado de USDT");
+  const irACard = () => {
+    const el = document.getElementById("inv-card");
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+  return (
+    <button onClick={irACard} title="Tu balance USDT/CLP. Tocá para ver el inventario completo."
+      style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer",
+               background: "var(--bg-1)", border: "1px solid var(--line)",
+               borderLeft: "3px solid " + tono, borderRadius: 10,
+               padding: "7px 12px", margin: "10px 0 0", fontFamily: "var(--font)" }}>
+      <span style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Balance</span>
+      <span style={{ fontFamily: "var(--mono)", fontSize: 15, fontWeight: 600, color: tono }}>
+        {invFmt(d.pct_usdt, 1)}% USDT
+      </span>
+      <span style={{ fontSize: 11.5, color: "var(--text-2)" }}>· {etiqueta}</span>
+    </button>
+  );
+}
+
+function BarraBalance({ pct, banda }) {
+  /* Barra de DOS niveles: verde = zona comoda (farmear), ambar = correccion
+     (repreciar agresivo), rojo = limite duro (cruzar). La marca blanca es
+     donde estas ahora. */
+  const b = banda || { min: 40, max: 60, duro_min: 30, duro_max: 70 };
+  const seg = [
+    { w: b.duro_min, c: "var(--sell-soft)" },
+    { w: b.min - b.duro_min, c: "var(--warn-soft)" },
+    { w: b.max - b.min, c: "var(--buy-soft)" },
+    { w: b.duro_max - b.max, c: "var(--warn-soft)" },
+    { w: 100 - b.duro_max, c: "var(--sell-soft)" },
+  ];
+  const marcas = [
+    { p: b.duro_min, c: "var(--sell)" }, { p: b.min, c: "var(--buy)" },
+    { p: b.max, c: "var(--buy)" }, { p: b.duro_max, c: "var(--sell)" },
+  ];
+  const pos = Math.max(0, Math.min(100, pct || 0));
+  return (
+    <div style={{ margin: "4px 0 2px" }}>
+      <div style={{ position: "relative", height: 16, borderRadius: 6, overflow: "hidden",
+                    display: "flex", border: "1px solid var(--line-soft)" }}>
+        {seg.map((s, i) => <div key={i} style={{ width: s.w + "%", background: s.c }} />)}
+        {marcas.map((m, i) => (
+          <div key={i} style={{ position: "absolute", left: m.p + "%", top: 0, bottom: 0,
+                                width: 1, background: m.c, opacity: 0.7 }} />
+        ))}
+        <div style={{ position: "absolute", left: pos + "%", top: -2, bottom: -2, width: 3,
+                      background: "var(--text)", transform: "translateX(-50%)", borderRadius: 2,
+                      boxShadow: "0 0 0 2px var(--bg-1)" }} />
+      </div>
+      <div style={{ position: "relative", height: 13, fontFamily: "var(--mono)", fontSize: 9,
+                    color: "var(--text-3)", marginTop: 2 }}>
+        {marcas.map((m, i) => (
+          <span key={i} style={{ position: "absolute", left: m.p + "%", transform: "translateX(-50%)" }}>{m.p}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function InventarioCard() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  const [detalle, setDetalle] = React.useState(false);
+  const [form, setForm] = React.useState(null);   // 'ancla' | 'mov' | null
+  const [msg, setMsg] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  // ancla
+  const [aU, setAU] = React.useState(""); const [aC, setAC] = React.useState("");
+  // movimiento
+  const [mTipo, setMTipo] = React.useState("taker");
+  const [mLado, setMLado] = React.useState("compra");
+  const [mU, setMU] = React.useState(""); const [mP, setMP] = React.useState(""); const [mC, setMC] = React.useState("");
+
+  const cargar = React.useCallback(() => {
+    fetch(B + "/api/inventario").then(r => r.json()).then(setD).catch(() => {});
+  }, []);
+  React.useEffect(() => { cargar(); const id = setInterval(cargar, 60000); return () => clearInterval(id); }, [cargar]);
+
+  const post = (url, body, okTxt) => {
+    if (busy) return;
+    setBusy(true); setMsg("Guardando…");
+    window.P2P_AUTH.post(B + url, body)
+      .then(r => r.json().then(j => ({ ok: r.ok && j && j.ok !== false, j })))
+      .then(({ ok, j }) => {
+        setBusy(false);
+        if (!ok) { setMsg("✗ " + ((j && j.error) || "no se pudo guardar")); return; }
+        let extra = "";
+        if (j.drift && (Math.abs(j.drift.usdt) > 0.01 || Math.abs(j.drift.clp) > 1)) {
+          extra = " · drift vs estimado: " + invFmt(j.drift.usdt, 2) + " USDT / " + invFmt(j.drift.clp) + " CLP";
+        }
+        setMsg("✓ " + okTxt + extra);
+        setForm(null); cargar();
+        setTimeout(() => setMsg(""), 9000);
+      })
+      .catch(() => { setBusy(false); setMsg("✗ error de red"); });
+  };
+
+  const box = { background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" };
+  const lbl = { fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" };
+  const val = { fontFamily: "var(--mono)", fontSize: 19, color: "var(--text)", margin: "3px 0 1px", fontVariantNumeric: "tabular-nums" };
+  const inp = { width: "100%", background: "var(--bg-1)", border: "1px solid var(--line)", borderRadius: 7,
+                color: "var(--text)", fontFamily: "var(--mono)", fontSize: 13, padding: "7px 9px" };
+  const btn = (activo) => ({ cursor: "pointer", borderRadius: 7, padding: "6px 12px", fontSize: 11.5,
+                             fontFamily: "var(--mono)",
+                             border: "1px solid " + (activo ? "var(--accent)" : "var(--line)"),
+                             background: activo ? "var(--accent-soft)" : "var(--bg-2)",
+                             color: activo ? "var(--accent)" : "var(--text-2)" });
+
+  if (!d) return null;
+
+  if (!d.configurado) {
+    return (
+      <div id="inv-card" style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)",
+                                  borderLeft: "4px solid var(--text-3)", borderRadius: 14, padding: "13px 16px" }}>
+        <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em", marginBottom: 6 }}>Mi inventario en vivo</div>
+        <div style={{ fontSize: 12.5, color: "var(--text-2)", marginBottom: 10 }}>{d.nota}</div>
+        {form !== "ancla" && <button onClick={() => setForm("ancla")} style={btn(true)}>Fijar mis saldos</button>}
+        {form === "ancla" && (
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div><div style={lbl}>USDT en Binance</div><input value={aU} onChange={e => setAU(e.target.value)} inputMode="decimal" style={{ ...inp, width: 120 }} /></div>
+            <div><div style={lbl}>CLP en Mercado Pago</div><input value={aC} onChange={e => setAC(e.target.value)} inputMode="decimal" style={{ ...inp, width: 140 }} /></div>
+            <button disabled={busy} style={btn(true)}
+              onClick={() => post("/api/inventario/ancla", { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")) }, "saldos fijados")}>Guardar</button>
+            <button onClick={() => setForm(null)} style={btn(false)}>Cancelar</button>
+          </div>
+        )}
+        {msg && <div style={{ fontFamily: "var(--mono)", fontSize: 11.5, marginTop: 8, color: msg[0] === "✓" ? "var(--buy)" : "var(--warn)" }}>{msg}</div>}
+      </div>
+    );
+  }
+
+  const tono = INV_ZONA_COLOR[d.zona] || "var(--accent)";
+  const req = d.reequilibrio || {};
+  const det = d.detalle || {};
+  const pnlPos = (d.pnl_dia_clp || 0) >= 0;
+
+  return (
+    <div id="inv-card" style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)",
+                                borderLeft: "4px solid " + tono, borderRadius: 14, padding: "13px 16px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Mi inventario en vivo</span>
+        <span title={d.nota} style={{ fontSize: 9.5, color: "var(--warn)", border: "1px solid var(--warn)",
+                                      borderRadius: 5, padding: "1px 6px", cursor: "help" }}>ESTIMADO</span>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)" }}>ancla: {String(d.ancla.ts).slice(5, 16)}</span>
+        {msg && <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, marginLeft: "auto", color: msg[0] === "✓" ? "var(--buy)" : "var(--warn)" }}>{msg}</span>}
+      </div>
+
+      {d.alerta && (
+        <div style={{ background: "var(--warn-soft)", border: "1px solid var(--warn)", borderRadius: 9,
+                      padding: "8px 12px", marginBottom: 10, fontSize: 11.5, color: "var(--warn)" }}>
+          ⚠ {d.alerta}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+        <div style={{ ...box, flex: 1.2, minWidth: 160 }}>
+          <div style={lbl}>Patrimonio</div>
+          <div style={val}>{invFmt(d.patrimonio_clp)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>CLP</span></div>
+          <div style={{ fontSize: 11, color: pnlPos ? "var(--buy)" : "var(--sell)" }}>
+            {pnlPos ? "+" : ""}{invFmt(d.pnl_dia_clp)} CLP hoy
+          </div>
+        </div>
+        <div style={{ ...box, flex: 1, minWidth: 130 }}>
+          <div style={lbl}>USDT · Binance</div>
+          <div style={val}>{invFmt(d.saldos.usdt, 2)}</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>≈ {invFmt(d.saldos.usdt * d.precio_ref_actual)} CLP</div>
+        </div>
+        <div style={{ ...box, flex: 1, minWidth: 130 }}>
+          <div style={lbl}>CLP · Mercado Pago</div>
+          <div style={val}>{invFmt(d.saldos.clp)}</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>ponderado ${invFmt(d.precio_ref_actual, 2)}</div>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 2 }}>
+          <span style={lbl}>Balance</span>
+          <span style={{ fontFamily: "var(--mono)", fontSize: 15, fontWeight: 600, color: tono }}>{invFmt(d.pct_usdt, 1)}% en USDT</span>
+          <span style={{ fontSize: 11.5, color: "var(--text-2)" }}>{d.zona_txt}</span>
+        </div>
+        <BarraBalance pct={d.pct_usdt} banda={d.banda} />
+      </div>
+
+      {d.zona !== "comoda" && (
+        <div style={{ background: "var(--bg-2)", border: "1px solid " + tono, borderRadius: 10,
+                      padding: "10px 13px", marginBottom: 10 }}>
+          <div style={{ fontSize: 12.5, color: "var(--text)", lineHeight: 1.6 }}>
+            <b style={{ color: tono }}>{req.modo === "cruzar" ? "Cruzá como taker" : "Repreciá agresivo"}</b>
+            {" — "}{req.accion === "comprar" ? "comprá" : "vendé"} <b>{invFmt(req.usdt_a_mover, 1)} USDT</b>
+            {req.precio_sugerido ? <> a <b style={{ fontFamily: "var(--mono)" }}>${invFmt(req.precio_sugerido, 2)}</b></> : null}
+            {" "}para volver a la banda.
+          </div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 4 }}>
+            {req.modo === "cruzar"
+              ? "Tomás el precio del otro: instantáneo, y la orden igual cuenta para los 300 de Merchant."
+              : "Un centavo mejor que el líder del lado corto. Todavía capturás algo de spread."}
+            {req.agresivo ? " · agresivo ${" + invFmt(req.agresivo, 2) + "}" : ""}
+            {req.cruce ? " · cruce ${" + invFmt(req.cruce, 2) + "}" : ""}
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <button onClick={() => { setForm(form === "ancla" ? null : "ancla"); setAU(String(d.saldos.usdt.toFixed(2))); setAC(String(Math.round(d.saldos.clp))); }} style={btn(form === "ancla")}>Actualizar saldos</button>
+        <button onClick={() => setForm(form === "mov" ? null : "mov")} style={btn(form === "mov")}>Registrar movimiento</button>
+        <button onClick={() => setDetalle(!detalle)} style={{ ...btn(false), border: "none", background: "transparent", marginLeft: "auto" }}>
+          {detalle ? "ocultar detalle" : "ver detalle"}
+        </button>
+      </div>
+
+      {form === "ancla" && (
+        <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
+          <div style={{ fontSize: 11.5, color: "var(--text-2)", marginBottom: 8 }}>
+            Pegá los saldos <b>reales</b> de Binance y Mercado Pago. Esto vuelve a anclar la verdad y mide cuánto se había desviado la estimación.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div><div style={lbl}>USDT en Binance</div><input value={aU} onChange={e => setAU(e.target.value)} inputMode="decimal" style={{ ...inp, width: 120 }} /></div>
+            <div><div style={lbl}>CLP en Mercado Pago</div><input value={aC} onChange={e => setAC(e.target.value)} inputMode="decimal" style={{ ...inp, width: 140 }} /></div>
+            <button disabled={busy} style={btn(true)}
+              onClick={() => post("/api/inventario/ancla", { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")) }, "saldos actualizados")}>Guardar</button>
+          </div>
+        </div>
+      )}
+
+      {form === "mov" && (
+        <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+            {[["taker", "Orden taker (crucé)"], ["externo", "Depósito / retiro"]].map(([k, t]) => (
+              <button key={k} onClick={() => setMTipo(k)} style={btn(mTipo === k)}>{t}</button>
+            ))}
+          </div>
+          {mTipo === "externo" ? (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+              <div><div style={lbl}>USDT (+ entra / − sale)</div><input value={mU} onChange={e => setMU(e.target.value)} inputMode="decimal" placeholder="0" style={{ ...inp, width: 130 }} /></div>
+              <div><div style={lbl}>CLP (+ entra / − sale)</div><input value={mC} onChange={e => setMC(e.target.value)} inputMode="decimal" placeholder="0" style={{ ...inp, width: 140 }} /></div>
+              <button disabled={busy} style={btn(true)}
+                onClick={() => post("/api/inventario/movimiento", { tipo: "externo", usdt: parseFloat(String(mU).replace(",", ".")) || 0, clp: parseFloat(String(mC).replace(",", ".")) || 0 }, "movimiento externo cargado")}>Guardar</button>
+              <div style={{ fontSize: 10.5, color: "var(--text-3)", flexBasis: "100%" }}>
+                Un depósito/retiro <b>no es ganancia</b>: solo mueve el saldo. Por eso se marca aparte y no entra en el P&amp;L.
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+              <div style={{ display: "flex", gap: 6 }}>
+                {[["compra", "Compré USDT"], ["venta", "Vendí USDT"]].map(([k, t]) => (
+                  <button key={k} onClick={() => setMLado(k)} style={btn(mLado === k)}>{t}</button>
+                ))}
+              </div>
+              <div><div style={lbl}>USDT</div><input value={mU} onChange={e => setMU(e.target.value)} inputMode="decimal" style={{ ...inp, width: 100 }} /></div>
+              <div><div style={lbl}>Precio</div><input value={mP} onChange={e => setMP(e.target.value)} inputMode="decimal" placeholder={String(d.precio_ref_actual)} style={{ ...inp, width: 110 }} /></div>
+              <button disabled={busy} style={btn(true)}
+                onClick={() => post("/api/inventario/movimiento", { tipo: "taker", lado: mLado, usdt: parseFloat(String(mU).replace(",", ".")), precio: parseFloat(String(mP).replace(",", ".")) }, "orden taker cargada")}>Guardar</button>
+              <div style={{ fontSize: 10.5, color: "var(--text-3)", flexBasis: "100%" }}>
+                El monitor no ve las órdenes taker (no dejan anuncio en el libro), por eso van a mano. Comisión fija 0,07 USDT.
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {detalle && (
+        <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10,
+                      border: "1px solid var(--line-soft)", fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.8 }}>
+          <div>Movimientos desde el ancla: <b>{det.movimientos}</b> ({det.maker} maker · {det.taker} taker · {det.externo} externo)</div>
+          <div>Comisiones pagadas: <b>{invFmt(det.comisiones_usdt, 2)} USDT</b></div>
+          <div>Revaluación del USDT que ya tenías: <b style={{ color: (det.revaluacion_clp || 0) >= 0 ? "var(--buy)" : "var(--sell)" }}>{invFmt(det.revaluacion_clp)} CLP</b> <span style={{ color: "var(--text-3)" }}>(el precio se movió, no operaste)</span></div>
+          <div>Costo de campaña (trading, sin revaluación): <b style={{ color: (det.costo_campania_clp || 0) >= 0 ? "var(--buy)" : "var(--sell)" }}>{invFmt(det.costo_campania_clp)} CLP</b></div>
+          {det.aporte_externo_clp ? <div>Depósitos/retiros netos: <b>{invFmt(det.aporte_externo_clp)} CLP</b> <span style={{ color: "var(--text-3)" }}>(fuera del P&amp;L)</span></div> : null}
+          <div style={{ color: "var(--text-3)", marginTop: 4 }}>
+            Farmear cuesta plata a propósito en esta fase: el objetivo son órdenes y reputación, no margen. Este número es el peaje.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CalculadoraCruzar() {
+  /* Logica EXACTA del prototipo Prototipo_Calculadora_Cruzar.html.
+     Doble objetivo: decidir Y entender el concepto compra/venta. */
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const C_MAKER = 0.002, C_TAKER = 0.07;
+  const [side, setSide] = React.useState("vendi");
+  const [qty, setQty] = React.useState("100");
+  const [pmine, setPmine] = React.useState("941.5");
+  const [pcross, setPcross] = React.useState("943");
+  const [abierto, setAbierto] = React.useState(false);
+
+  // autocompletar con los precios del Asistente (editable a mano igual)
+  React.useEffect(() => {
+    if (!abierto) return;
+    fetch(B + "/api/operativa").then(r => r.json()).then(j => {
+      const p = j && j.precios; if (!p) return;
+      if (side === "vendi") {
+        if (p.flujo_vender) setPmine(String(p.flujo_vender));
+        if (p.agresivo_comprar) setPcross(String(p.agresivo_comprar));
+      } else {
+        if (p.flujo_comprar) setPmine(String(p.flujo_comprar));
+        if (p.agresivo_vender) setPcross(String(p.agresivo_vender));
+      }
+    }).catch(() => {});
+  }, [abierto, side]);
+
+  const q = parseFloat(String(qty).replace(",", ".")) || 0;
+  const pm = parseFloat(String(pmine).replace(",", ".")) || 0;
+  const pc = parseFloat(String(pcross).replace(",", ".")) || 0;
+  const bruto = side === "vendi" ? (pm - pc) * q : (pc - pm) * q;
+  const cM = C_MAKER * pm * q, cT = C_TAKER * pc;
+  const neto = bruto - cM - cT;
+  const fmt = (n) => (n < 0 ? "−" : "") + "$" + Math.abs(Math.round(n)).toLocaleString("es-CL");
+
+  const inp = { width: "100%", background: "var(--bg-1)", border: "1px solid var(--line)", borderRadius: 8,
+                color: "var(--text)", fontFamily: "var(--mono)", fontSize: 14, padding: "8px 10px" };
+  const lbl = { fontSize: 11, color: "var(--text-2)", display: "block", marginBottom: 4 };
+
+  if (!abierto) {
+    return (
+      <button onClick={() => setAbierto(true)}
+        style={{ margin: "10px 0 0", cursor: "pointer", background: "var(--bg-1)",
+                 border: "1px solid var(--line)", borderRadius: 10, padding: "8px 13px",
+                 color: "var(--text-2)", fontSize: 12, fontFamily: "var(--font)" }}>
+        🧮 ¿Conviene cruzar? <span style={{ color: "var(--text-3)" }}>— calculadora</span>
+      </button>
+    );
+  }
+  return (
+    <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)",
+                  borderRadius: 14, padding: "13px 16px", maxWidth: 460 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+        <span style={{ fontSize: 13.5, fontWeight: 600 }}>¿Conviene cruzar?</span>
+        <button onClick={() => setAbierto(false)}
+          style={{ marginLeft: "auto", background: "transparent", border: "none", color: "var(--text-3)", cursor: "pointer", fontSize: 11 }}>cerrar</button>
+      </div>
+      <div style={lbl}>¿Qué te pasa ahora?</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
+        {[["vendi", "Vendí dólares", "me falta recomprar"], ["compre", "Compré dólares", "me falta vender"]].map(([k, t, s]) => (
+          <button key={k} onClick={() => setSide(k)}
+            style={{ fontSize: 12.5, padding: "9px 6px", borderRadius: 8, cursor: "pointer", lineHeight: 1.3,
+                     border: side === k ? "2px solid var(--accent)" : "1px solid var(--line)",
+                     background: side === k ? "var(--accent-soft)" : "transparent",
+                     color: side === k ? "var(--accent)" : "var(--text-2)" }}>
+            {t}<span style={{ fontSize: 10, display: "block" }}>{s}</span>
+          </button>
+        ))}
+      </div>
+      <label style={lbl}>Cuántos USDT</label>
+      <input value={qty} onChange={e => setQty(e.target.value)} inputMode="decimal" style={{ ...inp, marginBottom: 13 }} />
+      <label style={lbl}>{side === "vendi" ? "Precio al que ya vendí (mi anuncio maker)" : "Precio al que ya compré (mi anuncio maker)"}</label>
+      <input value={pmine} onChange={e => setPmine(e.target.value)} inputMode="decimal" style={{ ...inp, marginBottom: 13 }} />
+      <label style={lbl}>{side === "vendi" ? "Precio al que recompro ahora cruzando (taker)" : "Precio al que vendo ahora cruzando (taker)"}</label>
+      <input value={pcross} onChange={e => setPcross(e.target.value)} inputMode="decimal" style={{ ...inp, marginBottom: 13 }} />
+      <div style={{ borderRadius: 10, padding: "14px 16px",
+                    background: neto >= 0 ? "var(--buy-soft)" : "var(--warn-soft)" }}>
+        <div style={{ fontSize: 11, color: "var(--text-2)" }}>Resultado de la vuelta completa</div>
+        <div style={{ fontFamily: "var(--mono)", fontSize: 26, fontWeight: 600,
+                      color: neto >= 0 ? "var(--buy)" : "var(--warn)" }}>{fmt(neto)} CLP</div>
+        <div style={{ fontSize: 12.5, marginTop: 5, color: neto >= 0 ? "var(--buy)" : "var(--warn)" }}>
+          {neto >= 0
+            ? "✓ Cerrás en ganancia — cruzá tranquilo."
+            : "Perdés esto — es el peaje. Conviene si estás trabado (te destraba y suma 1 orden). Si no urge, esperá y hacelo como maker."}
+        </div>
+      </div>
+      <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 12, lineHeight: 1.6 }}>
+        Cuenta: diferencia de precio {fmt(bruto)} − comisión maker {fmt(cM)} − comisión taker {fmt(cT)} (0,07 USDT fija).
+      </div>
+    </div>
+  );
+}
+
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar };
 
 </script>
 <script type="text/babel">
@@ -6247,9 +6696,12 @@ function App() {
       {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
       <main className="content">
         {tab === "tr" && <V.PlanHoy />}
+        {tab === "tr" && <V.ChipBalance />}
         {tab === "tr" && <V.EstrategiaPanel />}
         {tab === "tr" && <V.MiCampania />}
+        {tab === "tr" && <V.InventarioCard />}
         {tab === "tr" && <V.AsistenteOperativo />}
+        {tab === "tr" && <V.CalculadoraCruzar />}
         {tab === "tr" && <V.VelocidadMercado />}
         {tab === "tr" && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
           filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} />}
@@ -8189,6 +8641,393 @@ def api_operativa():
         },
         "vacios_liquidez": vacios,
     })
+
+
+# ──────────────────────────────────────────────
+#  INVENTARIO EN VIVO (COL22)
+# ──────────────────────────────────────────────
+def _precio_mid(snap=None):
+    """Precio ponderado de referencia = medio entre los dos ponderados."""
+    if snap is None:
+        with data_lock:
+            snap = dict(ultimo_estado)
+    pc = float(snap.get("precio_pond_tab_compra") or 0)
+    pv = float(snap.get("precio_pond_tab_venta") or 0)
+    if pc and pv:
+        return (pc + pv) / 2
+    return pc or pv or 0
+
+
+def _movimientos_maker(desde_ts, hasta_ts=None):
+    """Movimientos MAKER derivados en vivo de los fills detectados de MI_NICKNAME.
+
+    OJO con la semantica del libro: mi anuncio de VENTA vive en el tab Compra,
+    asi que un fill con tipo='BUY' significa que YO VENDI USDT (y al reves).
+    La comision maker se cobra en USDT (medido en ordenes reales: 0,14 USDT
+    sobre 74,16), por eso se descuenta del saldo en USDT en ambos lados.
+
+    SOLO metodo='directo' (caida de stock OBSERVADA). Los 'enmascarado' son
+    estimaciones con el ticket MEDIANO DEL MERCADO (~408 USDT): sirven para el
+    volumen agregado, pero en un inventario personal con ordenes de 20-170 USDT
+    meterian movimientos fantasma de 400 que nunca pasaron. Lo que el tracker no
+    ve se corrige al re-anclar (ese es justamente el drift)."""
+    with config_lock:
+        nick = str(config.get("MI_NICKNAME") or "").strip()
+        com_pct = float(config.get("COM_MAKER_PCT", 0.20))
+    if not nick:
+        return []
+    f = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
+    sql = """SELECT ts, tipo, monto, precio FROM fills_estimados
+             WHERE exchange='binance' AND metodo='directo'
+               AND LOWER(anunciante)=LOWER(%(n)s)
+               AND ts >= %(d)s"""
+    params = {"n": nick, "d": f(desde_ts)}
+    if hasta_ts is not None:
+        sql += " AND ts < %(h)s"
+        params["h"] = f(hasta_ts)
+    sql += " ORDER BY ts"
+    filas = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                for r in cur.fetchall():
+                    monto = float(r["monto"] or 0)
+                    precio = float(r["precio"] or 0)
+                    if monto <= 0 or precio <= 0:
+                        continue
+                    fee = monto * com_pct / 100.0
+                    vendi = (r["tipo"] == "BUY")   # tab Compra = mi anuncio de VENTA
+                    filas.append({
+                        "ts": r["ts"], "tipo": "maker",
+                        "lado": "venta" if vendi else "compra",
+                        # el fee siempre sale del USDT
+                        "d_usdt": -(monto + fee) if vendi else (monto - fee),
+                        "d_clp": (monto * precio) if vendi else -(monto * precio),
+                        "precio": precio, "usdt": monto,
+                        "fee_usdt": fee,
+                    })
+    except Exception as e:
+        print(f"[inv maker] {e}")
+    return filas
+
+
+def _movimientos_manuales(desde_ts, hasta_ts=None):
+    """Movimientos cargados a mano: taker y externo (y maker manual si lo hubiera)."""
+    with config_lock:
+        com_taker = float(config.get("COM_TAKER_FIJA_USDT", 0.07))
+        com_pct = float(config.get("COM_MAKER_PCT", 0.20))
+    f = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
+    sql = "SELECT ts, tipo, lado, usdt, clp, precio, nota FROM movimientos_inventario WHERE ts >= %(d)s"
+    params = {"d": f(desde_ts)}
+    if hasta_ts is not None:
+        sql += " AND ts < %(h)s"
+        params["h"] = f(hasta_ts)
+    sql += " ORDER BY ts"
+    filas = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                for r in cur.fetchall():
+                    tipo = (r["tipo"] or "").lower()
+                    usdt = float(r["usdt"] or 0)
+                    clp = float(r["clp"] or 0)
+                    precio = float(r["precio"] or 0)
+                    lado = (r["lado"] or "").lower() or None
+                    if tipo == "externo":
+                        # deposito/retiro: se toma tal cual, sin comision ni P&L
+                        filas.append({"ts": r["ts"], "tipo": "externo", "lado": None,
+                                      "d_usdt": usdt, "d_clp": clp, "precio": precio,
+                                      "usdt": abs(usdt), "fee_usdt": 0.0, "nota": r["nota"]})
+                        continue
+                    # trade (taker o maker manual): el signo lo da el lado
+                    fee = com_taker if tipo == "taker" else usdt * com_pct / 100.0
+                    monto = abs(usdt)
+                    if not precio and monto:
+                        precio = abs(clp) / monto if clp else 0
+                    vendi = (lado == "venta")
+                    filas.append({
+                        "ts": r["ts"], "tipo": tipo, "lado": lado,
+                        "d_usdt": -(monto + fee) if vendi else (monto - fee),
+                        "d_clp": (monto * precio) if vendi else -(monto * precio),
+                        "precio": precio, "usdt": monto, "fee_usdt": fee,
+                        "nota": r["nota"],
+                    })
+    except Exception as e:
+        print(f"[inv manual] {e}")
+    return filas
+
+
+def _aplicar(ancla_usdt, ancla_clp, movs):
+    """Aplica una lista de movimientos sobre un saldo inicial."""
+    usdt, clp, externo_usdt, externo_clp = ancla_usdt, ancla_clp, 0.0, 0.0
+    for m in movs:
+        usdt += m["d_usdt"]
+        clp += m["d_clp"]
+        if m["tipo"] == "externo":
+            externo_usdt += m["d_usdt"]
+            externo_clp += m["d_clp"]
+    return usdt, clp, externo_usdt, externo_clp
+
+
+def _precio_a_las(dt):
+    """Precio ponderado medio mas cercano (hacia atras) a un momento dado."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT precio_pond_tab_compra pc, precio_pond_tab_venta pv
+                    FROM snapshots WHERE timestamp <= %s AND precio_pond_tab_compra IS NOT NULL
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (dt.strftime("%Y-%m-%d %H:%M:%S"),))
+                r = cur.fetchone()
+                if r:
+                    pc, pv = float(r["pc"] or 0), float(r["pv"] or 0)
+                    if pc and pv:
+                        return (pc + pv) / 2
+                    return pc or pv or 0
+    except Exception as e:
+        print(f"[inv precio_a_las] {e}")
+    return 0
+
+
+@app.route("/api/inventario")
+def api_inventario():
+    """INVENTARIO EN VIVO: saldos estimados, patrimonio, %USDT, banda y P&L.
+
+    El numero en vivo es ESTIMADO: el monitor no ve el banco ni las ordenes
+    taker que no cargues. Es exacto en el momento del ancla y va driftando
+    despues; al re-anclar se mide ese drift."""
+    with config_lock:
+        c = dict(config)
+    now = datetime.now(SANTIAGO_TZ)
+    # ── ancla ──
+    ancla = None
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT ts, usdt, clp, precio_ref FROM inventario_ancla ORDER BY ts DESC LIMIT 1")
+                r = cur.fetchone()
+                if r:
+                    ancla = {"ts": r["ts"], "usdt": float(r["usdt"] or 0),
+                             "clp": float(r["clp"] or 0),
+                             "precio_ref": float(r["precio_ref"] or 0)}
+    except Exception as e:
+        print(f"[inventario ancla] {e}")
+    if not ancla:
+        return jsonify({"configurado": False,
+                        "nota": "Todavia no fijaste tus saldos reales. Usa 'actualizar saldos' "
+                                "para anclar el inventario (USDT en Binance + CLP en Mercado Pago)."})
+
+    ancla_dt = ancla["ts"]
+    if ancla_dt.tzinfo is None:
+        ancla_dt = ancla_dt.replace(tzinfo=SANTIAGO_TZ)
+    movs = sorted(_movimientos_maker(ancla_dt) + _movimientos_manuales(ancla_dt),
+                  key=lambda m: m["ts"])
+    usdt, clp, ext_usdt, ext_clp = _aplicar(ancla["usdt"], ancla["clp"], movs)
+
+    precio = _precio_mid()
+    patrimonio = usdt * precio + clp
+    pct_usdt = (usdt * precio / patrimonio * 100) if patrimonio > 0 else 0
+
+    # ── P&L del dia: patrimonio ahora vs apertura, SIN los movimientos externos ──
+    inicio_dia = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if ancla_dt >= inicio_dia:
+        # el ancla es de hoy: la apertura es el ancla mismo
+        u0, cl0 = ancla["usdt"], ancla["clp"]
+        precio0 = ancla["precio_ref"] or _precio_a_las(ancla_dt) or precio
+        ext_dia_usdt, ext_dia_clp = ext_usdt, ext_clp
+    else:
+        movs_hasta = [m for m in movs if (m["ts"].replace(tzinfo=SANTIAGO_TZ)
+                                          if m["ts"].tzinfo is None else m["ts"]) < inicio_dia]
+        u0, cl0, _, _ = _aplicar(ancla["usdt"], ancla["clp"], movs_hasta)
+        precio0 = _precio_a_las(inicio_dia) or precio
+        ext_dia_usdt = sum(m["d_usdt"] for m in movs
+                           if m["tipo"] == "externo" and
+                           (m["ts"].replace(tzinfo=SANTIAGO_TZ) if m["ts"].tzinfo is None else m["ts"]) >= inicio_dia)
+        ext_dia_clp = sum(m["d_clp"] for m in movs
+                          if m["tipo"] == "externo" and
+                          (m["ts"].replace(tzinfo=SANTIAGO_TZ) if m["ts"].tzinfo is None else m["ts"]) >= inicio_dia)
+    patrimonio_apertura = u0 * precio0 + cl0
+    aporte_externo_dia = ext_dia_usdt * precio + ext_dia_clp
+    pnl_dia = patrimonio - aporte_externo_dia - patrimonio_apertura
+
+    # ── Costo de campaña (OCULTO en la UI) ──
+    # P&L de trading REALIZADO: se saca la revaluacion del USDT que ya tenias
+    # al anclar, para no confundir "el dolar subio" con "operar me dio plata".
+    ext_total = ext_usdt * precio + ext_clp
+    pnl_total = patrimonio - ext_total - (ancla["usdt"] * (ancla["precio_ref"] or precio) + ancla["clp"])
+    revaluacion = ancla["usdt"] * (precio - (ancla["precio_ref"] or precio))
+    costo_campania = pnl_total - revaluacion
+    fees_usdt = sum(m.get("fee_usdt", 0) for m in movs if m["tipo"] != "externo")
+
+    # ── Banda y reequilibrio ──
+    bmin = float(c.get("INV_BANDA_MIN", 40)); bmax = float(c.get("INV_BANDA_MAX", 60))
+    dmin = float(c.get("INV_DURO_MIN", 30));  dmax = float(c.get("INV_DURO_MAX", 70))
+    with data_lock:
+        snap = dict(ultimo_estado)
+    # lado CORTO = lo que me falta. Bajo 50% estoy corto de USDT -> comprar.
+    corto = "usdt" if pct_usdt < 50 else "clp"
+    accion = "comprar" if corto == "usdt" else "vender"
+    if bmin <= pct_usdt <= bmax:
+        zona, zona_txt = "comoda", "Zona cómoda: farmeá dual como maker."
+    elif dmin <= pct_usdt <= dmax:
+        zona, zona_txt = "correccion", "Fuera de banda: repreciá agresivo el lado corto (todavía maker)."
+    else:
+        zona, zona_txt = "dura", "Límite duro: cruzá como TAKER para volver a la banda."
+
+    # cuanto mover para volver al 50%
+    usdt_objetivo = (patrimonio * 0.5 / precio) if precio > 0 else 0
+    delta_usdt = usdt_objetivo - usdt
+
+    # Precio sugerido: NO se inventa, sale del mismo libro que usa el Asistente.
+    #   agresivo = un centavo mejor que el lider (para ser #1 del lado corto)
+    #   cruce    = tomar el precio del otro (taker, instantaneo)
+    agresivo = float(snap.get("precio_maker_comprar") or 0) if accion == "comprar" \
+        else float(snap.get("precio_maker_vender") or 0)
+    cruce = float(snap.get("mejor_vendedor_tab_compra") or 0) if accion == "comprar" \
+        else float(snap.get("mejor_comprador_tab_venta") or 0)
+    # la agresividad ESCALA con la distancia a 50%: en el borde de la banda
+    # arranca cerca del ponderado y llega al precio agresivo en el limite duro.
+    dist = abs(pct_usdt - 50)
+    borde = abs((bmin if pct_usdt < 50 else bmax) - 50)
+    tope = abs((dmin if pct_usdt < 50 else dmax) - 50)
+    t = 0.0 if tope <= borde else max(0.0, min(1.0, (dist - borde) / (tope - borde)))
+    precio_sugerido = None
+    if zona == "correccion" and agresivo and precio:
+        precio_sugerido = round(precio + (agresivo - precio) * t, 2)
+    elif zona == "dura":
+        precio_sugerido = round(cruce, 2) if cruce else None
+
+    # Si la estimacion se fue a un imposible (saldo negativo), es señal de que
+    # se perdieron movimientos: ordenes taker sin cargar, o fills que el tracker
+    # no vio. No se disimula: se avisa que hay que re-anclar.
+    alerta = None
+    if usdt < 0 or clp < 0:
+        alerta = ("La estimación dio un saldo negativo, o sea que se perdieron movimientos "
+                  "(órdenes taker sin cargar, o fills que el monitor no detectó). "
+                  "Actualizá tus saldos reales para volver a anclar.")
+    elif (now - ancla_dt).total_seconds() > 3 * 24 * 3600:
+        alerta = ("Hace más de 3 días que no anclás: la estimación se desvía con el tiempo. "
+                  "Conviene actualizar los saldos reales.")
+
+    return jsonify({
+        "configurado": True,
+        "estimado": True,
+        "alerta": alerta,
+        "ancla": {"ts": str(ancla["ts"]), "usdt": round(ancla["usdt"], 2),
+                  "clp": round(ancla["clp"]), "precio_ref": round(ancla["precio_ref"], 2)},
+        "saldos": {"usdt": round(usdt, 2), "clp": round(clp)},
+        "precio_ref_actual": round(precio, 2),
+        "patrimonio_clp": round(patrimonio),
+        "pct_usdt": round(pct_usdt, 1),
+        "pnl_dia_clp": round(pnl_dia),
+        "patrimonio_apertura_clp": round(patrimonio_apertura),
+        "banda": {"min": bmin, "max": bmax, "duro_min": dmin, "duro_max": dmax},
+        "zona": zona, "zona_txt": zona_txt,
+        "reequilibrio": {
+            "lado_corto": corto, "accion": accion,
+            "usdt_a_mover": round(abs(delta_usdt), 1),
+            "precio_sugerido": precio_sugerido,
+            "modo": "cruzar" if zona == "dura" else ("repreciar" if zona == "correccion" else None),
+            "agresivo": round(agresivo, 2) if agresivo else None,
+            "cruce": round(cruce, 2) if cruce else None,
+        },
+        "detalle": {
+            "movimientos": len(movs),
+            "maker": sum(1 for m in movs if m["tipo"] == "maker"),
+            "taker": sum(1 for m in movs if m["tipo"] == "taker"),
+            "externo": sum(1 for m in movs if m["tipo"] == "externo"),
+            "costo_campania_clp": round(costo_campania),
+            "comisiones_usdt": round(fees_usdt, 3),
+            "revaluacion_clp": round(revaluacion),
+            "aporte_externo_clp": round(ext_total),
+        },
+        "nota": ("Estimado: el monitor no ve el banco ni las órdenes taker que no cargues. "
+                 "Exacto al anclar, aproximado después. Volvé a anclar para medir el drift."),
+    })
+
+
+@app.route("/api/inventario/ancla", methods=["POST"])
+def api_inventario_ancla():
+    """Fija los saldos REALES (la verdad). Devuelve el drift vs lo estimado."""
+    if not _token_ok():
+        return jsonify({"ok": False, "error": "token requerido o invalido"}), 401
+    data = request.get_json() or {}
+    try:
+        usdt = float(data.get("usdt"))
+        clp = float(data.get("clp"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "usdt y clp son obligatorios y numericos"}), 400
+    if usdt < 0 or clp < 0:
+        return jsonify({"ok": False, "error": "los saldos no pueden ser negativos"}), 400
+    precio = _precio_mid()
+    now = datetime.now(SANTIAGO_TZ)
+    # drift: cuanto se desvio la estimacion de la realidad (calibracion gratis)
+    drift = None
+    try:
+        prev = api_inventario().get_json()
+        if prev.get("configurado"):
+            drift = {"usdt": round(usdt - prev["saldos"]["usdt"], 2),
+                     "clp": round(clp - prev["saldos"]["clp"])}
+    except Exception:
+        pass
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO inventario_ancla (ts, usdt, clp, precio_ref, nota)
+                               VALUES (%s,%s,%s,%s,%s)""",
+                            (now.strftime("%Y-%m-%d %H:%M:%S"), usdt, clp, precio,
+                             (data.get("nota") or "")[:200]))
+            conn.commit()
+    except Exception as e:
+        print(f"[ancla] {e}")
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+    return jsonify({"ok": True, "usdt": usdt, "clp": clp,
+                    "precio_ref": round(precio, 2), "drift": drift})
+
+
+@app.route("/api/inventario/movimiento", methods=["POST"])
+def api_inventario_movimiento():
+    """Carga manual: taker (trade) o externo (deposito/retiro, NO es P&L)."""
+    if not _token_ok():
+        return jsonify({"ok": False, "error": "token requerido o invalido"}), 401
+    data = request.get_json() or {}
+    tipo = (data.get("tipo") or "").strip().lower()
+    if tipo not in ("taker", "externo", "maker"):
+        return jsonify({"ok": False, "error": "tipo debe ser taker, externo o maker"}), 400
+    lado = (data.get("lado") or "").strip().lower() or None
+    if tipo != "externo" and lado not in ("compra", "venta"):
+        return jsonify({"ok": False, "error": "lado debe ser compra o venta"}), 400
+    try:
+        usdt = float(data.get("usdt") or 0)
+        precio = float(data.get("precio") or 0)
+        clp = float(data.get("clp") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "valores numericos invalidos"}), 400
+    if tipo != "externo":
+        if usdt <= 0 or precio <= 0:
+            return jsonify({"ok": False, "error": "usdt y precio deben ser > 0"}), 400
+        clp = usdt * precio
+    elif usdt == 0 and clp == 0:
+        return jsonify({"ok": False, "error": "un movimiento externo necesita usdt o clp"}), 400
+    now = datetime.now(SANTIAGO_TZ)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO movimientos_inventario
+                               (ts, tipo, lado, usdt, clp, precio, nota)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                            (now.strftime("%Y-%m-%d %H:%M:%S"), tipo, lado,
+                             usdt, clp, precio, (data.get("nota") or "")[:200]))
+                nuevo = cur.fetchone()[0]
+            conn.commit()
+    except Exception as e:
+        print(f"[movimiento] {e}")
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+    return jsonify({"ok": True, "id": nuevo, "tipo": tipo, "lado": lado,
+                    "usdt": usdt, "clp": round(clp), "precio": precio})
 
 
 @app.route("/api/mi_posicion")
