@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL25"
+VERSION       = "COL26"
 VERSION_FECHA = "2026-07-28"
 
 config = {
@@ -8428,13 +8428,40 @@ def api_cross():
     })
 
 
-@app.route("/api/storage")
-def api_storage():
-    LIMITE_MB = 500.0   # volumen del plan Railway (ajustar si cambia)
+LIMITE_MB = 500.0   # volumen del plan Railway (ajustar si cambia)
+
+def _uso_disco_mb():
+    """MB realmente usados en el volumen de Railway.
+
+    FIX (COL26): antes esto era solo pg_database_size(current_database()),
+    que mide las TABLAS pero ignora el WAL (los archivos de transacciones
+    pendientes de aplicar/reciclar) y cualquier otra base del mismo servidor.
+    Medido 28-jul, justo despues de un vaciado grande: tablas=66 MB pero
+    WAL=96 MB (¡mas grande que las tablas!) -> el numero viejo decia 13% de
+    uso cuando el real (con WAL) era 34%. Un TRUNCATE/DELETE grande genera
+    mucho WAL que tarda en reciclarse, asi que el hueco se nota mas justo
+    despues de purgar, que es la peor coincidencia posible.
+    Con este fix el % que muestra el monitor debería acercarse mucho mas al
+    que reporta Railway. Puede seguir sin coincidir al 100% (hay overhead de
+    filesystem/contenedor que Postgres no expone), por eso el numero de
+    Railway sigue siendo la referencia final si hay dudas."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_database_size(current_database())")
-            size = cur.fetchone()[0]
+            tablas_b = float(cur.fetchone()[0])
+            try:
+                cur.execute("SELECT COALESCE(SUM(size), 0) FROM pg_ls_waldir()")
+                wal_b = float(cur.fetchone()[0])
+            except Exception:
+                wal_b = 0.0   # sin permiso o funcion no disponible: mejor subestimar que romper
+    return (tablas_b + wal_b) / 1048576.0, tablas_b / 1048576.0, wal_b / 1048576.0
+
+
+@app.route("/api/storage")
+def api_storage():
+    usado, tablas_mb, wal_mb = _uso_disco_mb()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
             tablas = {}
             for t in ("snapshots", "snapshots_detalle", "snapshots_detalle_bybit"):
                 try:
@@ -8442,13 +8469,17 @@ def api_storage():
                     tablas[t] = round(cur.fetchone()[0] / 1048576.0, 1)
                 except Exception:
                     tablas[t] = None
-    usado = size / 1048576.0
     return jsonify({
         "usado_mb":  round(usado, 1),
+        "tablas_total_mb": round(tablas_mb, 1),
+        "wal_mb":    round(wal_mb, 1),
         "limite_mb": LIMITE_MB,
         "libre_mb":  round(LIMITE_MB - usado, 1),
         "pct":       round(usado / LIMITE_MB * 100, 1),
         "tablas_mb": tablas,
+        "nota": ("usado_mb incluye tablas + WAL (antes solo tablas, por eso el % podia verse "
+                 "muy por debajo de lo que muestra Railway). Puede no coincidir exacto: Railway "
+                 "cuenta ademas overhead de filesystem que Postgres no expone."),
     })
 
 
@@ -9238,13 +9269,12 @@ def api_rutinas():
         return jsonify({"rutinas": [], "error": str(e)[:200]})
 
     # disco: entra como señal extra para el backup (si esta lleno, urge mas)
+    # COL26: usa la misma _uso_disco_mb() de /api/storage (tablas + WAL), asi
+    # los dos endpoints nunca se desalinean entre si.
     pct_disco = None
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT pg_database_size(current_database())")
-                usado_mb = float(cur.fetchone()[0]) / 1024 / 1024
-                pct_disco = round(usado_mb / 500 * 100)
+        usado_mb, _, _ = _uso_disco_mb()
+        pct_disco = round(usado_mb / LIMITE_MB * 100)
     except Exception:
         pass
 
