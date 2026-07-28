@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL23"
-VERSION_FECHA = "2026-07-24"
+VERSION       = "COL24"
+VERSION_FECHA = "2026-07-28"
 
 config = {
     "MONEDA":               "USDT",
@@ -87,6 +87,14 @@ config = {
     # ── Mi posicion / carrera al verificado (COL14) ──
     "MI_NICKNAME":          "",    # nickname de Binance P2P: activa el seguimiento de MIS anuncios
     "MI_POSICION_OBJETIVO": 15,    # posicion objetivo en el libro (el plan farming dice top 10-20)
+    # Ticket PROPIO (COL24), medido de mis_ordenes_reales (CSV real, ground truth).
+    # Corrige un bug real: el ticket para fills 'enmascarado' de MI cuenta caia al
+    # generico del MERCADO (~400 USDT) porque el historial en memoria por
+    # anunciante (st["tickets"]) se resetea con cada redeploy, y en un ciclo de
+    # desarrollo activo eso pasa seguido. Medido 28-jul: mi ticket real es ~69
+    # USDT (mediana de 31 fills directos), 6x mas chico que el generico -> mis
+    # fills enmascarados se sobrestimaban ~150%. 0 = todavia sin datos suficientes.
+    "MI_TICKET_MEDIO":      0.0,
     # Ritmo MEDIDO del mercado en esa posicion (ordenes/hora por pierna).
     # Lo calcula recalibrar_ritmo() con fills observados; 0 = todavia sin medir.
     "RITMO_MEDIDO_ORD_H":   0.0,
@@ -144,6 +152,7 @@ CONFIG_TYPE_MAP = {
     "COMISION_BN_VERIF":    float,
     "MI_NICKNAME":          str,
     "MI_POSICION_OBJETIVO": int,
+    "MI_TICKET_MEDIO":      float,
     "RITMO_MEDIDO_ORD_H":   float,
     "RITMO_MEDIDO_RANGO":   str,
     "COM_TAKER_FIJA_USDT":  float,
@@ -513,6 +522,50 @@ def recalibrar_tickets():
     if nuevos:
         guardar_config_db(nuevos)
     return nuevos
+
+
+def recalibrar_mi_ticket():
+    """TICKET PROPIO (COL24), medido de mis_ordenes_reales (el CSV real que
+    Sebastian importa) en vez del generico del mercado.
+
+    Por que hace falta ademas de recalibrar_tickets(): el ticket por anunciante
+    que ya calcula el FillTracker (st["tickets"]) vive SOLO en memoria del
+    proceso, asi que se resetea con cada redeploy. En un ciclo de desarrollo
+    activo (COL16->COL23 en pocos dias) eso paso seguido, y el ticket de MI
+    cuenta nunca llegaba a las 3 muestras necesarias antes del siguiente reset
+    -> siempre caia al generico del MERCADO (~400 USDT), 6x mas grande que mi
+    ticket real (~69 USDT, medido). Esto INFLABA mis fills 'enmascarado' ~150%.
+
+    mis_ordenes_reales SI persiste (viene del CSV), asi que sirve de ancla
+    estable: sobrevive a cualquier redeploy. Se usa solo como FALLBACK cuando
+    el historial en memoria todavia no tiene datos (recien reiniciado)."""
+    with config_lock:
+        nick = str(config.get("MI_NICKNAME") or "").strip()
+    if not nick:
+        return {}
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY usdt) AS mediana,
+                           COUNT(*) AS n
+                    FROM mis_ordenes_reales
+                    WHERE rol = 'maker' AND estado = 'completada' AND usdt > 0
+                """)
+                r = cur.fetchone()
+    except Exception as e:
+        print(f"[MI_TICKET] {e}")
+        return {}
+    if not r or not r["n"] or int(r["n"]) < 5 or r["mediana"] is None:
+        print(f"[MI_TICKET] muestras insuficientes ({r['n'] if r else 0}<5), se mantiene el valor actual")
+        return {}
+    val = round(float(r["mediana"]), 1)
+    with config_lock:
+        anterior = config.get("MI_TICKET_MEDIO")
+        config["MI_TICKET_MEDIO"] = val
+    print(f"[MI_TICKET] auto-calibrado: {anterior} -> {val} USDT (mediana de {r['n']} órdenes reales)")
+    guardar_config_db({"MI_TICKET_MEDIO": val})
+    return {"MI_TICKET_MEDIO": val}
 
 
 def recalibrar_ritmo():
@@ -1074,9 +1127,16 @@ class FillTracker:
     def _cfg(self):
         with config_lock:
             tk_key = "FILL_TICKET_DEF_BYBIT" if self.exchange == "bybit" else "FILL_TICKET_DEF"
+            # ticket propio (COL24): solo aplica a MI cuenta y solo en Binance
+            # (MI_NICKNAME es un nick de Binance P2P). Persiste en DB, asi que
+            # sobrevive a los redeploys -- a diferencia de st["tickets"], que es
+            # en memoria y se resetea con cada uno.
+            mi_nick   = str(config.get("MI_NICKNAME") or "").strip().lower() if self.exchange == "binance" else ""
+            mi_ticket = float(config.get("MI_TICKET_MEDIO", 0) or 0) if self.exchange == "binance" else 0.0
             return (float(config.get("FILL_CAP_USDT", 10000)),
                     float(config.get("FILL_VENTANA_MIN", 15)),
-                    float(config.get(tk_key, config.get("FILL_TICKET_DEF", 272))))
+                    float(config.get(tk_key, config.get("FILL_TICKET_DEF", 272))),
+                    mi_nick, mi_ticket)
 
     def _ticket(self, st, defecto):
         tk = st.get("tickets")
@@ -1104,7 +1164,7 @@ class FillTracker:
         - ANTI-CANCELADA: al confirmar, se toman como maximo d_comp pendientes,
           los mas VIEJOS primero. Una orden cancelada (la caida mas nueva) queda
           sin confirmar y luego revierte/expira sola, sin inflar el volumen."""
-        cap, ventana_min, ticket_def = self._cfg()
+        cap, ventana_min, ticket_def, mi_nick, mi_ticket = self._cfg()
         ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         vistos = set()
         seguros = []       # fills confirmados por evidencia real (stock/pendientes)
@@ -1210,7 +1270,14 @@ class FillTracker:
             explicadas = ordenes_por_stock.get(mc["nombre"], 0)
             residual = mc["resid"] - explicadas
             if residual > 0:
-                monto = min(residual * self._ticket(mc["st"], ticket_def), cap)
+                # ticket propio (COL24): si es MI cuenta y ya tengo un ticket
+                # medido de mis ordenes reales, ese es el default -- no el
+                # generico del mercado. self._ticket() igual prioriza el
+                # historial en memoria (st["tickets"]) si ya acumulo 3+
+                # muestras en este proceso; esto solo mejora el FALLBACK.
+                es_mi_cuenta = mi_nick and mc["nombre"].strip().lower() == mi_nick
+                default_ticket = mi_ticket if (es_mi_cuenta and mi_ticket > 0) else ticket_def
+                monto = min(residual * self._ticket(mc["st"], default_ticket), cap)
                 if monto > 0:
                     seguros.append({"key": mc["key"], "tipo": mc["tipo"], "nombre": mc["nombre"],
                                     "monto": monto, "ordenes": residual,
@@ -1645,6 +1712,10 @@ def ciclo_colector():
                     recalibrar_horarios()
                 except Exception as e:
                     print(f"[HORARIOS diario] {e}")
+                try:
+                    recalibrar_mi_ticket()
+                except Exception as e:
+                    print(f"[MI_TICKET diario] {e}")
                 _ultima_purga = hoy
             print("[COLECTOR] Consultando Binance BUY...")
             raw_compra = obtener_anuncios("BUY")
@@ -9428,6 +9499,10 @@ def _boot():
         recalibrar_horarios()  # perfil de cada hora (plan de hoy + gap adaptativo)
     except Exception as e:
         print(f"[HORARIOS boot] {e}")
+    try:
+        recalibrar_mi_ticket()  # ticket propio desde el CSV real: sobrevive redeploys
+    except Exception as e:
+        print(f"[MI_TICKET boot] {e}")
     threading.Thread(target=ciclo_colector, daemon=True).start()
     threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
 
