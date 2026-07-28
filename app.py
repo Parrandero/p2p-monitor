@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL24"
+VERSION       = "COL25"
 VERSION_FECHA = "2026-07-28"
 
 config = {
@@ -114,6 +114,13 @@ config = {
     #   fuera de 40-60 -> correccion: repreciar AGRESIVO el lado corto (todavia maker).
     #   <30 o >70      -> limite duro: cruzar como TAKER si o si.
     # A futuro el monitor la afina solo viendo con que % se queda trabado.
+    # ── Rutinas de mantenimiento (COL25): cada cuantos dias toca cada tarea ──
+    # Se avisa en el dashboard. Los dias salen de la experiencia de la sesion
+    # 28-jul: el ancla driftea si pasan varios dias, el CSV afina calibracion y
+    # ticket propio, y el backup protege ante la purga automatica.
+    "RUT_ANCLA_DIAS":       3,     # re-anclar inventario (saldos reales)
+    "RUT_CSV_DIAS":         10,    # importar CSV de Binance (calibracion)
+    "RUT_BACKUP_DIAS":      7,     # backup general de la base
     "INV_BANDA_MIN":        40,
     "INV_BANDA_MAX":        60,
     "INV_DURO_MIN":         30,
@@ -157,6 +164,9 @@ CONFIG_TYPE_MAP = {
     "RITMO_MEDIDO_RANGO":   str,
     "COM_TAKER_FIJA_USDT":  float,
     "COM_MAKER_PCT":        float,
+    "RUT_ANCLA_DIAS":       int,
+    "RUT_CSV_DIAS":         int,
+    "RUT_BACKUP_DIAS":      int,
     "INV_BANDA_MIN":        float,
     "INV_BANDA_MAX":        float,
     "INV_DURO_MIN":         float,
@@ -419,6 +429,21 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_mov_inv_ts ON movimientos_inventario(ts)")
+            # ── RUTINAS (COL25): mantenimiento recurrente ────────────────
+            # Registro de cuando se hizo por ultima vez cada tarea periodica.
+            # Va en la DB y NO en localStorage a proposito: el backup viejo se
+            # guardaba en el navegador, asi que al abrir desde el telefono
+            # creia que nunca se habia hecho. En DB el estado es unico y real,
+            # se mire desde donde se mire.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rutinas_log (
+                    id SERIAL PRIMARY KEY,
+                    tarea TEXT NOT NULL,
+                    ts TIMESTAMP NOT NULL,
+                    nota TEXT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_rutinas_tarea ON rutinas_log(tarea, ts DESC)")
             # ── Perfil por hora del dia (COL19) ──
             # Cachea el calculo pesado (spread x flujo por hora) que alimenta al
             # Plan de hoy y al gap adaptativo. Se recalcula 1x/dia.
@@ -5364,6 +5389,10 @@ function Backup() {
     a.download = "backup_p2p.zip";
     document.body.appendChild(a); a.click(); a.remove();
     try { localStorage.setItem("ua_p2p_last_backup", String(Date.now())); } catch (e) {}
+    // COL25: registra la rutina en la DB, asi el recordatorio se apaga solo y
+    // el estado es el mismo desde cualquier dispositivo (antes vivia en
+    // localStorage y el telefono creia que nunca se habia hecho backup).
+    try { window.P2P_AUTH.post(B + "/api/rutinas/marcar", { tarea: "backup" }); } catch (e) {}
     setMsg("✅ Backup general (Binance + Bybit) en un ZIP. Guardalo en Drive o disco externo.");
   };
   const vaciar = async () => {
@@ -5442,6 +5471,108 @@ function BackupBanner({ onGo }) {
       <span className="bb-txt">{txt}</span>
       <button className="bb-go" onClick={onGo}>{discoAlto ? "Ir a Backup" : "Hacer backup"}</button>
       <button className="bb-x" onClick={() => setDismissed(true)} aria-label="cerrar">✕</button>
+    </div>
+  );
+}
+
+/* ============================================================
+   RUTINAS DE MANTENIMIENTO (COL25)
+   Reemplaza al BackupBanner viejo, que guardaba la fecha en localStorage y
+   por eso cada dispositivo creia una cosa distinta. Ahora el estado sale de
+   la DB: ancla y CSV se detectan solos de la actividad real; el backup se
+   marca a mano porque el ZIP se descarga fuera del monitor.
+   ============================================================ */
+const RUT_COLOR = { vencida: "var(--sell)", nunca: "var(--sell)", pronto: "var(--warn)", ok: "var(--buy)" };
+
+function RutinasPanel({ onGoBackup }) {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  const [abierto, setAbierto] = React.useState(false);
+  const [msg, setMsg] = React.useState("");
+  const cargar = React.useCallback(() => {
+    fetch(B + "/api/rutinas").then(r => r.json()).then(setD).catch(() => {});
+  }, []);
+  React.useEffect(() => { cargar(); const id = setInterval(cargar, 300000); return () => clearInterval(id); }, [cargar]);
+  if (!d || !d.rutinas || !d.rutinas.length) return null;
+
+  const marcarBackup = () => {
+    window.P2P_AUTH.post(B + "/api/rutinas/marcar", { tarea: "backup" })
+      .then(r => r.json().then(j => ({ ok: r.ok && j && j.ok !== false })))
+      .then(({ ok }) => { setMsg(ok ? "✓ backup registrado" : "✗ no se pudo registrar"); cargar(); setTimeout(() => setMsg(""), 6000); })
+      .catch(() => setMsg("✗ error de red"));
+  };
+
+  const pendientes = d.rutinas.filter(r => r.estado === "vencida" || r.estado === "nunca");
+  const proximas = d.rutinas.filter(r => r.estado === "pronto");
+  // si no hay nada vencido ni por vencer, el panel se calla (no ocupa lugar)
+  if (!pendientes.length && !proximas.length && !abierto) {
+    return (
+      <button onClick={() => setAbierto(true)}
+        style={{ margin: "10px 0 0", cursor: "pointer", background: "transparent", border: "none",
+                 color: "var(--text-3)", fontSize: 11, fontFamily: "var(--font)" }}>
+        ✓ mantenimiento al día — ver rutinas
+      </button>
+    );
+  }
+  const urgente = pendientes.length > 0;
+  const tono = urgente ? "var(--sell)" : "var(--warn)";
+
+  const fila = (r) => {
+    const col = RUT_COLOR[r.estado] || "var(--text-3)";
+    const cuando = r.estado === "nunca" ? "nunca se hizo"
+      : r.estado === "vencida" ? "hace " + r.dias_desde + " días (toca cada " + r.cada + ")"
+      : "en " + r.dias_restantes + " días";
+    return (
+      <div key={r.id} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "8px 0",
+                               borderTop: "1px solid var(--line-soft)" }}>
+        <span style={{ color: col, fontSize: 13, lineHeight: 1.3 }}>
+          {r.estado === "ok" ? "✓" : r.estado === "pronto" ? "◔" : "●"}
+        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12.5, color: "var(--text)" }}>
+            <b>{r.titulo}</b> <span style={{ color: col, fontSize: 11 }}>· {cuando}</span>
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text-2)", marginTop: 2 }}>{r.accion}</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 1 }}>{r.porque}</div>
+        </div>
+        {r.id === "backup" && (
+          <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+            <button onClick={onGoBackup} style={{ cursor: "pointer", borderRadius: 7, padding: "4px 10px",
+              border: "1px solid var(--accent)", background: "var(--accent-soft)", color: "var(--accent)",
+              fontSize: 11, fontFamily: "var(--mono)" }}>Ir</button>
+            <button onClick={marcarBackup} title="Ya lo hice (registra la fecha)"
+              style={{ cursor: "pointer", borderRadius: 7, padding: "4px 10px", border: "1px solid var(--line)",
+              background: "transparent", color: "var(--text-3)", fontSize: 11, fontFamily: "var(--mono)" }}>Ya está</button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)",
+                  borderLeft: "4px solid " + tono, borderRadius: 14, padding: "11px 16px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Mantenimiento</span>
+        <span style={{ fontFamily: "var(--mono)", fontSize: 13, fontWeight: 600, color: tono }}>
+          {pendientes.length ? pendientes.length + " pendiente" + (pendientes.length > 1 ? "s" : "") : proximas.length + " por vencer"}
+        </span>
+        {!abierto && (
+          <span style={{ fontSize: 11.5, color: "var(--text-2)" }}>
+            {(pendientes.length ? pendientes : proximas).map(r => r.titulo).join(" · ")}
+          </span>
+        )}
+        {msg && <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: msg[0] === "✓" ? "var(--buy)" : "var(--warn)" }}>{msg}</span>}
+        <button onClick={() => setAbierto(!abierto)}
+          style={{ marginLeft: "auto", background: "transparent", border: "1px solid var(--line)",
+                   borderRadius: 7, color: "var(--text-3)", fontSize: 11, padding: "3px 10px", cursor: "pointer" }}>
+          {abierto ? "ocultar" : "ver"}
+        </button>
+      </div>
+      {abierto && <div style={{ marginTop: 6 }}>{d.rutinas.map(fila)}</div>}
+      {!abierto && pendientes.length > 0 && (
+        <div style={{ marginTop: 6 }}>{pendientes.map(fila)}</div>
+      )}
     </div>
   );
 }
@@ -6725,7 +6856,7 @@ function CalculadoraCruzar() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar };
+window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
 
 </script>
 <script type="text/babel">
@@ -6802,7 +6933,7 @@ function App() {
       <Core.TopBar snap={viewSnap} secondsLeft={secondsLeft} cycleMs={state.cycleMs} />
       <Core.Tabs tab={tab} setTab={setTab} />
       <V.VolumenBar />
-      {tab !== "backup" && <V.BackupBanner onGo={() => setTab("backup")} />}
+      {tab !== "backup" && <V.RutinasPanel onGoBackup={() => setTab("backup")} />}
       <main className="content">
         {tab === "tr" && <V.PlanHoy />}
         {tab === "tr" && <V.ChipBalance />}
@@ -9067,6 +9198,126 @@ def api_inventario():
         "nota": ("Estimado: el monitor no ve el banco ni las órdenes taker que no cargues. "
                  "Exacto al anclar, aproximado después. Volvé a anclar para medir el drift."),
     })
+
+
+@app.route("/api/rutinas")
+def api_rutinas():
+    """RUTINAS DE MANTENIMIENTO (COL25): que tareas periodicas estan vencidas.
+
+    Cada rutina detecta sola su ultima vez desde datos REALES, no depende de
+    que el usuario marque nada:
+      - ancla  -> ultima fila de inventario_ancla
+      - csv    -> ultimo 'importado' en mis_ordenes_reales
+      - backup -> unica que no deja rastro propio (el ZIP se baja al disco del
+                  usuario), asi que usa rutinas_log, marcado desde el frontend.
+    Asi el estado es real y unico: se ve igual desde la compu o el telefono
+    (antes el backup vivia en localStorage y cada dispositivo creia otra cosa)."""
+    with config_lock:
+        c = dict(config)
+    now = datetime.now(SANTIAGO_TZ)
+
+    def dias_desde(dt):
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=SANTIAGO_TZ)
+        return (now - dt).total_seconds() / 86400.0
+
+    ultimos = {"ancla": None, "csv": None, "backup": None}
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT MAX(ts) m FROM inventario_ancla")
+                ultimos["ancla"] = (cur.fetchone() or {}).get("m")
+                cur.execute("SELECT MAX(importado) m FROM mis_ordenes_reales")
+                ultimos["csv"] = (cur.fetchone() or {}).get("m")
+                cur.execute("SELECT MAX(ts) m FROM rutinas_log WHERE tarea='backup'")
+                ultimos["backup"] = (cur.fetchone() or {}).get("m")
+    except Exception as e:
+        print(f"[rutinas] {e}")
+        return jsonify({"rutinas": [], "error": str(e)[:200]})
+
+    # disco: entra como señal extra para el backup (si esta lleno, urge mas)
+    pct_disco = None
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_database_size(current_database())")
+                usado_mb = float(cur.fetchone()[0]) / 1024 / 1024
+                pct_disco = round(usado_mb / 500 * 100)
+    except Exception:
+        pass
+
+    defs = [
+        {"id": "ancla", "titulo": "Re-anclar inventario",
+         "cada": int(c.get("RUT_ANCLA_DIAS", 3)),
+         "accion": "Actualizar saldos reales (Binance + Mercado Pago)",
+         "porque": "La estimación se desvía con el tiempo; anclar la corrige y mide el drift.",
+         "auto": True},
+        {"id": "csv", "titulo": "Importar CSV de Binance",
+         "cada": int(c.get("RUT_CSV_DIAS", 10)),
+         "accion": "Exportar órdenes y correr scripts/importar_mis_ordenes.bat",
+         "porque": "Recalibra la detección y tu ticket propio (lo que estima tus fills ocultos).",
+         "auto": True},
+        {"id": "backup", "titulo": "Backup de la base",
+         "cada": int(c.get("RUT_BACKUP_DIAS", 7)),
+         "accion": "Pestaña Backup → descargar el ZIP general",
+         "porque": "El detalle del libro se purga a los 7 días: lo que no se respalda, se pierde.",
+         "auto": False},
+    ]
+    rutinas, vencidas = [], 0
+    for d in defs:
+        dd = dias_desde(ultimos[d["id"]])
+        cada = max(1, d["cada"])
+        if dd is None:
+            estado, restantes = "nunca", 0
+        elif dd >= cada:
+            estado, restantes = "vencida", 0
+        elif dd >= cada * 0.75:
+            estado, restantes = "pronto", round(cada - dd, 1)
+        else:
+            estado, restantes = "ok", round(cada - dd, 1)
+        if estado in ("vencida", "nunca"):
+            vencidas += 1
+        rutinas.append({**d,
+                        "ultima": str(ultimos[d["id"]]) if ultimos[d["id"]] else None,
+                        "dias_desde": round(dd, 1) if dd is not None else None,
+                        "estado": estado, "dias_restantes": restantes})
+
+    # el disco lleno adelanta el backup: no tiene sentido esperar los 7 dias
+    if pct_disco is not None and pct_disco >= 70:
+        for r in rutinas:
+            if r["id"] == "backup" and r["estado"] not in ("vencida", "nunca"):
+                r["estado"] = "vencida"
+                r["porque"] = f"Disco al {pct_disco}%: conviene respaldar y vaciar listas."
+                vencidas += 1
+    return jsonify({"rutinas": rutinas, "vencidas": vencidas, "pct_disco": pct_disco,
+                    "nota": "Las rutinas de ancla y CSV se detectan solas de la actividad real. "
+                            "El backup hay que marcarlo porque el ZIP se descarga fuera del monitor."})
+
+
+@app.route("/api/rutinas/marcar", methods=["POST"])
+def api_rutinas_marcar():
+    """Marca una rutina como hecha. Hoy solo hace falta para 'backup' (las
+    otras se detectan solas), pero se acepta cualquiera por si se agrega otra."""
+    if not _token_ok():
+        return jsonify({"ok": False, "error": "token requerido o invalido"}), 401
+    data = request.get_json() or {}
+    tarea = (data.get("tarea") or "").strip().lower()
+    if tarea not in ("ancla", "csv", "backup"):
+        return jsonify({"ok": False, "error": "tarea invalida"}), 400
+    now = datetime.now(SANTIAGO_TZ)
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO rutinas_log (tarea, ts, nota) VALUES (%s,%s,%s)",
+                            (tarea, now.strftime("%Y-%m-%d %H:%M:%S"),
+                             (data.get("nota") or "")[:200]))
+            conn.commit()
+    except Exception as e:
+        print(f"[rutinas marcar] {e}")
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+    return jsonify({"ok": True, "tarea": tarea, "ts": now.strftime("%Y-%m-%d %H:%M:%S")})
 
 
 @app.route("/api/inventario/ancla", methods=["POST"])
