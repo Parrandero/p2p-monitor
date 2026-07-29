@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL29"
+VERSION       = "COL30"
 VERSION_FECHA = "2026-07-29"
 
 config = {
@@ -2568,8 +2568,8 @@ window.P2P_AUTH = {
 <script>
 /* ============================================================
    Unión Austral · P2P Monitor — utilidades compartidas del front
-   fmt*/clasificar/applyFilters/FILTROS_DEFAULT/COLOR_TONE los usa
-   la app real en vivo (filtros de Tiempo Real, formateo de precios,
+   fmtPrice/fmtNum/fmtPct/clasificar/applyFilters/FILTROS_DEFAULT/COLOR_TONE
+   los usa la app real en vivo (filtros de Tiempo Real, formateo de precios,
    umbrales de semáforo). NO es un motor de datos simulados: el
    generador de precios falsos (createEngine y su fallback silencioso
    ante fallos del backend) se retiró en COL29 — si el fetch inicial
