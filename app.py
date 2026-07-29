@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL30"
+VERSION       = "COL31"
 VERSION_FECHA = "2026-07-29"
 
 config = {
@@ -43,6 +43,11 @@ config = {
     "COSTO_TRANSFER_USDT":  1.0,     # ~1 USDT fijo por transferir USDT entre exchanges (red TRC20)
     # Spread neto mínimo (después de comisiones) para considerar operable.
     "SPREAD_MIN_OPERATIVO": 0.35,
+    # Cuantos dias de detalle crudo (top-80 cada 2 min) se conservan.
+    # Pesa ~25 MB/dia entre Binance y Bybit. Con 10 dias la base se estabiliza
+    # en ~270 MB de los 500 disponibles (53%), asi que NO hace falta vaciar a
+    # mano: la purga diaria sola la mantiene ahi. (COL31: era 7 fijo en el codigo.)
+    "DETALLE_DIAS":         10,
     "TOP_ANUNCIOS":         80,   # 4 páginas × 20 = 80 por lado (detalle/profundidad)
     "BANDA_DETALLE_PCT":    6,    # descarta del detalle anuncios con precio fuera de +-6% del tope real (anti-basura, mismo criterio Binance/Bybit)
     "ANALISIS_TOP":         20,   # cabecera del libro p/ spread y liquidez (mantiene baseline)
@@ -143,6 +148,7 @@ CONFIG_TYPE_MAP = {
     "FILTRO_MIN_USDT":      float,
     "FILTRO_MIN_ORD":       int,
     "FILTRO_MIN_TASA":      float,
+    "DETALLE_DIAS":         int,
     "INTERVALO_MIN":        int,
     "COMISION_BN":          float,
     "SPREAD_MIN_OPERATIVO": float,
@@ -384,6 +390,12 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_agr_fecha ON agregados_anunciante_dia(fecha)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_agr_anun ON agregados_anunciante_dia(anunciante, fecha)")
+            # ticket propio de cada anunciante (COL31). Aditiva: en los dias
+            # viejos queda NULL y no rompe nada. La llena guardar_agregados_dia
+            # con la mediana de sus fills 'directo'; la lee al arranque
+            # recalibrar_tickets_por_anunciante() para que el FillTracker no
+            # empiece de cero en cada redeploy.
+            cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS ticket_medio NUMERIC")
             # \u2500\u2500 MIS ORDENES REALES (verdad de terreno para calibrar) \u2500\u2500
             # Se importan del CSV de Binance. Es el unico caso donde sabemos que
             # paso de verdad: comparar contra lo que el monitor infirio desde
@@ -895,8 +907,9 @@ def recalibrar_bandas():
 
 def guardar_agregados_dia(fecha=None):
     """Congela el resumen diario ANTES de que la purga recicle el detalle top-80.
-    Sin esto perdemos la historia: snapshots_detalle solo guarda ~7 dias, asi
-    que todo analisis de competidores quedaba limitado a esa ventana movil.
+    Sin esto perdemos la historia: snapshots_detalle solo guarda DETALLE_DIAS
+    (10 por defecto), asi que todo analisis de competidores quedaria limitado a
+    esa ventana movil.
 
     Lo mas valioso que preserva: ordenes_dia = delta del contador OFICIAL de
     Binance (monthOrderCount) por anunciante. Eso NO es estimacion nuestra, es
@@ -934,12 +947,86 @@ def guardar_agregados_dia(fecha=None):
                             es_merchant = EXCLUDED.es_merchant
                     """, {"ex": ex, "f": fecha or (datetime.now(SANTIAGO_TZ).date() - timedelta(days=1))})
                     total += cur.rowcount
+
+                # ── ticket propio de cada anunciante (COL31) ──────────────
+                # OJO: se calcula SOLO con fills 'directo'. Los 'enmascarado'
+                # ya se estimaron multiplicando POR un ticket, asi que usarlos
+                # aca seria circular (el estimador comiendose su propia cola).
+                # monto/ordenes replica exactamente lo que el FillTracker mete
+                # en st["tickets"] (d_disp/resid), incluido el tope de 5000 que
+                # descarta outliers, y el minimo de 3 muestras de _ticket().
+                cur.execute("""
+                    UPDATE agregados_anunciante_dia a
+                    SET ticket_medio = t.tk
+                    FROM (
+                        SELECT exchange, anunciante, tipo,
+                               PERCENTILE_CONT(0.5) WITHIN GROUP (
+                                   ORDER BY monto / NULLIF(ordenes, 0)) AS tk
+                        FROM fills_estimados
+                        WHERE ts::date = %(f)s AND metodo = 'directo'
+                          AND ordenes > 0 AND monto > 0 AND monto < 5000
+                        GROUP BY 1, 2, 3
+                        HAVING COUNT(*) >= 3
+                    ) t
+                    WHERE a.fecha = %(f)s AND a.exchange = t.exchange
+                      AND a.anunciante = t.anunciante AND a.tipo = t.tipo
+                """, {"f": fecha or (datetime.now(SANTIAGO_TZ).date() - timedelta(days=1))})
             conn.commit()
         if total:
             print(f"[AGREGADOS] {total:,} filas anunciante/dia congeladas")
     except Exception as e:
         print(f"[AGREGADOS] {e}")
     return total
+
+
+def recalibrar_tickets_por_anunciante(dias=14):
+    """Carga a memoria el ticket propio de CADA anunciante, desde el agregado
+    permanente. Devuelve cuantos cargo.
+
+    POR QUE EXISTE (COL31): el FillTracker ya aprende el ticket de cada
+    anunciante en st["tickets"], pero eso vive SOLO en memoria del proceso y
+    necesita 3 muestras para activarse. Cada redeploy lo borra, asi que en la
+    practica casi nunca llega a usarse y todos los anunciantes terminan
+    estimados con el ticket GENERICO del mercado. Medido: los tickets reales
+    van de ~170 a ~2.900 USDT contra un generico de ~785, y el 32% del volumen
+    se estima justamente asi. Es el mismo problema que en COL24 inflo MI
+    volumen +154,6% -- aquel fix persistio solo MI ticket; este lo generaliza
+    a todos, leyendo del agregado que ya es permanente.
+
+    No pisa lo que el tracker aprende en vivo: solo mejora el FALLBACK (ver
+    _ticket(), que sigue prefiriendo st["tickets"] cuando tiene 3+ muestras).
+
+    DE DONDE LEE: de fills_estimados, no del agregado. Es a proposito — el
+    agregado recien tiene el dato despues de la primera corrida diaria, asi
+    que leer de ahi dejaria el arranque sin tickets por hasta 24h. Los fills
+    se retienen 30 dias, de sobra para la ventana que se pide. La columna
+    ticket_medio del agregado guarda lo mismo pero para SIEMPRE (analisis
+    historico mas alla de esos 30 dias), no para este arranque."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT anunciante, tipo,
+                           PERCENTILE_CONT(0.5) WITHIN GROUP (
+                               ORDER BY monto / NULLIF(ordenes, 0)) AS tk
+                    FROM fills_estimados
+                    WHERE exchange = 'binance' AND metodo = 'directo'
+                      AND ordenes > 0 AND monto > 0 AND monto < 5000
+                      AND ts >= NOW() - (%s || ' days')::INTERVAL
+                    GROUP BY 1, 2
+                    HAVING COUNT(*) >= 3
+                """, [dias])
+                mapa = {(r["anunciante"], r["tipo"]): float(r["tk"])
+                        for r in cur.fetchall() if r["tk"] and float(r["tk"]) > 0}
+        fill_tracker.tk_previo = mapa
+        if mapa:
+            vals = sorted(mapa.values())
+            print(f"[TICKET x ANUNCIANTE] {len(mapa)} cargados · "
+                  f"mediana {vals[len(vals)//2]:,.0f} USDT")
+        return len(mapa)
+    except Exception as e:
+        print(f"[TICKET x ANUNCIANTE] {e}")
+        return 0
 
 
 def guardar_config_db(cambios):
@@ -1324,6 +1411,10 @@ class FillTracker:
         self.exchange = exchange
         self.est = {}            # (anunciante, tipo) -> estado
         self.recent_fills = {}   # (anunciante, tipo) -> deque[(dt, monto)]
+        # (anunciante, tipo) -> ticket medido en dias anteriores, leido del
+        # agregado permanente al arrancar (COL31). Sobrevive redeploys; se usa
+        # solo como FALLBACK, st["tickets"] de este proceso tiene prioridad.
+        self.tk_previo = {}
 
     def _cfg(self):
         with config_lock:
@@ -1476,8 +1567,15 @@ class FillTracker:
                 # generico del mercado. self._ticket() igual prioriza el
                 # historial en memoria (st["tickets"]) si ya acumulo 3+
                 # muestras en este proceso; esto solo mejora el FALLBACK.
+                # COL31: el mismo criterio para CUALQUIER anunciante, usando el
+                # ticket que ya se le midio en dias previos (tk_previo, leido
+                # del agregado permanente). Orden de preferencia:
+                #   st["tickets"] de este proceso > mi ticket / el suyo previo > generico
                 es_mi_cuenta = mi_nick and mc["nombre"].strip().lower() == mi_nick
-                default_ticket = mi_ticket if (es_mi_cuenta and mi_ticket > 0) else ticket_def
+                if es_mi_cuenta and mi_ticket > 0:
+                    default_ticket = mi_ticket
+                else:
+                    default_ticket = self.tk_previo.get(mc["key"]) or ticket_def
                 monto = min(residual * self._ticket(mc["st"], default_ticket), cap)
                 if monto > 0:
                     seguros.append({"key": mc["key"], "tipo": mc["tipo"], "nombre": mc["nombre"],
@@ -1907,7 +2005,9 @@ def ciclo_colector():
                     guardar_agregados_dia(hoy)   # parcial del dia en curso
                 except Exception as e:
                     print(f"[AGREGADOS diario] {e}")
-                purgar_detalle_antiguo(dias=7)
+                with config_lock:
+                    _det_dias = int(config.get("DETALLE_DIAS", 10) or 10)
+                purgar_detalle_antiguo(dias=_det_dias)
                 try:
                     purgar_fills_antiguos(dias=30)
                 except Exception as e:
@@ -1928,6 +2028,10 @@ def ciclo_colector():
                     recalibrar_mi_ticket()
                 except Exception as e:
                     print(f"[MI_TICKET diario] {e}")
+                try:
+                    recalibrar_tickets_por_anunciante()
+                except Exception as e:
+                    print(f"[TICKET x ANUN diario] {e}")
                 try:
                     recalibrar_bandas()
                 except Exception as e:
@@ -5585,6 +5689,15 @@ function Backup() {
   const [fmt, setFmt]   = React.useState("csv");
   const [fuente, setFuente] = React.useState("binance");
   const [msg, setMsg]   = React.useState("");
+  // cuantos dias de detalle se conservan: se lee de la config, no se escribe a
+  // mano en el texto (antes decia "30 dias" fijo, que ademas era el numero
+  // equivocado y llevaba a recomendar backup mensual = perder datos)
+  const [detDias, setDetDias] = React.useState(10);
+  React.useEffect(() => {
+    fetch(B + "/api/config").then(r => r.json())
+      .then(c => { if (c && c.DETALLE_DIAS) setDetDias(Number(c.DETALLE_DIAS)); })
+      .catch(() => {});
+  }, []);
   const last = (() => { try { return parseInt(localStorage.getItem("ua_p2p_last_backup") || "0"); } catch (e) { return 0; } })();
   const lastTxt = last ? new Date(last).toLocaleString("es-CL") : "nunca";
   const diasDesde = last ? Math.floor((Date.now() - last) / 86400000) : null;
@@ -5607,7 +5720,7 @@ function Backup() {
     // el estado es el mismo desde cualquier dispositivo (antes vivia en
     // localStorage y el telefono creia que nunca se habia hecho backup).
     try { window.P2P_AUTH.post(B + "/api/rutinas/marcar", { tarea: "backup" }); } catch (e) {}
-    setMsg("✅ Backup general (Binance + Bybit) en un ZIP. Guardalo en Drive o disco externo.");
+    setMsg("✅ Backup COMPLETO: todas las tablas en un ZIP (trae un LEEME.txt con el inventario). Guardalo en Drive o disco externo.");
   };
   const vaciar = async () => {
     if (!window.confirm("¿Vaciar las listas conservando las últimas 24h? Hacé el backup ANTES. No borra precios, volumen ni historial.")) return;
@@ -5621,13 +5734,13 @@ function Backup() {
   return (
     <div className="view">
       <section className="chart-card backup-wrap">
-        <div className="card-head"><h3>Backup / Exportar base de datos</h3><span className="card-sub">descarga el detalle por anunciante</span></div>
+        <div className="card-head"><h3>Backup / Exportar base de datos</h3><span className="card-sub">todas las tablas en un ZIP</span></div>
         <div style={{ marginBottom: 6 }}><SystemBar /></div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", margin: "10px 0 6px" }}>
-          <button className="btn-apply dirty" onClick={descargarTodo}>⬇ Backup general (Binance + Bybit)</button>
+          <button className="btn-apply dirty" onClick={descargarTodo}>⬇ Backup COMPLETO (todas las tablas)</button>
           <button className="btn-reset" onClick={vaciar}>Vaciar listas (conservar 24h)</button>
         </div>
-        <p className="backup-last">Un clic baja TODO en un ZIP. Última copia: <b>{lastTxt}</b>{diasDesde !== null ? " (hace " + diasDesde + " días)" : ""}.</p>
+        <p className="backup-last">Un clic baja TODA la base en un ZIP (con un LEEME.txt adentro). Última copia: <b>{lastTxt}</b>{diasDesde !== null ? " (hace " + diasDesde + " días)" : ""}.</p>
         <div className="backup-grid">
           <div className="f-item"><label>Exchange</label>
             <select value={fuente} onChange={e => setFuente(e.target.value)}>
@@ -5654,10 +5767,11 @@ function Backup() {
         </div>
         {msg && <div className="backup-msg">{msg}</div>}
         <div className="backup-help">
+          <b>Qué trae el ZIP:</b> TODAS las tablas. El detalle crudo del libro recortado a los días que elijas, y el resto entero — precio histórico, resumen diario por competidor, tus órdenes reales, inventario y config. Adentro va un <code>LEEME.txt</code> con el inventario de lo que bajó.<br/><br/>
           <b>Cómo hacerlo vos mismo sin esta página:</b> abrí en el navegador la dirección de tu monitor seguida de:<br/>
-          <code>/api/export/detalle?dias=30&tipo=ALL&fmt=csv&fuente=binance</code><br/>
-          Cambiá <code>dias</code> por los que quieras, <code>tipo</code> por BUY/SELL/ALL, <code>fmt</code> por csv/json y <code>fuente</code> por binance/bybit. El archivo se descarga solo.<br/><br/>
-          <b>Recomendación:</b> exportá al menos una vez por semana y guardá el CSV en Drive o disco externo. La base se purga automáticamente a los 30 días, así que un backup mensual conserva tu historia completa.
+          <code>/api/export/todo?dias=30</code> (el ZIP completo) o <code>/api/export/detalle?dias=30&tipo=ALL&fmt=csv&fuente=binance</code> (solo una tabla).<br/><br/>
+          <b>La rutina, en orden:</b> 1) exportar → 2) guardar el ZIP → 3) recién ahí vaciar, si querés. <b>Nunca al revés:</b> el vaciado deja 24h, y lo que no esté en el ZIP a esa altura se pierde para siempre.<br/><br/>
+          <b>Cada cuánto:</b> una vez por semana. El detalle del libro se purga solo a los {detDias} días, así que exportando cada 7 quedan {Math.max(0, detDias - 7)} días de solape y nunca hay hueco. Un backup mensual NO alcanza: perderías las semanas del medio.
         </div>
       </section>
     </div>
@@ -9638,6 +9752,14 @@ def api_ciclo():
     })
 
 
+def _version_num(txt):
+    """'COL31' -> 31. Sirve para comparar con que version se hizo un backup.
+    Devuelve 0 si no se puede leer (backup viejo sin nota, o nota libre)."""
+    import re as _re
+    m = _re.search(r"COL(\d+)", str(txt or ""), _re.I)
+    return int(m.group(1)) if m else 0
+
+
 @app.route("/api/rutinas")
 def api_rutinas():
     """RUTINAS DE MANTENIMIENTO (COL25): que tareas periodicas estan vencidas.
@@ -9662,6 +9784,7 @@ def api_rutinas():
         return (now - dt).total_seconds() / 86400.0
 
     ultimos = {"ancla": None, "csv": None, "backup": None}
+    backup_nota = None
     try:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -9669,11 +9792,20 @@ def api_rutinas():
                 ultimos["ancla"] = (cur.fetchone() or {}).get("m")
                 cur.execute("SELECT MAX(importado) m FROM mis_ordenes_reales")
                 ultimos["csv"] = (cur.fetchone() or {}).get("m")
-                cur.execute("SELECT MAX(ts) m FROM rutinas_log WHERE tarea='backup'")
-                ultimos["backup"] = (cur.fetchone() or {}).get("m")
+                cur.execute("SELECT ts, nota FROM rutinas_log WHERE tarea='backup' "
+                            "ORDER BY ts DESC LIMIT 1")
+                r = cur.fetchone() or {}
+                ultimos["backup"] = r.get("ts")
+                backup_nota = r.get("nota")
     except Exception as e:
         print(f"[rutinas] {e}")
         return jsonify({"rutinas": [], "error": str(e)[:200]})
+
+    # ¿El ultimo backup se hizo con el formato COMPLETO? Hasta COL30 el ZIP
+    # traia 2 tablas de 14 (solo el detalle crudo, justo lo unico descartable),
+    # asi que un backup viejo NO respalda nada permanente. Sin este chequeo la
+    # rutina diria "al dia" apoyandose en un respaldo que no sirve.
+    backup_completo = _version_num(backup_nota) >= 31
 
     # disco: entra como señal extra para el backup (si esta lleno, urge mas)
     # COL26: usa la misma _uso_disco_mb() de /api/storage (tablas + WAL), asi
@@ -9699,7 +9831,8 @@ def api_rutinas():
         {"id": "backup", "titulo": "Backup de la base",
          "cada": int(c.get("RUT_BACKUP_DIAS", 7)),
          "accion": "Pestaña Backup → descargar el ZIP general",
-         "porque": "El detalle del libro se purga a los 7 días: lo que no se respalda, se pierde.",
+         "porque": (f"El detalle del libro se purga a los {int(c.get('DETALLE_DIAS', 10))} días: "
+                    "lo que no se respalda, se pierde. Exportá SIEMPRE antes de vaciar."),
          "auto": False},
     ]
     rutinas, vencidas = [], 0
@@ -9721,14 +9854,34 @@ def api_rutinas():
                         "dias_desde": round(dd, 1) if dd is not None else None,
                         "estado": estado, "dias_restantes": restantes})
 
-    # el disco lleno adelanta el backup: no tiene sentido esperar los 7 dias
+    # Un backup hecho con el formato viejo NO cuenta como respaldo: traia solo
+    # el detalle crudo (lo unico que caduca solo) y dejaba afuera TODO lo
+    # permanente — precio historico, agregado por competidor, mis ordenes
+    # reales. Se avisa hasta que se baje un ZIP nuevo.
+    if ultimos["backup"] is not None and not backup_completo:
+        for r in rutinas:
+            if r["id"] == "backup":
+                if r["estado"] not in ("vencida", "nunca"):
+                    r["estado"] = "vencida"
+                    vencidas += 1
+                r["porque"] = ("El último backup es del formato viejo (traía 2 tablas de 14): "
+                               "lo permanente — precio histórico, resumen por competidor, tus "
+                               "órdenes reales — NO está respaldado. Bajá un ZIP nuevo.")
+                r["formato_viejo"] = True
+
+    # el disco lleno adelanta el backup. Con DETALLE_DIAS=10 el techo normal es
+    # ~53%, asi que pasar de 70% significa que algo se salio de lo previsto
+    # (no es la situacion de rutina): respaldar primero, despues investigar.
     if pct_disco is not None and pct_disco >= 70:
         for r in rutinas:
             if r["id"] == "backup" and r["estado"] not in ("vencida", "nunca"):
                 r["estado"] = "vencida"
-                r["porque"] = f"Disco al {pct_disco}%: conviene respaldar y vaciar listas."
+                r["porque"] = (f"Disco al {pct_disco}%, por encima del techo esperado (~53% con "
+                               f"{int(c.get('DETALLE_DIAS', 10))} días de detalle): respaldá y "
+                               "revisá qué está creciendo de más.")
                 vencidas += 1
     return jsonify({"rutinas": rutinas, "vencidas": vencidas, "pct_disco": pct_disco,
+                    "backup_completo": backup_completo,
                     "nota": "Las rutinas de ancla y CSV se detectan solas de la actividad real. "
                             "El backup hay que marcarlo porque el ZIP se descarga fuera del monitor."})
 
@@ -9747,9 +9900,13 @@ def api_rutinas_marcar():
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # Se guarda la VERSION que hizo el backup (COL31): el formato
+                # cambio de raiz — hasta COL30 el ZIP traia 2 tablas de 14, asi
+                # que un backup viejo NO sirve como respaldo completo y la
+                # rutina tiene que poder distinguirlo (ver api_rutinas).
                 cur.execute("INSERT INTO rutinas_log (tarea, ts, nota) VALUES (%s,%s,%s)",
                             (tarea, now.strftime("%Y-%m-%d %H:%M:%S"),
-                             (data.get("nota") or "")[:200]))
+                             (data.get("nota") or VERSION)[:200]))
             conn.commit()
     except Exception as e:
         print(f"[rutinas marcar] {e}")
@@ -10077,45 +10234,126 @@ def api_export_detalle():
     )
 
 
+# Las dos tablas de detalle crudo son las PESADAS (~25 MB/dia entre las dos) y
+# ademas se purgan solas, asi que en el backup se filtran por ventana de dias.
+# Todo el resto de la base se vuelca ENTERO: son tablas chicas y son las
+# permanentes (agregado diario, precio historico, mis ordenes reales,
+# inventario, config). Si algun dia se pierde la DB de Railway, esas son las
+# irreemplazables — el detalle crudo, en cambio, esta disenado para caducar.
+EXPORT_VENTANA = {"snapshots_detalle": "snapshot_timestamp",
+                  "snapshots_detalle_bybit": "snapshot_timestamp"}
+
+
+def _tablas_de_la_base(cur):
+    """Descubre las tablas en vez de tenerlas escritas a mano.
+
+    POR QUE ASI (COL31): el backup viejo listaba dos tablas fijas, asi que
+    cada tabla nueva (agregados_anunciante_dia, mis_ordenes_reales,
+    inventario_ancla, perfil_banda...) quedaba FUERA del respaldo sin que
+    nadie se enterara. Descubriendolas, una tabla nueva entra sola."""
+    cur.execute("""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+    """)
+    return [r["table_name"] for r in cur.fetchall()]
+
+
+def _csv_de_tabla(cur, tabla, dias=None):
+    """Vuelca una tabla entera a CSV. Si la tabla tiene columna de ventana
+    (las de detalle), filtra por los ultimos `dias`."""
+    import csv, io
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = %s
+        ORDER BY ordinal_position
+    """, [tabla])
+    cols = [r["column_name"] for r in cur.fetchall()]
+    if not cols:
+        return None, 0
+    sel = ", ".join('"%s"' % c for c in cols)
+    sql = 'SELECT %s FROM "%s"' % (sel, tabla)
+    params = []
+    col_ts = EXPORT_VENTANA.get(tabla)
+    if col_ts and dias:
+        sql += ' WHERE "%s" >= NOW() - (%%s || \' days\')::INTERVAL' % col_ts
+        params.append(dias)
+        sql += ' ORDER BY "%s" DESC' % col_ts
+    cur.execute(sql, params)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    n = 0
+    for r in cur.fetchall():
+        fila = []
+        for c in cols:
+            v = r[c]
+            if v is None:
+                fila.append("")
+            elif isinstance(v, datetime):
+                fila.append(str(v)[:19])
+            else:
+                fila.append(v)
+        w.writerow(fila)
+        n += 1
+    return buf.getvalue(), n
+
+
 @app.route("/api/export/todo")
 def api_export_todo():
-    """Backup general en UN clic: ZIP con el detalle de Binance y Bybit.
-    Param: ?dias=N (default 30, cubre toda la base)."""
-    import csv, io, zipfile
+    """Backup COMPLETO en un clic: ZIP con TODAS las tablas de la base.
+    El detalle crudo (pesado) se recorta a ?dias=N (default 30); el resto va
+    entero. Incluye un LEEME.txt con el inventario de lo que trae.
+    Param: ?dias=N"""
+    import io, zipfile
     try:
         dias = int(request.args.get("dias", 30))
     except (ValueError, TypeError):
         dias = 30
-    campos = ["snapshot_timestamp", "hora", "tipo", "posicion", "anunciante",
-              "precio", "disponible", "completadas", "tasa_exito", "es_merchant"]
-    def csv_de(tabla):
-        buf = io.StringIO(); w = csv.writer(buf); w.writerow(campos)
+    hoy = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d")
+    # nombres lindos para las dos de detalle (compatibilidad con los backups viejos)
+    ALIAS = {"snapshots_detalle": "binance", "snapshots_detalle_bybit": "bybit"}
+
+    zbuf = io.BytesIO()
+    resumen, fallos = [], []
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT snapshot_timestamp, hora, tipo, posicion, anunciante,
-                           precio, disponible, completadas, tasa_exito, es_merchant
-                    FROM """ + tabla + """
-                    WHERE snapshot_timestamp >= NOW() - (%s || ' days')::INTERVAL
-                    ORDER BY snapshot_timestamp DESC, tipo, posicion
-                """, [dias])
-                for r in cur.fetchall():
-                    w.writerow([str(r["snapshot_timestamp"])[:19], r["hora"], r["tipo"], r["posicion"],
-                                r["anunciante"],
-                                float(r["precio"]) if r["precio"] is not None else "",
-                                float(r["disponible"]) if r["disponible"] is not None else "",
-                                r["completadas"],
-                                float(r["tasa_exito"]) if r["tasa_exito"] is not None else "",
-                                r["es_merchant"]])
-        return buf.getvalue()
-    hoy = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d")
-    zbuf = io.BytesIO()
-    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-        for tabla, nombre in (("snapshots_detalle", "binance"), ("snapshots_detalle_bybit", "bybit")):
-            try:
-                z.writestr(f"{nombre}_{hoy}.csv", csv_de(tabla))
-            except Exception as e:
-                print(f"[export todo {nombre}]", e)
+                for tabla in _tablas_de_la_base(cur):
+                    nombre = ALIAS.get(tabla, tabla)
+                    try:
+                        contenido, n = _csv_de_tabla(cur, tabla, dias)
+                        if contenido is None:
+                            continue
+                        z.writestr(f"{nombre}_{hoy}.csv", contenido)
+                        ventana = f"ultimos {dias} dias" if tabla in EXPORT_VENTANA else "TABLA COMPLETA"
+                        resumen.append(f"  {nombre}_{hoy}.csv    {n:>9,} filas   ({ventana})")
+                    except Exception as e:
+                        fallos.append(f"  {tabla}: {e}")
+                        print(f"[export todo {tabla}]", e)
+        leeme = [
+            "BACKUP COMPLETO — P2P Monitor (Union Austral)",
+            f"Generado: {datetime.now(SANTIAGO_TZ).strftime('%Y-%m-%d %H:%M')} (hora Chile)   Version: {VERSION}",
+            "",
+            "CONTENIDO:",
+        ] + resumen
+        if fallos:
+            leeme += ["", "TABLAS QUE FALLARON:"] + fallos
+        leeme += [
+            "",
+            "COMO LEER ESTO:",
+            "  binance_*.csv / bybit_*.csv = detalle crudo del libro (top-80 cada 2 min).",
+            "      Es lo pesado y lo que se purga solo; por eso viene recortado.",
+            "  agregados_anunciante_dia    = resumen PERMANENTE por competidor y dia.",
+            "  snapshots / snapshots_bybit = precio y spread del mercado, permanente.",
+            "  mis_ordenes_reales          = tus ordenes reales (verdad de terreno).",
+            "  fills_estimados             = operaciones inferidas del libro.",
+            "  operativa_historial         = que decidio el semaforo, cada 5 min.",
+            "",
+            "RUTINA: exportar SIEMPRE antes de vaciar. El vaciado deja 24h;",
+            "lo que no este en este ZIP a esa altura, se pierde.",
+        ]
+        z.writestr("LEEME.txt", "\n".join(leeme))
     zbuf.seek(0)
     return Response(zbuf.getvalue(), mimetype="application/zip",
                     headers={"Content-Disposition": f"attachment; filename=backup_p2p_{hoy}.zip"})
@@ -10255,6 +10493,12 @@ def _boot():
         recalibrar_mi_ticket()  # ticket propio desde el CSV real: sobrevive redeploys
     except Exception as e:
         print(f"[MI_TICKET boot] {e}")
+    try:
+        # ticket de CADA anunciante desde el agregado: sin esto el tracker
+        # arranca sin memoria y estima a todos con el generico (COL31)
+        recalibrar_tickets_por_anunciante()
+    except Exception as e:
+        print(f"[TICKET x ANUN boot] {e}")
     try:
         recalibrar_bandas()     # flujo por banda de precio (modulo Ciclo)
     except Exception as e:
