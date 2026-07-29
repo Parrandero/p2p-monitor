@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL26"
+VERSION       = "COL27"
 VERSION_FECHA = "2026-07-28"
 
 config = {
@@ -114,6 +114,14 @@ config = {
     #   fuera de 40-60 -> correccion: repreciar AGRESIVO el lado corto (todavia maker).
     #   <30 o >70      -> limite duro: cruzar como TAKER si o si.
     # A futuro el monitor la afina solo viendo con que % se queda trabado.
+    # ── Modulo Ciclo de recompra (COL27) ────────────────────────────
+    # El monto es el input CLAVE porque la comision taker es un monto FIJO
+    # (0,07 USDT): su peso en % depende enteramente de cuanto cruces.
+    #   100 USDT -> 0,0700%    1.200 USDT -> 0,0058%
+    # Arriba de ~300 USDT la taker es ruido frente al 0,20% del maker.
+    "CICLO_MONTO_DEFAULT":   1200,  # USDT sugeridos por ciclo
+    "CICLO_MARGEN_OBJETIVO": 0.30,  # % neto deseado por vuelta
+    "CICLO_FLUJO_MIN_DIA":   2000,  # USDT/dia capturables para considerar la banda "con flujo"
     # ── Rutinas de mantenimiento (COL25): cada cuantos dias toca cada tarea ──
     # Se avisa en el dashboard. Los dias salen de la experiencia de la sesion
     # 28-jul: el ancla driftea si pasan varios dias, el CSV afina calibracion y
@@ -164,6 +172,9 @@ CONFIG_TYPE_MAP = {
     "RITMO_MEDIDO_RANGO":   str,
     "COM_TAKER_FIJA_USDT":  float,
     "COM_MAKER_PCT":        float,
+    "CICLO_MONTO_DEFAULT":   float,
+    "CICLO_MARGEN_OBJETIVO": float,
+    "CICLO_FLUJO_MIN_DIA":   float,
     "RUT_ANCLA_DIAS":       int,
     "RUT_CSV_DIAS":         int,
     "RUT_BACKUP_DIAS":      int,
@@ -444,6 +455,21 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rutinas_tarea ON rutinas_log(tarea, ts DESC)")
+            # ── PERFIL POR BANDA DE PRECIO (COL27) ───────────────────────
+            # Cuanto se consume por banda de % sobre el mejor precio del libro.
+            # Alimenta al modulo "Ciclo de recompra": saber si el precio de venta
+            # sugerido cae en una zona con flujo real o en una zona muerta.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS perfil_banda (
+                    banda TEXT PRIMARY KEY,
+                    pct_desde NUMERIC,
+                    pct_hasta NUMERIC,
+                    consumo_dia NUMERIC,
+                    competidores NUMERIC,
+                    capturable_dia NUMERIC,
+                    actualizado TIMESTAMP
+                )
+            """)
             # ── Perfil por hora del dia (COL19) ──
             # Cachea el calculo pesado (spread x flujo por hora) que alimenta al
             # Plan de hoy y al gap adaptativo. Se recalcula 1x/dia.
@@ -715,6 +741,156 @@ def recalibrar_horarios():
     except Exception as e:
         print(f"[HORARIOS] {e}")
         return None
+
+
+#  Bandas fijas del perfil (en % sobre el mejor precio real del libro).
+#  Son las mismas del pliego, para poder comparar contra los valores medidos.
+BANDAS_CICLO = [
+    ("0.0-0.1", 0.0, 0.1), ("0.1-0.2", 0.1, 0.2), ("0.2-0.3", 0.2, 0.3),
+    ("0.3-0.4", 0.3, 0.4), ("0.4-0.5", 0.4, 0.5), ("0.5-0.6", 0.5, 0.6),
+    ("0.6-0.8", 0.6, 0.8), ("0.8-1.0", 0.8, 1.0), ("1.0-1.5", 1.0, 1.5),
+    ("1.5-2.0", 1.5, 2.0), ("2.0-3.0", 2.0, 3.0),
+]
+
+
+def _banda_de(pct):
+    """Devuelve el nombre de la banda que contiene ese % sobre el top."""
+    for nombre, desde, hasta in BANDAS_CICLO:
+        if desde <= pct < hasta:
+            return nombre
+    return None
+
+
+def recalibrar_bandas():
+    """FLUJO POR BANDA DE PRECIO (COL27): cuanto se consume, por dia, en cada
+    banda de % sobre el mejor precio del libro.
+
+    Sirve para saber si el precio de venta que sugiere el modulo Ciclo cae en
+    una zona con flujo real o en una zona muerta -- que es la diferencia entre
+    llenar 7 veces al dia o 1.
+
+    METODO ANTI-REPOSICIONAMIENTO (critico): la caida de `disponible` cuenta
+    como consumo SOLO si el precio del anunciante NO cambio en ese paso. Si
+    cambio el precio, la caida es una EDICION del anuncio (lo reposiciono), no
+    una venta. Sin este filtro el volumen se infla ~45%.
+
+    Ademas:
+    - Solo anuncios REALES (mismos filtros que el resto del monitor).
+    - Solo el tab BUY (es donde se recompra en la estrategia de gotas).
+    - Se agrupa por (fecha, anunciante) y se divide por dias para el diario, y
+      por competidores simultaneos para lo capturable por uno."""
+    with config_lock:
+        min_usdt = float(config.get("FILTRO_MIN_USDT", 200))
+        min_tasa = float(config.get("FILTRO_MIN_TASA", 90))
+    filas = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL statement_timeout = '90s'")
+                cur.execute("""
+                    WITH real AS (
+                        -- anuncios reales del tab BUY, con el mejor precio de su snapshot
+                        SELECT snapshot_timestamp AS ts, anunciante, precio, disponible,
+                               MIN(precio) OVER (PARTITION BY snapshot_timestamp) AS mejor
+                        FROM snapshots_detalle
+                        WHERE tipo = 'BUY'
+                          AND snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                          AND disponible >= %(mu)s AND tasa_exito >= %(mt)s
+                          AND precio > 0
+                    ), pasos AS (
+                        -- comparar cada anuncio contra su propio paso anterior
+                        SELECT ts, anunciante, precio, mejor, disponible,
+                               LAG(disponible) OVER w AS disp_prev,
+                               LAG(precio)     OVER w AS precio_prev,
+                               EXTRACT(EPOCH FROM (ts - LAG(ts) OVER w))/60 AS gap_min
+                        FROM real
+                        WINDOW w AS (PARTITION BY anunciante ORDER BY ts)
+                    ), consumo AS (
+                        SELECT ts, ts::date AS dia, anunciante,
+                               (precio - mejor) / NULLIF(mejor,0) * 100 AS pct_top,
+                               -- ANTI-REPOSICIONAMIENTO: solo si el precio no cambio
+                               CASE WHEN precio_prev = precio
+                                     AND disp_prev > disponible
+                                     AND gap_min BETWEEN 0 AND 10
+                                    THEN disp_prev - disponible ELSE 0 END AS consumido
+                        FROM pasos
+                        WHERE disp_prev IS NOT NULL
+                    ), clasificado AS (
+                        SELECT ts, dia, anunciante, consumido,
+                            CASE
+                              WHEN pct_top >= 0.0 AND pct_top < 0.1 THEN '0.0-0.1'
+                              WHEN pct_top < 0.2 THEN '0.1-0.2'
+                              WHEN pct_top < 0.3 THEN '0.2-0.3'
+                              WHEN pct_top < 0.4 THEN '0.3-0.4'
+                              WHEN pct_top < 0.5 THEN '0.4-0.5'
+                              WHEN pct_top < 0.6 THEN '0.5-0.6'
+                              WHEN pct_top < 0.8 THEN '0.6-0.8'
+                              WHEN pct_top < 1.0 THEN '0.8-1.0'
+                              WHEN pct_top < 1.5 THEN '1.0-1.5'
+                              WHEN pct_top < 2.0 THEN '1.5-2.0'
+                              WHEN pct_top < 3.0 THEN '2.0-3.0'
+                            END AS banda
+                        FROM consumo
+                        WHERE pct_top >= 0 AND pct_top < 3.0
+                    ), por_snapshot AS (
+                        -- competidores SIMULTANEOS: cuantos anuncios coexisten en la
+                        -- banda EN CADA snapshot. Contar anunciantes distintos de toda
+                        -- la ventana daria ~35 (todo el que paso alguna vez), no los
+                        -- ~3-7 que de verdad compiten a la vez por ese flujo.
+                        SELECT banda, ts, COUNT(DISTINCT anunciante) AS n
+                        FROM clasificado GROUP BY 1, 2
+                    )
+                    SELECT c.banda,
+                           SUM(c.consumido) AS consumo_total,
+                           COUNT(DISTINCT c.dia) AS dias,
+                           (SELECT AVG(n) FROM por_snapshot p WHERE p.banda = c.banda) AS competidores
+                    FROM clasificado c
+                    GROUP BY c.banda
+                    HAVING SUM(c.consumido) > 0
+                """, {"mu": min_usdt, "mt": min_tasa})
+                filas = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[BANDAS] {e}")
+        return None
+    if not filas:
+        print("[BANDAS] sin datos suficientes, se mantiene lo anterior")
+        return None
+    now = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    rangos = {n: (d, h) for n, d, h in BANDAS_CICLO}
+    out = []
+    for f in filas:
+        b = f["banda"]
+        if not b or b not in rangos:
+            continue
+        dias = max(1, int(f["dias"] or 1))
+        consumo_dia = float(f["consumo_total"] or 0) / dias
+        comp = float(f["competidores"] or 0) or 1.0
+        out.append((b, rangos[b][0], rangos[b][1], round(consumo_dia, 1),
+                    round(comp, 2), round(consumo_dia / comp, 1), now))
+    if not out:
+        return None
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany("""
+                    INSERT INTO perfil_banda
+                        (banda, pct_desde, pct_hasta, consumo_dia, competidores,
+                         capturable_dia, actualizado)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (banda) DO UPDATE SET
+                        pct_desde=EXCLUDED.pct_desde, pct_hasta=EXCLUDED.pct_hasta,
+                        consumo_dia=EXCLUDED.consumo_dia,
+                        competidores=EXCLUDED.competidores,
+                        capturable_dia=EXCLUDED.capturable_dia,
+                        actualizado=EXCLUDED.actualizado
+                """, out)
+            conn.commit()
+    except Exception as e:
+        print(f"[BANDAS guardar] {e}")
+        return None
+    total = sum(x[3] for x in out)
+    print(f"[BANDAS] {len(out)} bandas · consumo total {total:,.0f} USDT/dia")
+    return out
 
 
 def guardar_agregados_dia(fecha=None):
@@ -1741,6 +1917,10 @@ def ciclo_colector():
                     recalibrar_mi_ticket()
                 except Exception as e:
                     print(f"[MI_TICKET diario] {e}")
+                try:
+                    recalibrar_bandas()
+                except Exception as e:
+                    print(f"[BANDAS diario] {e}")
                 _ultima_purga = hoy
             print("[COLECTOR] Consultando Binance BUY...")
             raw_compra = obtener_anuncios("BUY")
@@ -4814,6 +4994,155 @@ function FichaAnunciante({ inicial }) {
   );
 }
 
+/* ============================================================
+   CICLO DE RECOMPRA (COL27)
+   Dado un monto, dice a que precio recomprar cruzando (VWAP real del libro)
+   y a que precio publicar la venta para que quede el margen objetivo.
+   Los dos precios van en grande: es lo unico que se copia para operar.
+   ============================================================ */
+const CICLO_TONO = { VERDE: "var(--buy)", AMBAR: "var(--warn)", ROJO: "var(--sell)" };
+
+function CicloRecompra() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [monto, setMonto] = React.useState(1200);
+  const [margen, setMargen] = React.useState(0.30);
+  const [d, setD] = React.useState(null);
+  const [cargando, setCargando] = React.useState(true);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/ciclo?monto=" + monto + "&margen=" + margen)
+      .then(r => r.json())
+      .then(j => { if (!stop) { setD(j); setCargando(false); } })
+      .catch(() => { if (!stop) setCargando(false); });
+    load();
+    const id = setInterval(load, 30000);
+    return () => { stop = true; clearInterval(id); };
+  }, [monto, margen]);
+
+  const fN = (x, n) => x == null ? "—" : Number(x).toLocaleString("es-CL",
+    { minimumFractionDigits: n || 0, maximumFractionDigits: n || 0 });
+  if (cargando) return <div className="intel-loading">Calculando el ciclo…</div>;
+  if (!d || d.error) return <div className="intel-loading">{(d && d.error) || "Sin datos del libro."}</div>;
+
+  const tono = CICLO_TONO[d.veredicto] || "var(--text-3)";
+  const r = d.recompra || {}, v = d.venta || {}, co = d.costos || {},
+        fl = d.flujo || {}, g = d.ganancia || {};
+  const PRESETS = [300, 600, 1200, 2500];
+
+  return (
+    <section className="chart-card" style={{ marginBottom: 14 }}>
+      <div className="card-head">
+        <h3>Ciclo de recompra</h3>
+        <span className="card-sub">cuánto cruzar → a qué precio recomprar y a cuál vender</span>
+      </div>
+
+      {/* controles */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+        <div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)", marginBottom: 4 }}>Monto a ciclar (USDT)</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            {PRESETS.map(p => (
+              <button key={p} className={"pr-btn" + (Number(monto) === p ? " on" : "")}
+                onClick={() => setMonto(p)}>{fN(p)}</button>
+            ))}
+            {/* clase 0-9 explicita: un backslash aca dispararia SyntaxWarning
+                dentro del string de Python que contiene el DASHBOARD */}
+            <input value={monto} onChange={e => setMonto(e.target.value.replace(/[^0-9.]/g, "") || 0)}
+              inputMode="decimal"
+              style={{ width: 90, background: "var(--bg-2)", border: "1px solid var(--line)",
+                       borderRadius: 7, color: "var(--text)", fontFamily: "var(--mono)",
+                       fontSize: 13, padding: "6px 9px" }} />
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)", marginBottom: 4 }}>Margen objetivo (%)</div>
+          <input value={margen} onChange={e => setMargen(e.target.value.replace(/[^0-9.]/g, "") || 0)}
+            inputMode="decimal"
+            style={{ width: 80, background: "var(--bg-2)", border: "1px solid var(--line)",
+                     borderRadius: 7, color: "var(--text)", fontFamily: "var(--mono)",
+                     fontSize: 13, padding: "6px 9px" }} />
+        </div>
+      </div>
+
+      {/* LOS DOS PRECIOS: lo unico que se copia para operar */}
+      <div style={{ background: "var(--bg-2)", border: "1px solid " + tono, borderRadius: 12,
+                    padding: "16px 18px", marginBottom: 12 }}>
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
+          <div style={{ flex: "1 1 150px", minWidth: 140 }}>
+            <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase",
+                          letterSpacing: "0.08em" }}>Comprá hasta</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 30, fontWeight: 600,
+                          color: "var(--text)", lineHeight: 1.15 }}>{fN(r.vwap, 2)}</div>
+            <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>
+              cruzando · barre {r.niveles} {r.niveles === 1 ? "anuncio" : "anuncios"}
+            </div>
+          </div>
+          <div style={{ fontSize: 20, color: tono, flex: "0 0 auto" }}>→</div>
+          <div style={{ flex: "1 1 150px", minWidth: 140 }}>
+            <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase",
+                          letterSpacing: "0.08em" }}>Vendé a</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 30, fontWeight: 600,
+                          color: tono, lineHeight: 1.15 }}>{fN(v.precio, 2)}</div>
+            <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>
+              publicando · ≈pos {v.posicion_est}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* estado: banda y flujo */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+        <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 600, color: tono,
+                       border: "1px solid " + tono, borderRadius: 7, padding: "3px 10px" }}>
+          {d.veredicto === "VERDE" ? "🟢" : d.veredicto === "AMBAR" ? "🟡" : "🔴"} {d.veredicto}
+        </span>
+        <span style={{ fontSize: 12, color: "var(--text-2)" }}>
+          banda {fN(v.banda_pct, 2)}%{fl.banda ? " (" + fl.banda + ")" : ""}
+          {fl.capturable_dia != null && <> · se mueven <b style={{ color: "var(--text)" }}>{fN(fl.capturable_dia)}</b> USDT/día por competidor</>}
+        </span>
+      </div>
+
+      <div style={{ fontSize: 12.5, color: "var(--text-2)", marginBottom: 10, lineHeight: 1.6 }}>
+        {d.mensaje}
+      </div>
+
+      {(d.avisos || []).map((a, i) => (
+        <div key={i} style={{ background: "var(--warn-soft)", border: "1px solid var(--warn)",
+                              borderRadius: 8, padding: "7px 11px", marginBottom: 8,
+                              fontSize: 11.5, color: "var(--warn)" }}>⚠ {a}</div>
+      ))}
+
+      {/* ganancia y costos */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 150, background: "var(--bg-2)", borderRadius: 9,
+                      padding: "9px 12px", border: "1px solid var(--line-soft)" }}>
+          <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase" }}>Ganancia</div>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 15, color: "var(--text)" }}>
+            {fN(g.por_vuelta_usdt, 2)} USDT<span style={{ fontSize: 11, color: "var(--text-3)" }}> /vuelta</span>
+          </div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>
+            {fl.ciclos_dia_est != null ? "≈" + fN(fl.ciclos_dia_est, 1) + " vueltas/día · " + fN(g.por_dia_usdt, 1) + " USDT/día" : "sin estimación de vueltas"}
+          </div>
+        </div>
+        <div style={{ flex: 1, minWidth: 150, background: "var(--bg-2)", borderRadius: 9,
+                      padding: "9px 12px", border: "1px solid var(--line-soft)" }}>
+          <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase" }}>Costo del ciclo</div>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 15, color: "var(--text)" }}>{fN(co.total_pct, 4)}%</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>
+            {fN(co.maker_pct, 2)}% maker + {co.taker_usdt} USDT taker ({fN(co.taker_pct, 4)}%)
+          </div>
+        </div>
+      </div>
+
+      <div className="intel-explain">
+        <b>Por qué el monto es el input clave:</b> la comisión taker es un <b>monto fijo</b> (0,07 USDT), así que su peso en % depende de cuánto cruces: en 100 USDT pesa 0,07%, en 1.200 apenas 0,0058%. La maker es porcentual y no cambia. Por eso ciclar montos grandes sale proporcionalmente más barato.<br/>
+        <b>El precio de compra es el VWAP real:</b> se calcula barriendo el libro en vivo, no con el "mejor precio" a secas — si el tope tiene poco volumen, comprar de verdad te sale bastante más caro que ese número.<br/>
+        <b>El semáforo mira el flujo, no solo el margen:</b> un precio de venta puede darte el margen que pediste pero caer en una banda donde casi no se opera. Ahí la orden tarda en llenarse, y eso es la diferencia entre 7 vueltas al día y 1.
+      </div>
+    </section>
+  );
+}
+
 function CruzarOEsperar() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [usdt, setUsdt] = React.useState(200);
@@ -4992,7 +5321,7 @@ function Inteligencia() {
         ))}
       </div>
 
-      {seccion==="cruzar" && <CruzarOEsperar />}
+      {seccion==="cruzar" && <div id="ciclo-recompra"><CicloRecompra /><CruzarOEsperar /></div>}
       {seccion==="ficha" && <FichaAnunciante inicial={fichaSel} />}
       {seccion==="perfilhoras" && <PerfilHoras />}
       {seccion==="basecomp" && <BaseCompetidores onElegir={(n) => { setFichaSel(n); setSeccion("ficha"); }} />}
@@ -6186,6 +6515,47 @@ function AsistenteOperativo() {
   );
 }
 
+function ChipCiclo() {
+  /* Chip compacto del Ciclo de recompra dentro del Plan de Hoy.
+     Solo aparece si hay una oportunidad util (VERDE): si no, no molesta.
+     Al tocarlo lleva a Inteligencia -> Cruzar o esperar, donde esta la tarjeta. */
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/ciclo").then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => {});
+    load();
+    const id = setInterval(load, 120000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  if (!d || d.error || d.veredicto !== "VERDE") return null;
+  const fN = (x, n) => x == null ? "—" : Number(x).toLocaleString("es-CL",
+    { minimumFractionDigits: n || 0, maximumFractionDigits: n || 0 });
+  const ir = () => {
+    // el detalle vive en Inteligencia; el usuario cambia de pestaña a mano,
+    // asi que damos la instruccion en el title en vez de simular navegacion.
+    const el = document.getElementById("ciclo-recompra");
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+  return (
+    <button onClick={ir}
+      title="Ciclo de recompra: comprá cruzando y publicá la venta a ese precio. El detalle está en Inteligencia → Cruzar o esperar."
+      style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer",
+               background: "var(--bg-2)", border: "1px solid var(--buy)",
+               borderRadius: 9, padding: "6px 11px", marginTop: 8,
+               fontFamily: "var(--font)", textAlign: "left" }}>
+      <span style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.09em" }}>Ciclo</span>
+      <span style={{ fontFamily: "var(--mono)", fontSize: 13, color: "var(--text)" }}>
+        {fN(d.recompra.vwap, 2)} <span style={{ color: "var(--buy)" }}>→</span> {fN(d.venta.precio, 2)}
+      </span>
+      <span style={{ fontSize: 11, color: "var(--text-2)" }}>
+        con {fN(d.monto)} USDT · {fN(d.ganancia.por_vuelta_usdt, 2)}/vuelta
+      </span>
+    </button>
+  );
+}
+
 function PlanHoy() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [d, setD] = React.useState(null);
@@ -6227,6 +6597,7 @@ function PlanHoy() {
           </div>
         ))}
       </div>
+      <ChipCiclo />
       {abierto && (
         <div style={{ marginTop: 12, display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-end" }}>
           <div>
@@ -9231,6 +9602,159 @@ def api_inventario():
     })
 
 
+@app.route("/api/ciclo")
+def api_ciclo():
+    """CICLO DE RECOMPRA (COL27): dado un monto a ciclar, a que precio recomprar
+    como taker y a que precio publicar la venta.
+
+    Por que el MONTO es el input clave: la comision taker es un monto FIJO
+    (0,07 USDT), asi que su peso en % depende enteramente de cuanto cruces
+    (100 USDT -> 0,07% · 1.200 USDT -> 0,0058%). La maker es porcentual y no
+    depende del monto. Sin fijar el monto, el costo del ciclo no esta definido.
+
+    El VWAP sale de barrer el libro EN VIVO, no del "mejor precio" a secas:
+    si el tope tiene poco volumen, el precio real de barrer es bastante peor.
+    Params: ?monto=1200&margen=0.30"""
+    with config_lock:
+        c = dict(config)
+    try:
+        monto = float(request.args.get("monto") or c.get("CICLO_MONTO_DEFAULT", 1200))
+    except (TypeError, ValueError):
+        monto = float(c.get("CICLO_MONTO_DEFAULT", 1200))
+    try:
+        margen = float(request.args.get("margen") or c.get("CICLO_MARGEN_OBJETIVO", 0.30))
+    except (TypeError, ValueError):
+        margen = float(c.get("CICLO_MARGEN_OBJETIVO", 0.30))
+    monto = max(10.0, min(100000.0, monto))
+    margen = max(0.0, min(10.0, margen))
+
+    with data_lock:
+        snap = dict(ultimo_estado)
+    compra = snap.get("detalle_compra") or []   # tab Compra = donde YO recompro
+    venta = snap.get("detalle_venta") or []
+    if not compra:
+        return jsonify({"error": "sin datos del libro aun"}), 503
+
+    mi_nick = str(c.get("MI_NICKNAME") or "").strip().lower()
+    min_usdt = float(c.get("FILTRO_MIN_USDT", 200))
+    min_tasa = float(c.get("FILTRO_MIN_TASA", 90))
+    # anuncios REALES y sin los mios: no puedo recomprarme a mi mismo
+    reales = [a for a in compra
+              if float(a.get("disponible") or 0) >= min_usdt
+              and float(a.get("tasa_exito") or 0) >= min_tasa
+              and float(a.get("precio") or 0) > 0
+              and (a.get("anunciante") or "").strip().lower() != mi_nick]
+    reales.sort(key=lambda a: float(a["precio"]))
+    if not reales:
+        return jsonify({"error": "no hay anuncios reales en el libro"}), 503
+
+    # ── 1. barrer el libro hasta acumular el monto ──
+    restante, costo_clp, niveles = monto, 0.0, 0
+    for a in reales:
+        if restante <= 0:
+            break
+        disp = float(a["disponible"])
+        toma = min(restante, disp)
+        costo_clp += toma * float(a["precio"])
+        restante -= toma
+        niveles += 1
+    profundidad = sum(float(a["disponible"]) for a in reales)
+    alcanza = restante <= 0.01
+    llenado = monto - restante          # lo que SI se pudo comprar
+    vwap = (costo_clp / llenado) if llenado > 0 else 0.0
+    mejor = float(reales[0]["precio"])
+
+    # ── 2-5. costos y precio de venta ──
+    com_taker = float(c.get("COM_TAKER_FIJA_USDT", 0.07))
+    com_maker = float(c.get("COM_MAKER_PCT", 0.20))
+    costo_taker_pct = com_taker / monto * 100
+    costo_total_pct = costo_taker_pct + com_maker
+    precio_venta = vwap * (1 + (costo_total_pct + margen) / 100) if vwap else 0.0
+
+    # ── 6-7. donde caeria esa venta y en que banda ──
+    # mi anuncio de VENTA compite en el tab Compra (mismo lado del libro que
+    # acabo de barrer): ahi es donde el comprador me va a encontrar.
+    posicion_est = 1 + sum(1 for a in reales if float(a["precio"]) < precio_venta)
+    banda_pct = ((precio_venta - mejor) / mejor * 100) if mejor else 0.0
+    banda = _banda_de(banda_pct)
+
+    # ── 8-9. flujo de esa banda (dato historico) ──
+    flujo = {"banda": banda, "capturable_dia": None, "competidores": None,
+             "consumo_dia": None, "ciclos_dia_est": None}
+    if banda:
+        try:
+            with get_conn() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""SELECT consumo_dia, competidores, capturable_dia
+                                   FROM perfil_banda WHERE banda = %s""", (banda,))
+                    r = cur.fetchone()
+                    if r:
+                        cap = float(r["capturable_dia"] or 0)
+                        flujo.update({"capturable_dia": round(cap),
+                                      "competidores": round(float(r["competidores"] or 0), 1),
+                                      "consumo_dia": round(float(r["consumo_dia"] or 0)),
+                                      "ciclos_dia_est": round(cap / monto, 1) if monto > 0 else None})
+        except Exception as e:
+            print(f"[ciclo banda] {e}")
+
+    # ── 10. ganancia ──
+    gan_vuelta = monto * margen / 100
+    ciclos = flujo.get("ciclos_dia_est") or 0
+    gan_dia = gan_vuelta * ciclos
+
+    # ── semaforo ──
+    flujo_min = float(c.get("CICLO_FLUJO_MIN_DIA", 2000))
+    cap = flujo.get("capturable_dia")
+    avisos = []
+    if not alcanza:
+        veredicto = "ROJO"
+        mensaje = (f"El libro solo tiene {profundidad:,.0f} USDT en anuncios reales: "
+                   f"no alcanza para ciclar {monto:,.0f}.")
+        avisos.append(f"Podés ciclar hasta ~{profundidad:,.0f} USDT con el libro actual.")
+    elif cap is None:
+        veredicto = "AMBAR"
+        mensaje = "Todavía no hay perfil de flujo para esa banda (se calcula 1x/día)."
+    elif cap >= flujo_min:
+        veredicto = "VERDE"
+        mensaje = f"Recomprá hasta {vwap:,.2f} · Vendé a {precio_venta:,.2f} (≈pos {posicion_est})"
+    else:
+        veredicto = "AMBAR"
+        mensaje = (f"Alcanzable, pero esa banda mueve solo {cap:,.0f} USDT/día: "
+                   f"la venta va a tardar en llenarse.")
+
+    # mercado lento: aunque el margen exista, los ciclos no se van a cumplir
+    ratio = None
+    try:
+        op = api_operativa().get_json()
+        ratio = (op.get("mercado") or {}).get("vs_promedio_12h")
+    except Exception:
+        pass
+    if ratio is not None and ratio < 0.7 and veredicto == "VERDE":
+        avisos.append(f"Mercado lento ({ratio}x vs 12h): los {ciclos} ciclos/día estimados "
+                      "probablemente no se cumplan hoy, aunque el margen exista.")
+
+    return jsonify({
+        "monto": round(monto),
+        "margen_objetivo": margen,
+        "recompra": {"vwap": round(vwap, 2), "niveles": niveles,
+                     "mejor": round(mejor, 2), "alcanza": alcanza,
+                     "profundidad_libro": round(profundidad),
+                     "llenado": round(llenado, 2)},
+        "costos": {"taker_pct": round(costo_taker_pct, 4), "maker_pct": com_maker,
+                   "total_pct": round(costo_total_pct, 4), "taker_usdt": com_taker},
+        "venta": {"precio": round(precio_venta, 2), "posicion_est": posicion_est,
+                  "banda_pct": round(banda_pct, 3)},
+        "flujo": flujo,
+        "ganancia": {"por_vuelta_usdt": round(gan_vuelta, 2),
+                     "por_dia_usdt": round(gan_dia, 1),
+                     "por_mes_20d": round(gan_dia * 20)},
+        "veredicto": veredicto, "mensaje": mensaje, "avisos": avisos,
+        "ratio_mercado": ratio,
+        "nota": ("El VWAP es de barrer el libro EN VIVO (no el mejor precio a secas). "
+                 "El flujo por banda es histórico de 7 días y se recalcula 1x/día."),
+    })
+
+
 @app.route("/api/rutinas")
 def api_rutinas():
     """RUTINAS DE MANTENIMIENTO (COL25): que tareas periodicas estan vencidas.
@@ -9784,6 +10308,10 @@ def _boot():
         recalibrar_mi_ticket()  # ticket propio desde el CSV real: sobrevive redeploys
     except Exception as e:
         print(f"[MI_TICKET boot] {e}")
+    try:
+        recalibrar_bandas()     # flujo por banda de precio (modulo Ciclo)
+    except Exception as e:
+        print(f"[BANDAS boot] {e}")
     threading.Thread(target=ciclo_colector, daemon=True).start()
     threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
 
