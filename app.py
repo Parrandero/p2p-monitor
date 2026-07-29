@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL31"
+VERSION       = "COL32"
 VERSION_FECHA = "2026-07-29"
 
 config = {
@@ -325,6 +325,16 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_byb_detalle_ts ON snapshots_detalle_bybit(snapshot_timestamp)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_byb_detalle_anun ON snapshots_detalle_bybit(anunciante, tipo)")
+            # ── LIMITES DE ORDEN por anuncio (COL32) ─────────────────────
+            # min/max que el anunciante configuro, en CLP TAL COMO VIENEN de la
+            # API (no se convierten a USDT: es un monto fiat fijo, convertirlo
+            # lo haria variar con el precio). INTEGER alcanza: el techo real es
+            # ~7.000.000 contra los 2.147 millones que soporta el tipo.
+            # Aditivas: las filas viejas quedan NULL, asi que TODA consulta
+            # tiene que tolerar min_orden IS NULL.
+            for _t in ("snapshots_detalle", "snapshots_detalle_bybit"):
+                cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS min_orden INTEGER")
+                cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS max_orden INTEGER")
             # ── Fills v2: un registro por evento de fill confirmado/estimado ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS fills_estimados (
@@ -396,6 +406,14 @@ def init_db():
             # recalibrar_tickets_por_anunciante() para que el FillTracker no
             # empiece de cero en cada redeploy.
             cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS ticket_medio NUMERIC")
+            # limites de orden propagados al resumen permanente (COL32): asi el
+            # segmento de cada competidor (mayorista / minorista) sobrevive a la
+            # purga del detalle. La MODA del minimo va aparte del promedio: si
+            # el anunciante edita el limite un rato, el promedio se ensucia y la
+            # moda sigue mostrando el valor con el que opera de verdad.
+            cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS min_orden_med INTEGER")
+            cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS max_orden_med INTEGER")
+            cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS min_orden_moda INTEGER")
             # \u2500\u2500 MIS ORDENES REALES (verdad de terreno para calibrar) \u2500\u2500
             # Se importan del CSV de Binance. Es el unico caso donde sabemos que
             # paso de verdad: comparar contra lo que el monitor infirio desde
@@ -927,14 +945,22 @@ def guardar_agregados_dia(fecha=None):
                         INSERT INTO agregados_anunciante_dia
                             (fecha, exchange, anunciante, tipo, apariciones, pos_media,
                              pos_min, precio_medio, disp_medio, comp_min, comp_max,
-                             ordenes_dia, es_merchant)
+                             ordenes_dia, es_merchant,
+                             min_orden_med, max_orden_med, min_orden_moda)
                         SELECT snapshot_timestamp::date, %(ex)s, anunciante, tipo,
                                COUNT(*), ROUND(AVG(posicion)::numeric, 1),
                                MIN(posicion), ROUND(AVG(precio)::numeric, 2),
                                ROUND(AVG(disponible)::numeric, 1),
                                MIN(completadas), MAX(completadas),
                                GREATEST(MAX(completadas) - MIN(completadas), 0),
-                               BOOL_OR(es_merchant)
+                               BOOL_OR(es_merchant),
+                               -- limites de orden (COL32). AVG y mode() ignoran
+                               -- los NULL y dan NULL si TODO es NULL, asi que los
+                               -- dias anteriores al deploy quedan limpios en vez
+                               -- de en 0 (verificado contra la DB antes de usarlo).
+                               ROUND(AVG(min_orden)::numeric)::int,
+                               ROUND(AVG(max_orden)::numeric)::int,
+                               mode() WITHIN GROUP (ORDER BY min_orden)
                         FROM {tabla}
                         WHERE snapshot_timestamp::date = %(f)s
                           AND anunciante IS NOT NULL AND anunciante <> ''
@@ -944,7 +970,10 @@ def guardar_agregados_dia(fecha=None):
                             pos_min = EXCLUDED.pos_min, precio_medio = EXCLUDED.precio_medio,
                             disp_medio = EXCLUDED.disp_medio, comp_min = EXCLUDED.comp_min,
                             comp_max = EXCLUDED.comp_max, ordenes_dia = EXCLUDED.ordenes_dia,
-                            es_merchant = EXCLUDED.es_merchant
+                            es_merchant = EXCLUDED.es_merchant,
+                            min_orden_med = EXCLUDED.min_orden_med,
+                            max_orden_med = EXCLUDED.max_orden_med,
+                            min_orden_moda = EXCLUDED.min_orden_moda
                     """, {"ex": ex, "f": fecha or (datetime.now(SANTIAGO_TZ).date() - timedelta(days=1))})
                     total += cur.rowcount
 
@@ -1096,6 +1125,40 @@ def _detalle_banda(raw, precio_de, band_pct):
     return out if len(out) >= 3 else raw
 
 
+def _limites_adv(adv):
+    """LIMITES DE ORDEN del anuncio (COL32): devuelve (min_orden, max_orden) en
+    CLP entero, o None si el campo no viene.
+
+    UN SOLO helper para los dos exchanges A PROPOSITO: cinco lugares del codigo
+    parsean anuncios (guardado del detalle, parsear_y_filtrar, _items_binance,
+    y sus dos equivalentes de Bybit). Si cada uno leyera los campos por su
+    cuenta, el mismo anuncio podria mostrar limites distintos segun la vista.
+
+    Nombres por exchange (verificados contra las APIs el 29-jul-2026):
+      Binance -> minSingleTransAmount / maxSingleTransAmount   ('400000')
+      Bybit   -> minAmount / maxAmount                          ('20000.00')
+    Bybit los manda con decimales, de ahi el float() antes del int().
+
+    NO se convierte a USDT: es un monto fiat fijo que el anunciante configuro;
+    convertirlo lo haria variar con el precio. La conversion se hace al mostrar."""
+    if not adv:
+        return (None, None)
+
+    def _n(*claves):
+        for k in claves:
+            v = adv.get(k)
+            if v not in (None, "", 0, "0"):
+                try:
+                    n = int(float(v))
+                    return n if n > 0 else None
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    return (_n("minSingleTransAmount", "minAmount"),
+            _n("maxSingleTransAmount", "maxAmount"))
+
+
 def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
     """Guarda los top 80 anunciantes de cada lado SIN filtros de mínimos"""
     with config_lock:
@@ -1105,37 +1168,29 @@ def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
     anuncios_raw_compra = _detalle_banda(anuncios_raw_compra, _pb, band)
     anuncios_raw_venta  = _detalle_banda(anuncios_raw_venta,  _pb, band)
     rows = []
-    for pos, item in enumerate(anuncios_raw_compra[:top], 1):
-        adv   = item.get("adv", {})
-        trade = item.get("advertiser", {})
-        rows.append((
-            timestamp, hora, "BUY", pos,
-            trade.get("nickName", ""),
-            float(adv.get("price", 0)),
-            float(adv.get("tradableQuantity", 0)),
-            int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0),
-            float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100,
-            bool(trade.get("userType") == "merchant"),
-        ))
-    for pos, item in enumerate(anuncios_raw_venta[:top], 1):
-        adv   = item.get("adv", {})
-        trade = item.get("advertiser", {})
-        rows.append((
-            timestamp, hora, "SELL", pos,
-            trade.get("nickName", ""),
-            float(adv.get("price", 0)),
-            float(adv.get("tradableQuantity", 0)),
-            int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0),
-            float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100,
-            bool(trade.get("userType") == "merchant"),
-        ))
+    for lado, crudos in (("BUY", anuncios_raw_compra), ("SELL", anuncios_raw_venta)):
+        for pos, item in enumerate(crudos[:top], 1):
+            adv   = item.get("adv", {})
+            trade = item.get("advertiser", {})
+            mino, maxo = _limites_adv(adv)
+            rows.append((
+                timestamp, hora, lado, pos,
+                trade.get("nickName", ""),
+                float(adv.get("price", 0)),
+                float(adv.get("tradableQuantity", 0)),
+                int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0),
+                float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100,
+                bool(trade.get("userType") == "merchant"),
+                mino, maxo,
+            ))
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.executemany("""
                 INSERT INTO snapshots_detalle
                 (snapshot_timestamp, hora, tipo, posicion, anunciante, precio,
-                 disponible, completadas, tasa_exito, es_merchant)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 disponible, completadas, tasa_exito, es_merchant,
+                 min_orden, max_orden)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, rows)
         conn.commit()
 
@@ -1249,11 +1304,14 @@ def parsear_y_filtrar(anuncios, tipo):
         if completadas < c["FILTRO_MIN_ORD"]:  continue
         tasa_exito = float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100
         if tasa_exito < c["FILTRO_MIN_TASA"]:  continue
+        mino, maxo = _limites_adv(adv)
         resultado.append({
             "tipo":       tipo,
             "precio":     float(adv.get("price", 0)),
             "disponible": disponible,
             "anunciante": trade.get("nickName", ""),
+            "min_orden":  mino,
+            "max_orden":  maxo,
         })
     return resultado
 
@@ -1363,6 +1421,7 @@ def build_detalle_memory(raw_anuncios, tipo, now_dt):
         # (antes: caida cruda del ultimo ciclo -> ruidosa y casi siempre 0)
         velocidad = fill_tracker.velocidad(nombre, tipo, now_dt)
         nuevo_prev[nombre] = (disp, now_dt)
+        mino, maxo = _limites_adv(adv)
         rows.append({
             "posicion":    pos,
             "anunciante":  nombre,
@@ -1372,6 +1431,8 @@ def build_detalle_memory(raw_anuncios, tipo, now_dt):
             "tasa_exito":  round(float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100, 1),
             "es_merchant": trade.get("userType") == "merchant",
             "velocidad":   velocidad,
+            "min_orden":   mino,
+            "max_orden":   maxo,
         })
     prev_detalle_raw[tipo] = nuevo_prev
     return rows
@@ -1640,11 +1701,14 @@ def _items_binance(raw):
     for item in raw:
         adv   = item.get("adv", {})
         trade = item.get("advertiser", {})
+        mino, maxo = _limites_adv(adv)
         out.append({
             "anunciante":  trade.get("nickName", ""),
             "precio":      float(adv.get("price", 0) or 0),
             "disponible":  float(adv.get("tradableQuantity", 0) or 0),
             "completadas": int(trade.get("monthOrderCount", 0) or trade.get("tradeCount", 0) or 0),
+            "min_orden":   mino,
+            "max_orden":   maxo,
         })
     return out
 
@@ -1772,6 +1836,10 @@ def obtener_anuncios_bybit(tipo):
     return out[:top]
 
 def _bybit_item(item):
+    # Bybit manda los limites en la raiz del item (no en un sub-objeto 'adv')
+    # y con decimales: minAmount='20000.00'. Verificado contra la API el
+    # 29-jul-2026; _limites_adv() se encarga del float()->int().
+    mino, maxo = _limites_adv(item)
     return {
         "anunciante":  item.get("nickName", ""),
         "precio":      float(item.get("price", 0) or 0),
@@ -1779,6 +1847,8 @@ def _bybit_item(item):
         "completadas": int(item.get("recentOrderNum", 0) or 0),
         "tasa_exito":  float(item.get("recentExecuteRate", 0) or 0),   # ya viene 0-100
         "es_merchant": item.get("userType", "PERSONAL") != "PERSONAL",
+        "min_orden":   mino,
+        "max_orden":   maxo,
     }
 
 def parsear_y_filtrar_bybit(items, tipo):
@@ -1790,7 +1860,9 @@ def parsear_y_filtrar_bybit(items, tipo):
         if f["disponible"]  < c["FILTRO_MIN_USDT"]: continue
         if f["completadas"] < c["FILTRO_MIN_ORD"]:  continue
         if f["tasa_exito"]  < c["FILTRO_MIN_TASA"]: continue
-        res.append({"tipo": tipo, "precio": f["precio"], "disponible": f["disponible"], "anunciante": f["anunciante"]})
+        res.append({"tipo": tipo, "precio": f["precio"], "disponible": f["disponible"],
+                    "anunciante": f["anunciante"],
+                    "min_orden": f["min_orden"], "max_orden": f["max_orden"]})
     return res
 
 def guardar_detalle_bybit(timestamp, hora, raw_compra, raw_venta):
@@ -1805,14 +1877,16 @@ def guardar_detalle_bybit(timestamp, hora, raw_compra, raw_venta):
         for pos, it in enumerate(raw[:top], 1):
             f = _bybit_item(it)
             rows.append((timestamp, hora, tipo, pos, f["anunciante"], f["precio"],
-                         f["disponible"], f["completadas"], f["tasa_exito"], f["es_merchant"]))
+                         f["disponible"], f["completadas"], f["tasa_exito"], f["es_merchant"],
+                         f["min_orden"], f["max_orden"]))
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.executemany("""
                 INSERT INTO snapshots_detalle_bybit
                 (snapshot_timestamp, hora, tipo, posicion, anunciante, precio,
-                 disponible, completadas, tasa_exito, es_merchant)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 disponible, completadas, tasa_exito, es_merchant,
+                 min_orden, max_orden)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, rows)
         conn.commit()
 
@@ -1830,7 +1904,8 @@ def build_detalle_memory_bybit(raw, tipo, now_dt):
         nuevo[nombre] = (disp, now_dt)
         rows.append({"posicion": pos, "anunciante": nombre, "precio": f["precio"],
                      "disponible": disp, "completadas": f["completadas"],
-                     "tasa_exito": round(f["tasa_exito"], 1), "es_merchant": f["es_merchant"], "velocidad": vel})
+                     "tasa_exito": round(f["tasa_exito"], 1), "es_merchant": f["es_merchant"], "velocidad": vel,
+                     "min_orden": f["min_orden"], "max_orden": f["max_orden"]})
     prev_detalle_raw_bybit[tipo] = nuevo
     return rows
 
@@ -1843,9 +1918,15 @@ def ciclo_colector_bybit():
             hoy = datetime.now(SANTIAGO_TZ).date()
             if _ultima_purga != hoy:
                 try:
+                    # COL32: respeta DETALLE_DIAS igual que la purga de Binance.
+                    # Estaba en 7 fijo, asi que al subir la retencion en COL31
+                    # las dos tablas quedaban con ventanas distintas.
+                    with config_lock:
+                        _dd = int(config.get("DETALLE_DIAS", 10) or 10)
                     with get_conn() as conn:
                         with conn.cursor() as cur:
-                            cur.execute("DELETE FROM snapshots_detalle_bybit WHERE snapshot_timestamp < NOW() - INTERVAL '7 days'")
+                            cur.execute("DELETE FROM snapshots_detalle_bybit "
+                                        "WHERE snapshot_timestamp < NOW() - (%s || ' days')::INTERVAL", [_dd])
                         conn.commit()
                 except Exception as e:
                     print(f"[BYBIT purga] {e}")
@@ -4886,6 +4967,17 @@ function FichaAnunciante({ inicial }) {
                     <div style={{ fontSize: 10, color: "var(--text-3)" }}>USDT, neto de comisión</div>
                   </div>
                 )}
+                {ficha.limites && (
+                  <div style={boxSt} title="Mínimo por orden que exige (moda de los días medidos). Marca a qué segmento apunta: mínimo alto = mayorista, bajo = minorista.">
+                    <div style={lbl}>Mínimo por orden</div>
+                    <div style={val}>${fN(ficha.limites.min_habitual)}</div>
+                    <div style={{ fontSize: 10, color: "var(--text-3)" }}>
+                      CLP · {ficha.limites.min_visto_desde !== ficha.limites.min_visto_hasta
+                        ? "varía $" + fN(ficha.limites.min_visto_desde) + "–" + fN(ficha.limites.min_visto_hasta)
+                        : "estable"} · {ficha.limites.dias_con_dato}d
+                    </div>
+                  </div>
+                )}
               </div>
               {ficha.en_libro_ahora && (
                 <div style={{ fontSize: 11.5, color: "var(--text-2)", marginBottom: 10 }}>
@@ -4893,6 +4985,11 @@ function FichaAnunciante({ inicial }) {
                     <span key={k} style={{ marginRight: 14 }}>
                       <b style={{ color: k === "venta" ? "var(--buy)" : "var(--sell)" }}>{k === "venta" ? "vende" : "compra"}</b>
                       {" "}#{ficha.posiciones[k].posicion} a ${fN(ficha.posiciones[k].precio)} · {fN(ficha.posiciones[k].disponible)} USDT
+                      {ficha.posiciones[k].min_orden != null && (
+                        <span style={{ color: "var(--text-3)" }}>
+                          {" "}· orden ${fN(ficha.posiciones[k].min_orden)}–{fN(ficha.posiciones[k].max_orden)}
+                        </span>
+                      )}
                     </span>
                   ))}
                 </div>
@@ -8293,7 +8390,8 @@ def api_anunciante():
                 # ── ficha ──
                 cur.execute("""
                     SELECT fecha, tipo, apariciones, pos_media, pos_min, precio_medio,
-                           disp_medio, ordenes_dia, es_merchant
+                           disp_medio, ordenes_dia, es_merchant,
+                           min_orden_med, max_orden_med, min_orden_moda
                     FROM agregados_anunciante_dia
                     WHERE exchange='binance' AND LOWER(anunciante)=LOWER(%(n)s)
                     ORDER BY fecha DESC, tipo LIMIT 40
@@ -8322,7 +8420,10 @@ def api_anunciante():
         for row in (snap.get(key) or []):
             if (row.get("anunciante") or "").strip().lower() == nombre.lower():
                 vivo[lado] = {"posicion": row.get("posicion"), "precio": row.get("precio"),
-                              "disponible": round(float(row.get("disponible") or 0))}
+                              "disponible": round(float(row.get("disponible") or 0)),
+                              # limites que declara AHORA (COL32)
+                              "min_orden": row.get("min_orden"),
+                              "max_orden": row.get("max_orden")}
     gap_propio = None
     if "venta" in vivo and "compra" in vivo:
         try:
@@ -8348,6 +8449,19 @@ def api_anunciante():
                       "pos_media": round(sum(d["pos"]) / len(d["pos"]), 1) if d["pos"] else None,
                       "stock": round(d["stock"])})
     ord_dia = round(sum(s["ordenes"] for s in serie) / len(serie), 1) if serie else None
+    # ── limites de orden historicos (COL32) ──
+    # La MODA es la referencia: si el anunciante edito el limite un rato, el
+    # promedio se ensucia y la moda sigue mostrando con cual opera de verdad.
+    # Todo puede venir NULL (dias anteriores al deploy) y eso no rompe nada.
+    _modas = [int(h["min_orden_moda"]) for h in hist if h.get("min_orden_moda")]
+    _maxs  = [int(h["max_orden_med"]) for h in hist if h.get("max_orden_med")]
+    limites = None
+    if _modas:
+        _modas.sort()
+        limites = {"min_habitual": _modas[len(_modas) // 2],
+                   "min_visto_desde": _modas[0], "min_visto_hasta": _modas[-1],
+                   "max_habitual": (sorted(_maxs)[len(_maxs) // 2] if _maxs else None),
+                   "dias_con_dato": len(_modas)}
     vol30 = float(fl.get("vol") or 0)
     # ganancia bruta estimada: solo tiene sentido si sabemos su gap
     gan = None
@@ -8363,6 +8477,7 @@ def api_anunciante():
         "ticket_medio": float(fl["ticket"]) if fl.get("ticket") else None,
         "en_libro_ahora": bool(vivo), "dual_ahora": len(vivo) == 2,
         "posiciones": vivo, "gap_propio_pct": gap_propio,
+        "limites": limites,
         "ganancia_30d_estimada_usdt": gan,
         "serie": serie[:14],
         "nota": ("ordenes_dia sale del contador OFICIAL de Binance (no es estimacion nuestra). "
@@ -9645,21 +9760,57 @@ def api_ciclo():
     if not reales:
         return jsonify({"error": "no hay anuncios reales en el libro"}), 503
 
-    # ── 1. barrer el libro hasta acumular el monto ──
+    # ── 1. barrer el libro RESPETANDO LOS LIMITES DE CADA ANUNCIO (COL32) ──
+    # Antes se barria solo por 'disponible', asi que el VWAP podia salir de
+    # anuncios que NUNCA me habrian aceptado la orden -> un precio de recompra
+    # inalcanzable. Los limites vienen en CLP, y lo que cruzo son USDT, asi que
+    # se convierten con el precio de ESE anuncio (cada uno tiene el suyo).
+    #
+    # El max NO descalifica al anuncio: acota cuanto le puedo sacar en una orden.
+    # El min SI descalifica, pero solo para el resto que me falta en ese momento:
+    # si me quedan 50 USDT y su minimo son 213, esa orden no se puede colocar.
+    #
+    # min_orden/max_orden en None = todavia sin dato (dias previos al deploy, o
+    # Bybit si no lo manda): NO se excluye el anuncio. Falta de dato no es
+    # prueba de que no acepte -- excluir por eso seria peor que el bug original.
     restante, costo_clp, niveles = monto, 0.0, 0
+    usados, saltados = [], []
     for a in reales:
-        if restante <= 0:
+        if restante <= 0.01:
             break
+        precio = float(a["precio"])
         disp = float(a["disponible"])
-        toma = min(restante, disp)
-        costo_clp += toma * float(a["precio"])
-        restante -= toma
+        mino, maxo = a.get("min_orden"), a.get("max_orden")
+        # techo de esta orden: su stock y, si lo declara, su maximo por orden
+        tope = min(restante, disp)
+        if maxo:
+            tope = min(tope, float(maxo) / precio)
+        # piso: si lo que puedo tomar no llega a su minimo, no hay orden posible
+        if mino and tope < float(mino) / precio - 0.01:
+            saltados.append({"anunciante": a.get("anunciante"), "precio": round(precio, 2),
+                             "min_orden": mino,
+                             "min_usdt": round(float(mino) / precio, 1)})
+            continue
+        if tope <= 0:
+            continue
+        costo_clp += tope * precio
+        restante -= tope
         niveles += 1
-    profundidad = sum(float(a["disponible"]) for a in reales)
+        usados.append(a)
+    # Profundidad REALMENTE accesible: suma de lo que cada anuncio me deja tomar,
+    # no su stock crudo (un anuncio con 40.000 USDT pero maximo de 7.000.000 CLP
+    # solo me sirve por ~7.500 USDT por orden).
+    def _accesible(a):
+        p = float(a["precio"]); d = float(a["disponible"])
+        mx = a.get("max_orden")
+        return min(d, float(mx) / p) if mx else d
+    profundidad = sum(_accesible(a) for a in reales)
     alcanza = restante <= 0.01
     llenado = monto - restante          # lo que SI se pudo comprar
     vwap = (costo_clp / llenado) if llenado > 0 else 0.0
     mejor = float(reales[0]["precio"])
+    # el mejor precio que de verdad me acepta (puede no ser el tope del libro)
+    mejor_accesible = float(usados[0]["precio"]) if usados else None
 
     # ── 2-5. costos y precio de venta ──
     com_taker = float(c.get("COM_TAKER_FIJA_USDT", 0.07))
@@ -9730,13 +9881,29 @@ def api_ciclo():
         avisos.append(f"Mercado lento ({ratio}x vs 12h): los {ciclos} ciclos/día estimados "
                       "probablemente no se cumplan hoy, aunque el margen exista.")
 
+    # COL32: avisar cuando el tope del libro NO te acepta el monto. Es info que
+    # antes simplemente no existia y llevaba a apuntar a un precio imposible.
+    if saltados:
+        s = saltados[0]
+        detalle = (f"{s['anunciante']} a {s['precio']:,.2f} pide mínimo "
+                   f"${s['min_orden']:,} CLP (≈{s['min_usdt']:,.0f} USDT)")
+        avisos.append(f"{len(saltados)} anuncio(s) más barato(s) quedaron afuera porque no "
+                      f"aceptan este monto — ej.: {detalle}. El VWAP ya los excluye.")
+    if mejor_accesible and mejor_accesible > mejor + 0.005:
+        avisos.append(f"El tope del libro ({mejor:,.2f}) no te acepta {monto:,.0f} USDT; "
+                      f"el mejor precio que sí te acepta es {mejor_accesible:,.2f}.")
+
     return jsonify({
         "monto": round(monto),
         "margen_objetivo": margen,
         "recompra": {"vwap": round(vwap, 2), "niveles": niveles,
                      "mejor": round(mejor, 2), "alcanza": alcanza,
                      "profundidad_libro": round(profundidad),
-                     "llenado": round(llenado, 2)},
+                     "llenado": round(llenado, 2),
+                     # COL32: que quedo afuera por no aceptar el monto
+                     "mejor_accesible": (round(mejor_accesible, 2) if mejor_accesible else None),
+                     "saltados_por_limite": len(saltados),
+                     "saltados": saltados[:5]},
         "costos": {"taker_pct": round(costo_taker_pct, 4), "maker_pct": com_maker,
                    "total_pct": round(costo_total_pct, 4), "taker_usdt": com_taker},
         "venta": {"precio": round(precio_venta, 2), "posicion_est": posicion_est,
