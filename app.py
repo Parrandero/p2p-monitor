@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL27"
+VERSION       = "COL28"
 VERSION_FECHA = "2026-07-28"
 
 config = {
@@ -5006,8 +5006,28 @@ function CicloRecompra() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [monto, setMonto] = React.useState(1200);
   const [margen, setMargen] = React.useState(0.30);
+  const [guardado, setGuardado] = React.useState({ monto: 1200, margen: 0.30 });
   const [d, setD] = React.useState(null);
   const [cargando, setCargando] = React.useState(true);
+  const [msg, setMsg] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  // COL28: arrancar con los valores GUARDADOS en config, no con los hardcodeados.
+  // Asi el monto y el margen que dejaste fijados sobreviven al recargar la pagina
+  // y son los mismos que usa el chip del Plan de Hoy (que lee /api/ciclo sin
+  // parametros, o sea con el default de config).
+  React.useEffect(() => {
+    let stop = false;
+    fetch(B + "/api/config").then(r => r.json()).then(c => {
+      if (stop || !c) return;
+      const m = c.CICLO_MONTO_DEFAULT, g = c.CICLO_MARGEN_OBJETIVO;
+      if (m != null) { setMonto(m); }
+      if (g != null) { setMargen(g); }
+      setGuardado({ monto: m != null ? m : 1200, margen: g != null ? g : 0.30 });
+    }).catch(() => {});
+    return () => { stop = true; };
+  }, []);
+
   React.useEffect(() => {
     let stop = false;
     const load = () => fetch(B + "/api/ciclo?monto=" + monto + "&margen=" + margen)
@@ -5018,6 +5038,26 @@ function CicloRecompra() {
     const id = setInterval(load, 30000);
     return () => { stop = true; clearInterval(id); };
   }, [monto, margen]);
+
+  const nMonto = parseFloat(String(monto)) || 0;
+  const nMargen = parseFloat(String(margen)) || 0;
+  const sinGuardar = nMonto !== Number(guardado.monto) || nMargen !== Number(guardado.margen);
+
+  const guardarDefaults = () => {
+    if (busy) return;
+    setBusy(true); setMsg("Guardando…");
+    window.P2P_AUTH.post(B + "/api/config",
+      { CICLO_MONTO_DEFAULT: nMonto, CICLO_MARGEN_OBJETIVO: nMargen })
+      .then(r => r.json().then(j => ({ ok: r.ok && j && j.ok !== false })))
+      .then(({ ok }) => {
+        setBusy(false);
+        if (!ok) { setMsg("✗ no se pudo guardar (¿token?)"); return; }
+        setGuardado({ monto: nMonto, margen: nMargen });
+        setMsg("✓ guardado como tu configuración");
+        setTimeout(() => setMsg(""), 6000);
+      })
+      .catch(() => { setBusy(false); setMsg("✗ error de red"); });
+  };
 
   const fN = (x, n) => x == null ? "—" : Number(x).toLocaleString("es-CL",
     { minimumFractionDigits: n || 0, maximumFractionDigits: n || 0 });
@@ -5062,6 +5102,26 @@ function CicloRecompra() {
                      borderRadius: 7, color: "var(--text)", fontFamily: "var(--mono)",
                      fontSize: 13, padding: "6px 9px" }} />
         </div>
+        {/* guardar como default: solo aparece si cambiaste algo respecto de lo
+            guardado, para no ensuciar la barra cuando ya esta como lo queres */}
+        {sinGuardar && (
+          <button disabled={busy} onClick={guardarDefaults}
+            title="Deja este monto y margen como tu configuración fija: se usan al abrir la página y en el chip del Plan de Hoy"
+            style={{ cursor: "pointer", borderRadius: 7, padding: "7px 12px", fontSize: 11.5,
+                     fontFamily: "var(--mono)", border: "1px solid var(--accent)",
+                     background: "var(--accent-soft)", color: "var(--accent)" }}>
+            Fijar como mío
+          </button>
+        )}
+        {msg && (
+          <span style={{ fontFamily: "var(--mono)", fontSize: 11.5, alignSelf: "center",
+                         color: msg[0] === "✓" ? "var(--buy)" : "var(--warn)" }}>{msg}</span>
+        )}
+        {!sinGuardar && !msg && (
+          <span style={{ fontSize: 10.5, color: "var(--text-3)", alignSelf: "center" }}>
+            usando tu configuración guardada
+          </span>
+        )}
       </div>
 
       {/* LOS DOS PRECIOS: lo unico que se copia para operar */}
