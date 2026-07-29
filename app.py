@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL28"
-VERSION_FECHA = "2026-07-28"
+VERSION       = "COL29"
+VERSION_FECHA = "2026-07-29"
 
 config = {
     "MONEDA":               "USDT",
@@ -1792,6 +1792,17 @@ def ciclo_colector_bybit():
             intervalo = config["INTERVALO_MIN"]
         time.sleep(intervalo * 60)
 
+def _frase_min_op(gan, min_op):
+    """Frase base del spread vs el minimo. Si el preset Farming esta activo
+    (min_op<0) y el spread real tambien es negativo, el veredicto OPERAR
+    implica una perdida ACEPTADA a proposito (farmear ordenes hacia Merchant),
+    no un error de calculo — hay que decirlo asi de explicito, si no un numero
+    negativo en pantalla se lee como bug."""
+    if min_op < 0 and gan < 0:
+        return f"Farmeando a {gan}% de perdida controlada (tope {min_op}%) para sumar ordenes hacia Merchant"
+    return f"Spread neto {gan}% sobre tu minimo ({min_op}%)"
+
+
 def decidir_operativa(gan, min_op, ratio, presion, rot_lento, rot_dual, sesgo_min):
     """Arbol de decision del asistente — UNICA fuente (lo usan api_operativa y
     _registrar_operativa; antes estaba duplicado y podia desincronizarse).
@@ -1801,18 +1812,18 @@ def decidir_operativa(gan, min_op, ratio, presion, rot_lento, rot_dual, sesgo_mi
     if ratio is None:
         if gan >= min_op:
             return ("OPERAR DUAL (paciente)", "yellow",
-                    f"Spread neto {gan}% sobre tu minimo ({min_op}%), pero todavia no hay datos de rotacion (colector recien iniciado): entra con paciencia")
+                    f"{_frase_min_op(gan, min_op)}, pero todavia no hay datos de rotacion (colector recien iniciado): entra con paciencia")
         return ("ESPERAR", "red",
                 f"Spread neto {gan}% bajo tu minimo ({min_op}%) y sin datos de rotacion aun — mejor conservar el capital")
     if gan >= min_op and ratio >= rot_dual:
         return ("OPERAR DUAL", "green",
-                f"Spread neto {gan}% sobre tu minimo ({min_op}%) y mercado rotando {ratio}x su promedio de 12h")
+                f"{_frase_min_op(gan, min_op)} y mercado rotando {ratio}x su promedio de 12h")
     if gan >= min_op and ratio >= rot_lento:
         return ("OPERAR DUAL (paciente)", "yellow",
-                f"Spread neto {gan}% es operable, pero la rotacion esta en {ratio}x del promedio (umbral dual: {rot_dual}x): los fills tardaran mas de lo habitual")
+                f"{_frase_min_op(gan, min_op)}, pero la rotacion esta en {ratio}x del promedio (umbral dual: {rot_dual}x): los fills tardaran mas de lo habitual")
     if gan >= min_op:
         return ("SOLO PIERNA CON FLUJO", "orange",
-                f"Spread neto {gan}% pero mercado lento ({ratio}x): no bloquees capital en dual; opera solo el lado que la presion favorece")
+                f"{_frase_min_op(gan, min_op)} pero mercado lento ({ratio}x): no bloquees capital en dual; opera solo el lado que la presion favorece")
     if ratio >= rot_dual and abs(presion - 50) >= sesgo_min:
         lado = "VENTA" if presion > 50 else "COMPRA"
         return (f"SOLO {lado}", "orange",
@@ -2556,25 +2567,16 @@ window.P2P_AUTH = {
 </script>
 <script>
 /* ============================================================
-   Unión Austral · P2P Monitor — motor de data en vivo (demo)
-   Emite snapshots con LOS MISMOS nombres de campo que /api/estado
-   del backend Flask, más detalle por anunciante (snapshots_detalle).
-   Para producción: reemplazá createEngine() por polling a tus
-   endpoints reales (/api/estado, /api/historial, /api/heatmap).
-   Mercado: USDT / CLP · Binance P2P · TZ America/Santiago
+   Unión Austral · P2P Monitor — utilidades compartidas del front
+   fmt*/clasificar/applyFilters/FILTROS_DEFAULT/COLOR_TONE los usa
+   la app real en vivo (filtros de Tiempo Real, formateo de precios,
+   umbrales de semáforo). NO es un motor de datos simulados: el
+   generador de precios falsos (createEngine y su fallback silencioso
+   ante fallos del backend) se retiró en COL29 — si el fetch inicial
+   falla, la pantalla debe decir "SIN DATOS EN VIVO", no inventar un
+   número sin avisar.
    ============================================================ */
 (function () {
-  const NAMES = [
-    "SpaMaig", "Jimmy2680", "CryptoSurCL", "BilleteraCL", "NodoP2P",
-    "TetherKing", "PesoFuerte_OK", "DigitalCLP", "AndesExchange", "PacificoPay",
-    "FastUSDT", "ManoAMano", "RioCripto", "CordilleraP2P", "QuickTether",
-    "SantiagoCoin", "AtacamaCash", "ElCambista", "USDT_Express", "MercadoSur",
-  ];
-  const MERCHANTS = new Set(["SpaMaig", "Jimmy2680", "TetherKing", "AndesExchange", "DigitalCLP", "USDT_Express"]);
-
-  const rnd = (a, b) => a + Math.random() * (b - a);
-  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-
   const fmtPrice = (n) => "$" + Number(n).toLocaleString("es-CL", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const fmtNum = (n) => Math.round(n).toLocaleString("es-CL");
   const fmtPct = (n) => Number(n).toFixed(2) + "%";
@@ -2583,107 +2585,11 @@ window.P2P_AUTH = {
   const ALERTA_SPREAD = 0.8;     // umbral MUY APTO
   const SPREAD_MINIMO = 0.2;     // umbral APTO
 
-  // detalle por lado: top-N anunciantes (como snapshots_detalle)
-  function buildDetalle(side, n, best, worst, leaderName) {
-    const rows = [];
-    const names = NAMES.slice();
-    for (let i = 0; i < n; i++) {
-      const t = i / Math.max(1, n - 1);
-      let precio = best + (worst - best) * Math.pow(t, 1.2) + rnd(-0.5, 0.5);
-      const disponible = Math.round(rnd(900, 16000) * (1 - t * 0.45));
-      const anunciante = i === 0 ? leaderName : pick(names);
-      rows.push({
-        posicion: i + 1,
-        anunciante,
-        precio: Math.round(precio * 100) / 100,
-        disponible,
-        completadas: Math.round(rnd(120, 5400)),
-        tasa_exito: Math.round(rnd(94, 100) * 10) / 10,
-        es_merchant: MERCHANTS.has(anunciante),
-        velocidad: Math.round(rnd(40, 900)),    // USDT/min consumidos (de obtener_velocidad_anunciante)
-      });
-    }
-    rows.sort((a, b) => (side === "buy" ? a.precio - b.precio : b.precio - a.precio));
-    rows.forEach((r, i) => (r.posicion = i + 1));
-    return rows;
-  }
-
-  function ponderado(rows) {
-    let v = 0, w = 0;
-    rows.forEach((r) => { v += r.precio * r.disponible; w += r.disponible; });
-    return w ? v / w : 0;
-  }
-
   function clasificar(spread_pond_pct) {
     if (spread_pond_pct >= ALERTA_SPREAD) return { estado: "MUY APTO", color: "green" };
     if (spread_pond_pct >= SPREAD_MINIMO) return { estado: "APTO", color: "yellow" };
     if (spread_pond_pct >= 0) return { estado: "ESTRECHO", color: "orange" };
     return { estado: "NO APTO", color: "red" };
-  }
-
-  // genera un snapshot con los nombres EXACTOS del backend
-  function buildSnapshot(prev) {
-    const drift = (base, amt) => base + rnd(-amt, amt);
-    const buyLeader = drift(prev ? prev.mejor_vendedor_tab_compra : 918.0, 0.8);
-    const buyWorst = drift(prev ? prev.peor_vendedor_tab_compra : 933.0, 1.0);
-    const sellLeader = drift(prev ? prev.mejor_comprador_tab_venta : 915.52, 0.8);
-    const sellWorst = drift(prev ? prev.peor_comprador_tab_venta : 909.0, 1.0);
-
-    const dc = buildDetalle("buy", 16, buyLeader, buyWorst, "SpaMaig");
-    const dv = buildDetalle("sell", 9, sellLeader, sellWorst, "Jimmy2680");
-
-    const pond_tc = Math.round(ponderado(dc) * 100) / 100;
-    const pond_tv = Math.round(ponderado(dv) * 100) / 100;
-    const lider_tc = dc[0], lider_tv = dv[0];
-
-    const spread_abs = Math.round((lider_tc.precio - lider_tv.precio) * 100) / 100;
-    const spread_pct = Math.round((spread_abs / lider_tv.precio) * 10000) / 100;
-    const spread_pond_abs = Math.round((pond_tc - pond_tv) * 100) / 100;
-    const spread_pond_pct = Math.round((spread_pond_abs / pond_tv) * 10000) / 100;
-    const ganancia_neta_pct = Math.round((spread_pond_pct - COMISION_BN * 2 * 100) * 100) / 100;
-
-    const liq_tc = dc.reduce((s, r) => s + r.disponible, 0);
-    const liq_tv = dv.reduce((s, r) => s + r.disponible, 0);
-    const cls = clasificar(spread_pond_pct);
-    const d = new Date();
-
-    return {
-      timestamp: d.toLocaleString("sv-SE").replace("T", " "),
-      hora: d.getHours(),
-      dia: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][d.getDay()],
-      mejor_vendedor_tab_compra: lider_tc.precio,
-      peor_vendedor_tab_compra: dc[dc.length - 1].precio,
-      precio_pond_tab_compra: pond_tc,
-      lider_tab_compra: lider_tc.anunciante,
-      mejor_comprador_tab_venta: lider_tv.precio,
-      peor_comprador_tab_venta: dv[dv.length - 1].precio,
-      precio_pond_tab_venta: pond_tv,
-      lider_tab_venta: lider_tv.anunciante,
-      spread_abs, spread_pct, spread_pond_abs, spread_pond_pct,
-      liq_tab_compra: liq_tc, liq_tab_venta: liq_tv,
-      n_tab_compra: dc.length, n_tab_venta: dv.length,
-      precio_maker_vender: Math.round((lider_tc.precio - 0.01) * 100) / 100,
-      precio_maker_comprar: Math.round((lider_tv.precio + 0.01) * 100) / 100,
-      ganancia_neta_pct,
-      estado: cls.estado, color: cls.color,
-      detalle_compra: dc, detalle_venta: dv,
-    };
-  }
-
-  // heatmap: promedio de spread_pond_pct por hora/día (como /api/heatmap)
-  function buildHeatmap() {
-    const dias = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-    const out = [];
-    dias.forEach((dia, di) => {
-      for (let h = 0; h < 24; h++) {
-        // patrón: spreads más altos de madrugada/noche, más bajos al mediodía
-        const base = 0.85 - 0.6 * Math.cos(((h - 4) / 24) * Math.PI * 2);
-        const wknd = di >= 5 ? 0.25 : 0;
-        const avg = Math.max(0.05, base + wknd + rnd(-0.18, 0.18));
-        out.push({ hora: h, dia, avg_spread: Math.round(avg * 100) / 100, muestras: Math.round(rnd(20, 60)) });
-      }
-    });
-    return out;
   }
 
   // Aplica filtros sobre el detalle y RECALCULA todo (espejo de parsear_y_filtrar + analizar)
@@ -2765,89 +2671,17 @@ window.P2P_AUTH = {
 
   const COLOR_TONE = { green: "buy", yellow: "warn", orange: "warn-low", red: "sell" };
 
-  function createEngine({ cycleMs = 30000 } = {}) {
-    let snap = buildSnapshot(null);
-    const history = [];
-    let seed = buildSnapshot(null);
-    const now = Date.now();
-    const step = 5 * 60 * 1000; // 5 min reales entre snapshots
-    for (let i = 64; i >= 1; i--) {
-      seed = buildSnapshot(seed);
-      history.push(liteSnap(seed, now - i * step));
-    }
-    history.push(liteSnap(snap, now));
-    const heatmap = buildHeatmap();
-    let count = 9601;
-
-    // --- velocidad de mercado (USDT absorbidos / min) ---
-    // Deriva del consumo de 'disponible' de los anuncios entre ciclos.
-    let vel = 165; // USDT/min
-    const velHistory = [];
-    for (let i = 48; i >= 0; i--) { vel = clampVel(vel + rnd(-22, 22)); velHistory.push(vel); }
-    let velState = computeVel(velHistory[velHistory.length - 1], velHistory);
-
-    const subs = new Set();
-    let cycleStart = Date.now();
-
-    function emit(type) {
-      subs.forEach((fn) => fn({ snap, history, heatmap, count, vel: velState, cycleStart, cycleMs, type }));
-    }
-    function tick() {
-      snap = buildSnapshot(snap);
-      count += 1;
-      history.push(liteSnap(snap, Date.now()));
-      if (history.length > 80) history.shift();
-      vel = clampVel(vel + rnd(-26, 26) + (snap.spread_pond_pct > 1 ? 8 : -4));
-      velHistory.push(vel);
-      if (velHistory.length > 60) velHistory.shift();
-      velState = computeVel(vel, velHistory);
-      cycleStart = Date.now();
-      emit("cycle");
-    }
-    const id = setInterval(tick, cycleMs);
-    return {
-      get state() { return { snap, history, heatmap, count, vel: velState, cycleStart, cycleMs }; },
-      subscribe(fn) { subs.add(fn); fn({ snap, history, heatmap, count, vel: velState, cycleStart, cycleMs, type: "init" }); return () => subs.delete(fn); },
-      forceCycle: tick,
-      stop() { clearInterval(id); },
-    };
-  }
-
-  function clampVel(v) { return Math.max(45, Math.min(420, v)); }
-  function computeVel(vel, hist) {
-    const usdt_min = Math.round(vel);
-    const vol_15m = Math.round(vel * 15);
-    // base demo fija para simular el ratio contra ritmo normal
-    const base = 165;
-    const ratio = Math.round((vel / base) * 100) / 100;
-    let nivel, tone;
-    if (ratio < 0.5) { nivel = "TRANQUILO"; tone = "warn-low"; }
-    else if (ratio < 1.3) { nivel = "NORMAL"; tone = "warn"; }
-    else if (ratio < 2.2) { nivel = "ACTIVO"; tone = "buy"; }
-    else { nivel = "MUY ACTIVO"; tone = "sell"; }
-    return { usdt_min, vol_15m, nivel, tone, history: hist.slice(), pct: Math.min(1, ratio / 3), ratio };
-  }
-
-  function liteSnap(s, ts) {
-    return {
-      ts, timestamp: s.timestamp,
-      spread_pond_pct: s.spread_pond_pct, spread_pct: s.spread_pct,
-      ganancia_neta_pct: s.ganancia_neta_pct,
-      liq_tab_compra: s.liq_tab_compra, liq_tab_venta: s.liq_tab_venta,
-      precio_pond_tab_compra: s.precio_pond_tab_compra, precio_pond_tab_venta: s.precio_pond_tab_venta,
-    };
-  }
-
-  window.P2P = { createEngine, buildSnapshot, buildHeatmap, clasificar, applyFilters, FILTROS_DEFAULT, COLOR_TONE, fmtPrice, fmtNum, fmtPct, NAMES, ALERTA_SPREAD, SPREAD_MINIMO };
+  window.P2P = { clasificar, applyFilters, FILTROS_DEFAULT, COLOR_TONE, fmtPrice, fmtNum, fmtPct, ALERTA_SPREAD, SPREAD_MINIMO };
 })();
 
 </script>
 <script>
 /* ============================================================
    Unión Austral · P2P Monitor — MOTOR EN VIVO
-   Sondea tu API Flask real y emite con la MISMA interfaz que
-   createEngine() (demo). Mapea los campos del backend 1:1.
-   Si la API falla, mantiene el último dato bueno y reintenta.
+   Sondea tu API Flask real y emite snapshots con los campos del
+   backend. Si la API falla, mantiene el último dato bueno y reintenta
+   (el estado "SIN DATOS EN VIVO" ya lo muestra el header cuando el
+   último snapshot envejece — no hay fallback a datos inventados).
    ============================================================ */
 (function () {
   const P = window.P2P;
@@ -3019,20 +2853,11 @@ window.P2P_AUTH = {
         cycleStart = Date.now();
         emit(type);
       } catch (e) {
+        // si nunca cargo, NO inventamos data: se queda sin snap y el header
+        // ya muestra "SIN DATOS EN VIVO" (ver ageSec/dead mas abajo) hasta
+        // que el proximo intervalo o un evento de despertar reconecte.
         console.warn("[P2P live] no se pudo refrescar:", e.message);
-        // si nunca cargó, caemos a demo para no dejar pantalla vacía
-        if (!snap && window.P2P.createEngine) {
-          console.warn("[P2P live] usando data demo como respaldo");
-          fallbackToDemo();
-        }
       }
-    }
-
-    let demoEng = null;
-    function fallbackToDemo() {
-      if (demoEng) return;
-      demoEng = window.P2P.createEngine({ cycleMs: pollMs });
-      demoEng.subscribe((s) => { snap = s.snap; history = s.history; heatmap = s.heatmap; count = s.count; vel = s.vel; cycleStart = s.cycleStart; emit("cycle"); });
     }
 
     refresh("init");
@@ -3060,7 +2885,7 @@ window.P2P_AUTH = {
       subscribe(fn) { subs.add(fn); if (snap) fn({ snap, history, heatmap, count, vel, cycleStart, cycleMs: pollMs, type: "init" }); return () => subs.delete(fn); },
       forceCycle: () => refresh("cycle"),
       stop() {
-        stopped = true; clearInterval(id); if (demoEng) demoEng.stop();
+        stopped = true; clearInterval(id);
         if (typeof document !== "undefined") document.removeEventListener("visibilitychange", despertar);
         if (typeof window !== "undefined") {
           window.removeEventListener("focus", despertar);
@@ -7309,10 +7134,8 @@ function useEngine() {
   const [state, setState] = mS(() => null);
   const engRef = mR(null);
   mE(() => {
-    const cfg = window.P2P_CONFIG || { mode: "demo" };
-    const eng = cfg.mode === "live" && window.P2P.createLiveEngine
-      ? window.P2P.createLiveEngine({ baseUrl: cfg.baseUrl || "", pollMs: cfg.pollMs || 30000, intervaloMin: cfg.intervaloMin || 5 })
-      : window.P2P.createEngine({ cycleMs: 30000 });
+    const cfg = window.P2P_CONFIG || {};
+    const eng = window.P2P.createLiveEngine({ baseUrl: cfg.baseUrl || "", pollMs: cfg.pollMs || 30000, intervaloMin: cfg.intervaloMin || 5 });
     engRef.current = eng;
     const unsub = eng.subscribe((s) => setState(s));
     return () => { unsub(); eng.stop(); };
@@ -10296,6 +10119,70 @@ def api_export_todo():
     zbuf.seek(0)
     return Response(zbuf.getvalue(), mimetype="application/zip",
                     headers={"Content-Disposition": f"attachment; filename=backup_p2p_{hoy}.zip"})
+
+
+@app.route("/api/export/operativa")
+def api_export_operativa():
+    """Exporta operativa_historial crudo (ts + señales + decision del semaforo)
+    para poder validar la presion/decision del monitor contra el precio real
+    fuera del dashboard. Params: ?dias=N&fmt=csv|json&limit=N
+    Ej: /api/export/operativa?dias=30&fmt=json"""
+    try:
+        dias = int(request.args.get("dias", 30))
+    except (ValueError, TypeError):
+        dias = 30
+    fmt = (request.args.get("fmt", "csv") or "csv").lower()
+    limit_arg = request.args.get("limit")
+
+    sql = """
+        SELECT ts, hora, decision, color, spread_neto, ratio, presion, min_op, gap
+        FROM operativa_historial
+        WHERE ts >= NOW() - (%s || ' days')::INTERVAL
+        ORDER BY ts DESC
+    """
+    params = [dias]
+    if limit_arg:
+        try:
+            params.append(int(limit_arg))
+            sql += " LIMIT %s"
+        except (ValueError, TypeError):
+            pass
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    campos = ["ts", "hora", "decision", "color", "spread_neto", "ratio", "presion", "min_op", "gap"]
+    if fmt == "json":
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["ts"] = str(d["ts"])[:19]
+            for k in ("spread_neto", "ratio", "presion", "min_op", "gap"):
+                if d.get(k) is not None:
+                    d[k] = float(d[k])
+            out.append(d)
+        return jsonify(out)
+
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(campos)
+    for r in rows:
+        w.writerow([
+            str(r["ts"])[:19], r["hora"], r["decision"], r["color"],
+            float(r["spread_neto"]) if r["spread_neto"] is not None else "",
+            float(r["ratio"])       if r["ratio"]       is not None else "",
+            float(r["presion"])     if r["presion"]     is not None else "",
+            float(r["min_op"])      if r["min_op"]      is not None else "",
+            float(r["gap"])         if r["gap"]          is not None else "",
+        ])
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=operativa_{dias}d.csv"},
+    )
 
 
 @app.route("/api/mantenimiento/vaciar", methods=["POST"])
