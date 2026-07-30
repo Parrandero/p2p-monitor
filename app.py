@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL33"
+VERSION       = "COL34"
 VERSION_FECHA = "2026-07-29"
 
 config = {
@@ -7087,10 +7087,22 @@ function InventarioCard() {
   const [busy, setBusy] = React.useState(false);
   // ancla
   const [aU, setAU] = React.useState(""); const [aC, setAC] = React.useState("");
+  const [aNota, setANota] = React.useState("");   // COL34: para distinguir apertura/cierre en el historial
   // movimiento
   const [mTipo, setMTipo] = React.useState("taker");
   const [mLado, setMLado] = React.useState("compra");
   const [mU, setMU] = React.useState(""); const [mP, setMP] = React.useState(""); const [mC, setMC] = React.useState("");
+  // historial de anclas (COL34)
+  const [hist, setHist] = React.useState(null);
+  const [histAbierto, setHistAbierto] = React.useState(false);
+  const verHistorial = () => {
+    const abrir = !histAbierto;
+    setHistAbierto(abrir);
+    if (abrir && !hist) {
+      fetch(B + "/api/inventario/historial?dias=30").then(r => r.json())
+        .then(j => setHist(j.historial || [])).catch(() => setHist([]));
+    }
+  };
 
   const cargar = React.useCallback(() => {
     fetch(B + "/api/inventario").then(r => r.json()).then(setD).catch(() => {});
@@ -7110,7 +7122,7 @@ function InventarioCard() {
           extra = " · drift vs estimado: " + invFmt(j.drift.usdt, 2) + " USDT / " + invFmt(j.drift.clp) + " CLP";
         }
         setMsg("✓ " + okTxt + extra);
-        setForm(null); cargar();
+        setForm(null); setANota(""); cargar();
         setTimeout(() => setMsg(""), 9000);
       })
       .catch(() => { setBusy(false); setMsg("✗ error de red"); });
@@ -7140,8 +7152,9 @@ function InventarioCard() {
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
             <div><div style={lbl}>USDT en Binance</div><input value={aU} onChange={e => setAU(e.target.value)} inputMode="decimal" style={{ ...inp, width: 120 }} /></div>
             <div><div style={lbl}>CLP en Mercado Pago</div><input value={aC} onChange={e => setAC(e.target.value)} inputMode="decimal" style={{ ...inp, width: 140 }} /></div>
+            <div><div style={lbl}>Nota (opcional)</div><input value={aNota} onChange={e => setANota(e.target.value)} placeholder="apertura / cierre" style={{ ...inp, width: 150 }} /></div>
             <button disabled={busy} style={btn(true)}
-              onClick={() => post("/api/inventario/ancla", { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")) }, "saldos fijados")}>Guardar</button>
+              onClick={() => post("/api/inventario/ancla", { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")), nota: aNota }, "saldos fijados")}>Guardar</button>
             <button onClick={() => setForm(null)} style={btn(false)}>Cancelar</button>
           </div>
         )}
@@ -7224,10 +7237,51 @@ function InventarioCard() {
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         <button onClick={() => { setForm(form === "ancla" ? null : "ancla"); setAU(String(d.saldos.usdt.toFixed(2))); setAC(String(Math.round(d.saldos.clp))); }} style={btn(form === "ancla")}>Actualizar saldos</button>
         <button onClick={() => setForm(form === "mov" ? null : "mov")} style={btn(form === "mov")}>Registrar movimiento</button>
+        <button onClick={verHistorial} style={{ ...btn(histAbierto), fontSize: 11 }}>
+          {histAbierto ? "ocultar historial" : "📋 historial de saldos"}
+        </button>
         <button onClick={() => setDetalle(!detalle)} style={{ ...btn(false), border: "none", background: "transparent", marginLeft: "auto" }}>
           {detalle ? "ocultar detalle" : "ver detalle"}
         </button>
       </div>
+
+      {histAbierto && (
+        <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
+          <div style={{ display: "flex", alignItems: "center", marginBottom: 8 }}>
+            <div style={{ fontSize: 11.5, color: "var(--text-2)" }}>
+              Cada fila es un ancla real (nunca se pisan). Cruzalo con lo que anotaste en la bitácora.
+            </div>
+            <a href={B + "/api/inventario/historial?dias=30&fmt=csv"} download
+               style={{ marginLeft: "auto", fontSize: 11, fontFamily: "var(--mono)", color: "var(--accent)",
+                       textDecoration: "none", border: "1px solid var(--accent)", borderRadius: 7, padding: "3px 9px", whiteSpace: "nowrap" }}>
+              ⬇ CSV
+            </a>
+          </div>
+          {hist === null && <div style={{ fontSize: 11.5, color: "var(--text-3)" }}>Cargando…</div>}
+          {hist && hist.length === 0 && <div style={{ fontSize: 11.5, color: "var(--text-3)" }}>Sin anclas en los últimos 30 días.</div>}
+          {hist && hist.length > 0 && (
+            <div className="intel-scroll">
+              <table className="intel-table">
+                <thead><tr>
+                  <th>Fecha y hora</th><th>Nota</th><th>USDT</th><th>CLP</th>
+                  <th title="Cambio respecto del ancla inmediatamente anterior. No es P&L: incluye depósitos/retiros y trades.">Δ desde el ancla previo</th>
+                </tr></thead>
+                <tbody>{hist.map((h, i) => (
+                  <tr key={i}>
+                    <td className="tnum">{h.ts.replace("T", " ")}</td>
+                    <td>{h.nota || <span style={{ color: "var(--text-3)" }}>—</span>}</td>
+                    <td className="tnum">{invFmt(h.usdt, 2)}</td>
+                    <td className="tnum">{invFmt(h.clp)}</td>
+                    <td className="tnum" style={{ color: "var(--text-3)" }}>
+                      {h.drift_usdt != null ? (h.drift_usdt >= 0 ? "+" : "") + invFmt(h.drift_usdt, 2) + " USDT / " + (h.drift_clp >= 0 ? "+" : "") + invFmt(h.drift_clp) + " CLP" : "—"}
+                    </td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
 
       {form === "ancla" && (
         <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
@@ -7237,8 +7291,13 @@ function InventarioCard() {
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
             <div><div style={lbl}>USDT en Binance</div><input value={aU} onChange={e => setAU(e.target.value)} inputMode="decimal" style={{ ...inp, width: 120 }} /></div>
             <div><div style={lbl}>CLP en Mercado Pago</div><input value={aC} onChange={e => setAC(e.target.value)} inputMode="decimal" style={{ ...inp, width: 140 }} /></div>
+            <div><div style={lbl}>Nota (opcional)</div><input value={aNota} onChange={e => setANota(e.target.value)} placeholder="apertura / cierre" style={{ ...inp, width: 150 }} /></div>
             <button disabled={busy} style={btn(true)}
-              onClick={() => post("/api/inventario/ancla", { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")) }, "saldos actualizados")}>Guardar</button>
+              onClick={() => post("/api/inventario/ancla", { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")), nota: aNota }, "saldos actualizados")}>Guardar</button>
+          </div>
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            <button onClick={() => setANota("Apertura")} style={{ ...btn(aNota === "Apertura"), fontSize: 10.5, padding: "3px 9px" }}>Apertura</button>
+            <button onClick={() => setANota("Cierre")} style={{ ...btn(aNota === "Cierre"), fontSize: 10.5, padding: "3px 9px" }}>Cierre</button>
           </div>
         </div>
       )}
@@ -10312,6 +10371,71 @@ def api_rutinas_marcar():
         print(f"[rutinas marcar] {e}")
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
     return jsonify({"ok": True, "tarea": tarea, "ts": now.strftime("%Y-%m-%d %H:%M:%S")})
+
+
+@app.route("/api/inventario/historial")
+def api_inventario_historial():
+    """HISTORIAL DE ANCLAS (COL34): cada vez que se ancla el inventario queda
+    una fila NUEVA en inventario_ancla (nunca se pisa la anterior) — este
+    endpoint expone ese historial, que ya existia en la DB pero no se podia
+    consultar desde ningun lado. Pedido de Sebastian: poder cruzar sus anclas
+    (apertura/cierre) contra lo que anota a mano en la bitacora.
+    Params: ?dias=30&limit=200&fmt=json|csv"""
+    try:
+        dias = max(1, min(365, int(request.args.get("dias", 30))))
+    except (ValueError, TypeError):
+        dias = 30
+    try:
+        limit = max(1, min(1000, int(request.args.get("limit", 200))))
+    except (ValueError, TypeError):
+        limit = 200
+    fmt = (request.args.get("fmt", "json") or "json").lower()
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT ts, usdt, clp, precio_ref, nota
+                    FROM inventario_ancla
+                    WHERE ts >= NOW() - (%s || ' days')::INTERVAL
+                    ORDER BY ts DESC LIMIT %s
+                """, [dias, limit])
+                filas = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[inventario historial] {e}")
+        return jsonify({"error": str(e)[:200]}), 500
+
+    # drift entre cada ancla y la INMEDIATAMENTE anterior (mas vieja) — asi se
+    # ve de un vistazo cuanto se desvio la estimacion entre una y otra, el
+    # mismo calculo que ya hace api_inventario_ancla() para la ultima.
+    salida = []
+    for i, f in enumerate(filas):
+        anterior = filas[i + 1] if i + 1 < len(filas) else None
+        drift_usdt = round(float(f["usdt"]) - float(anterior["usdt"]), 2) if anterior else None
+        drift_clp = round(float(f["clp"]) - float(anterior["clp"])) if anterior else None
+        salida.append({
+            "ts": str(f["ts"])[:19], "usdt": float(f["usdt"]), "clp": float(f["clp"]),
+            "precio_ref": float(f["precio_ref"]) if f["precio_ref"] else None,
+            "nota": f["nota"] or "",
+            "drift_usdt": drift_usdt, "drift_clp": drift_clp,
+        })
+
+    if fmt == "csv":
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["fecha_hora", "usdt", "clp", "precio_ref", "nota", "drift_usdt", "drift_clp"])
+        for s in salida:
+            w.writerow([s["ts"], s["usdt"], s["clp"], s["precio_ref"] or "", s["nota"],
+                       s["drift_usdt"] if s["drift_usdt"] is not None else "",
+                       s["drift_clp"] if s["drift_clp"] is not None else ""])
+        return Response(buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename=historial_saldos_{dias}d.csv"})
+
+    return jsonify({"historial": salida, "total": len(salida),
+                    "nota": ("Cada fila es un ancla real que hiciste (nunca se sobreescriben). "
+                             "'drift' es cuanto cambio el saldo respecto del ancla anterior — "
+                             "no es P&L, incluye depositos/retiros y trades.")})
 
 
 @app.route("/api/inventario/ancla", methods=["POST"])
