@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL32"
+VERSION       = "COL33"
 VERSION_FECHA = "2026-07-29"
 
 config = {
@@ -5348,6 +5348,7 @@ function Inteligencia() {
   const [ventanas, setVentanas] = vS(null);
   const [farmers, setFarmers] = vS(null);
   const [curva, setCurva] = vS(null);
+  const [doble, setDoble] = vS(null);
   const [loading, setLoading] = vS(true);
   const [seccion, setSeccion] = vS("perfilhoras");
   const [fichaSel, setFichaSel] = vS(null);   // anunciante elegido desde la base
@@ -5365,13 +5366,15 @@ function Inteligencia() {
       fetch(B+"/api/inteligencia/ventanas_reales").then(r=>r.json()).catch(()=>[]),
       fetch(B+"/api/inteligencia/farmers").then(r=>r.json()).catch(()=>[]),
       fetch(B+"/api/inteligencia/curva_llenado").then(r=>r.json()).catch(()=>({filas:[]})),
-    ]).then(([h,a,t,f,p,prof,pvf,vr,fa,cl]) => {
+      fetch(B+"/api/inteligencia/doble_precio?dias=10").then(r=>r.json()).catch(()=>null),
+    ]).then(([h,a,t,f,p,prof,pvf,vr,fa,cl,dp]) => {
       setHorario(h); setAnunciantes(a); setTraders(t); setFill(f); setPatron(p);
       setProfundidad(Array.isArray(prof) ? prof : (prof.datos || []));
       setPrecioFill(Array.isArray(pvf) ? pvf : (pvf.datos || []));
       setVentanas(Array.isArray(vr) ? vr : []);
       setFarmers(Array.isArray(fa) ? fa : []);
       setCurva((cl && cl.filas) ? cl.filas : []);
+      setDoble(dp && dp.casos ? dp : null);
       setLoading(false);
     }).catch(()=>setLoading(false));
   }, []);
@@ -5388,7 +5391,7 @@ function Inteligencia() {
   const GRUPOS = [
     ["CUÁNDO",        [["perfilhoras","🕐 Perfil por hora"]]],
     ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"]]],
-    ["CONTRA QUIÉN",  [["basecomp","🗂️ Base de competidores"],["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"]]],
+    ["CONTRA QUIÉN",  [["basecomp","🗂️ Base de competidores"],["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"],["doble","🏷️ Doble precio"]]],
   ];
 
   if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
@@ -5557,6 +5560,68 @@ function Inteligencia() {
           <div className="intel-explain">
             <b>Qué es esto:</b> los que YA hacen lo que estás por hacer — muchas órdenes chicas por día, el modelo Inversiones_MH. El monitor los detecta por sus fills confirmados.<br/>
             <b>Qué hacer:</b> mirá el <b>gap propio</b> de los duales activos: ese es el gap que el mercado está pagando hoy por farmear. Si tu gap objetivo (0,6%) queda muy lejos del de ellos, ajustalo. Y copiales la posición: si los que más giran están #8-#15, ahí es donde pasa el flujo.
+          </div>
+        </section>
+      )}
+
+      {seccion==="doble" && (
+        <section className="chart-card">
+          <div className="card-head"><h3>Doble precio por ticket</h3><span className="card-sub">quién publica 2+ avisos del mismo lado y cuánto vende por cada uno · {doble ? doble.dias : 10} días</span></div>
+          {!doble && <div className="intel-loading">Sin datos todavía.</div>}
+          {doble && (
+          <>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
+            {[["multi-aviso", doble.resumen.pares_multi_aviso],
+              ["analizables", doble.resumen.analizables],
+              ["% por la caja (mediana)", doble.resumen.mediana_pct_por_la_caja != null ? doble.resumen.mediana_pct_por_la_caja+"%" : "—"],
+              ["segmentan por mínimo", doble.resumen.con_dato_de_limites ? doble.resumen.segmentan_por_minimo+" de "+doble.resumen.con_dato_de_limites : "sin datos aún"]
+            ].map(([l,v])=>(
+              <div key={l} style={{background:"var(--bg-2)",border:"1px solid var(--line-soft)",borderRadius:9,padding:"8px 12px",minWidth:120}}>
+                <div style={{fontSize:10,color:"var(--text-3)",textTransform:"uppercase"}}>{l}</div>
+                <div style={{fontFamily:"var(--mono)",fontSize:16,fontWeight:600}}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr>
+                <th title="Nickname en Binance P2P.">Anunciante</th>
+                <th title="Lado del libro. En BUY él vende USDT (precio atractivo = el más bajo); en SELL él compra (atractivo = el más alto).">Lado</th>
+                <th title="Volumen consumido en sus avisos, medido por caída de stock con filtro anti-reposicionamiento.">Volumen</th>
+                <th title="Qué porcentaje de su volumen se fue por el aviso de PEOR precio para el cliente (el que más margen le deja). El hallazgo: en muchos es el canal principal.">% por la caja</th>
+                <th title="Diferencia porcentual entre sus dos precios.">Spread propio</th>
+                <th title="Precio y posición del aviso con precio atractivo (la vidriera).">Vidriera</th>
+                <th title="Precio y posición del aviso con peor precio (la caja).">Caja</th>
+                <th title="¿La vidriera exige un mínimo de orden MÁS ALTO que la caja? Ese es el mecanismo: el mínimo alto excluye al comprador chico y lo empuja al aviso caro. Requiere días de límites capturados.">Segmenta</th>
+              </tr></thead>
+              <tbody>{doble.casos.map(c=>(
+                <tr key={c.anunciante+c.lado} style={{opacity: c.analizable ? 1 : 0.45}}>
+                  <td style={{fontWeight:600}}>{c.anunciante}</td>
+                  <td>{c.lado}</td>
+                  <td className="tnum">{fN(c.volumen_total)}</td>
+                  <td className="tnum" style={{fontWeight:600,color: c.analizable ? (c.pct_por_la_caja>=50?"var(--buy)":"var(--text)") : "var(--text-3)"}}>
+                    {c.analizable ? c.pct_por_la_caja+"%" : "—"}
+                    {!c.analizable && <span title={"Inventario compartido entre sus avisos ("+c.stock_compartido_pct+"% de los ciclos): la caída de stock no se puede atribuir a un aviso concreto."} style={{cursor:"help"}}> ⚠</span>}
+                  </td>
+                  <td className="tnum" style={{color:"var(--warn)"}}>{c.spread_propio_pct!=null?c.spread_propio_pct+"%":"—"}</td>
+                  <td className="tnum">{fC(c.vidriera.precio)} <span style={{color:"var(--text-3)"}}>#{c.vidriera.pos}</span>
+                    {c.vidriera.min_orden!=null && <div style={{fontSize:10,color:"var(--text-3)"}}>mín ${fN(c.vidriera.min_orden)}</div>}</td>
+                  <td className="tnum">{fC(c.caja.precio)} <span style={{color:"var(--text-3)"}}>#{c.caja.pos}</span>
+                    {c.caja.min_orden!=null && <div style={{fontSize:10,color:"var(--text-3)"}}>mín ${fN(c.caja.min_orden)}</div>}</td>
+                  <td>{c.segmenta_por_minimo===true?<span style={{color:"var(--buy)",fontWeight:600}}>✓ sí</span>
+                      :c.segmenta_por_minimo===false?<span style={{color:"var(--text-3)"}}>no</span>
+                      :<span style={{color:"var(--text-3)"}} title="Falta acumular días con límites capturados (empezó el 29-jul-2026).">—</span>}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+          </>
+          )}
+          <div className="intel-explain">
+            <b>Qué es esto:</b> publicar <b>dos avisos del mismo lado</b> a precios distintos. El barato queda arriba y visible (vidriera) pero con <b>mínimo de orden alto</b>, así que el comprador chico no califica y termina comprando en el aviso caro de más abajo (caja). El hallazgo del análisis: <b>la caja suele ser el canal principal de volumen</b>, y duplica el margen ponderado.<br/><br/>
+            <b>Ojo con la dirección:</b> en el tab <b>BUY</b> el anunciante vende, así que el precio atractivo es el <b>más bajo</b>. En <b>SELL</b> compra, y el atractivo es el <b>más alto</b>. La regla es "precio atractivo con mínimo alto", y qué es atractivo depende del lado.<br/><br/>
+            <b>Cómo se mide (y qué no se puede medir):</b> el reparto sale de la <b>caída de stock de cada aviso</b>, no del contador de órdenes — ese es por CUENTA y no se puede repartir entre avisos. Las filas <b>grises con ⚠</b> tienen inventario compartido (los dos avisos muestran el mismo disponible): ahí el reparto no es atribuible y no se informa.<br/><br/>
+            <b>La columna "Segmenta"</b> confirma el mecanismo con el mínimo real. Necesita días acumulados desde el 29-jul-2026, cuando se empezó a capturar. <b>Tener 2 avisos no implica segmentar por ticket</b>: buena parte usa el mismo mínimo en los dos.
           </div>
         </section>
       )}
@@ -8208,6 +8273,174 @@ def api_plan_hoy():
         "acciones": acciones,
         "nota": "indice 0-100: que tan buena es la hora para farmear (spread x flujo, medido). "
                 "100 = la mejor hora del dia.",
+    })
+
+
+@app.route("/api/inteligencia/doble_precio")
+def api_doble_precio():
+    """DOBLE PRECIO POR TICKET (COL33): mide la estrategia de publicar 2+ avisos
+    del mismo lado a precios distintos, segmentados por el minimo de orden.
+    Pliego: documentos/Estrategia_Doble_Precio_por_Ticket.md
+    Params: ?dias=7&min_vol=2000
+
+    ── POR QUE NO SE USA fills_estimados ──
+    Seria lo natural, pero NO SIRVE para esto: _agrupar_items() fusiona los
+    avisos de un anunciante en uno solo y guarda "el precio del mejor puesto"
+    (hay una razon: 'completadas' es por CUENTA, no por aviso, asi que sin
+    fusionar el tracker inflaba el volumen ~31 por ciento). Consecuencia: en un
+    anunciante dual, fills_estimados.precio es SIEMPRE el de la vidriera, y
+    atribuir volumen por ese campo da ~0 para la caja — medido y descartado.
+
+    ── COMO SE MIDE ENTONCES ──
+    Por la CAIDA DE STOCK de cada aviso, que si es propia de cada uno. Mismo
+    metodo anti-reposicionamiento que recalibrar_bandas(): la caida cuenta
+    como consumo solo si el precio no cambio en ese paso (si cambio, fue una
+    edicion del aviso, no una venta).
+
+    ── LIMITACION QUE HAY QUE MIRAR SIEMPRE ──
+    Un 23 por ciento de los duales muestra el MISMO 'disponible' en sus dos
+    avisos (inventario compartido, espejado por la API). En esos casos la
+    caida no se puede atribuir a un aviso concreto y el reparto NO es valido:
+    se devuelve 'stock_compartido_pct' alto y 'analizable': false. Medido en
+    44h: su lado SELL comparte (97 por ciento) y su lado BUY no (0)."""
+    try:
+        dias = max(1, min(30, int(request.args.get("dias", 7))))
+    except (ValueError, TypeError):
+        dias = 7
+    try:
+        min_vol = max(0.0, float(request.args.get("min_vol", 2000)))
+    except (ValueError, TypeError):
+        min_vol = 2000.0
+
+    # OJO ZONA HORARIA: los ts se guardan en hora Chile NAIVE y la DB corre en
+    # UTC, asi que NOW() esta 4 h adelantado y una ventana corta daria 0 filas.
+    # Se pasa la fecha ya formateada en hora Chile, como hace _registrar_operativa.
+    desde = (datetime.now(SANTIAGO_TZ) - timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S")
+
+    sql = """
+        WITH ads AS (
+            SELECT snapshot_timestamp ts, anunciante, tipo, precio, disponible,
+                   posicion, min_orden, max_orden
+            FROM snapshots_detalle
+            WHERE snapshot_timestamp >= %(d)s AND precio > 0
+              AND anunciante IS NOT NULL AND anunciante <> ''
+        ),
+        multi AS (
+            SELECT ts, anunciante, tipo, COUNT(*) n_ads,
+                   COUNT(DISTINCT disponible) n_disp
+            FROM ads GROUP BY 1,2,3 HAVING COUNT(*) > 1
+        ),
+        rk AS (
+            SELECT a.*, m.n_ads, m.n_disp,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY a.ts, a.anunciante, a.tipo
+                       ORDER BY CASE WHEN a.tipo='BUY' THEN a.precio ELSE -a.precio END
+                   ) rol
+            FROM ads a JOIN multi m USING (ts, anunciante, tipo)
+        ),
+        pasos AS (
+            SELECT anunciante, tipo, rol, ts, precio, disponible, posicion,
+                   min_orden, max_orden, n_disp,
+                   LAG(disponible) OVER w disp_prev,
+                   LAG(precio)     OVER w precio_prev,
+                   EXTRACT(EPOCH FROM (ts - LAG(ts) OVER w))/60 gap_min
+            FROM rk
+            WINDOW w AS (PARTITION BY anunciante, tipo, rol ORDER BY ts)
+        ),
+        consumo AS (
+            SELECT anunciante, tipo, rol, precio, posicion, min_orden, max_orden, n_disp,
+                   CASE WHEN precio_prev = precio AND disp_prev > disponible
+                             AND gap_min BETWEEN 0 AND 10
+                        THEN disp_prev - disponible ELSE 0 END consumido
+            FROM pasos
+        )
+        SELECT anunciante, tipo, rol,
+               COUNT(*) muestras,
+               SUM(consumido) volumen,
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY precio)   precio_med,
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY posicion) pos_med,
+               mode() WITHIN GROUP (ORDER BY min_orden) min_moda,
+               mode() WITHIN GROUP (ORDER BY max_orden) max_moda,
+               AVG(CASE WHEN n_disp = 1 THEN 1.0 ELSE 0.0 END) frac_compartido
+        FROM consumo
+        GROUP BY 1,2,3
+        ORDER BY 1,2,3
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, {"d": desde})
+                filas = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[doble_precio] {e}")
+        return jsonify({"error": str(e)[:200]}), 500
+
+    # agrupar por (anunciante, lado) en Python: mas legible que en SQL
+    grupos = {}
+    for r in filas:
+        grupos.setdefault((r["anunciante"], r["tipo"]), []).append(r)
+
+    salida = []
+    for (anun, tipo), roles in grupos.items():
+        if len(roles) < 2:
+            continue
+        roles.sort(key=lambda r: int(r["rol"]))
+        vol_tot = sum(float(r["volumen"] or 0) for r in roles)
+        if vol_tot < min_vol:
+            continue
+        vid, caja = roles[0], roles[1]
+        vol_caja = sum(float(r["volumen"] or 0) for r in roles[1:])
+        p_vid, p_caja = float(vid["precio_med"]), float(caja["precio_med"])
+        frac_comp = max(float(r["frac_compartido"] or 0) for r in roles)
+
+        # segmenta por minimo? Solo se puede afirmar si HAY dato de limites.
+        mv, mc = vid["min_moda"], caja["min_moda"]
+        if mv is None or mc is None:
+            segmenta = None            # todavia sin datos de limites
+        elif int(mv) > int(mc):
+            segmenta = True            # la vidriera pide minimo mas alto: el patron
+        else:
+            segmenta = False           # mismo minimo o invertido: no segmenta por ticket
+
+        salida.append({
+            "anunciante": anun, "lado": tipo, "n_roles": len(roles),
+            "volumen_total": round(vol_tot),
+            "pct_por_la_caja": round(vol_caja / vol_tot * 100, 1) if vol_tot else None,
+            "spread_propio_pct": round(abs(p_caja - p_vid) / p_vid * 100, 3) if p_vid else None,
+            "stock_compartido_pct": round(frac_comp * 100),
+            # si comparten inventario, el reparto por aviso no significa nada
+            "analizable": frac_comp < 0.5,
+            "segmenta_por_minimo": segmenta,
+            "vidriera": {"precio": round(p_vid, 2), "pos": round(float(vid["pos_med"]), 1),
+                         "min_orden": int(mv) if mv else None,
+                         "max_orden": int(vid["max_moda"]) if vid["max_moda"] else None,
+                         "volumen": round(float(vid["volumen"] or 0))},
+            "caja": {"precio": round(p_caja, 2), "pos": round(float(caja["pos_med"]), 1),
+                     "min_orden": int(mc) if mc else None,
+                     "max_orden": int(caja["max_moda"]) if caja["max_moda"] else None,
+                     "volumen": round(vol_caja)},
+        })
+
+    salida.sort(key=lambda x: -x["volumen_total"])
+    validos = [x for x in salida if x["analizable"]]
+    pcts = sorted(x["pct_por_la_caja"] for x in validos if x["pct_por_la_caja"] is not None)
+    con_lim = [x for x in validos if x["segmenta_por_minimo"] is not None]
+    return jsonify({
+        "dias": dias,
+        "casos": salida,
+        "resumen": {
+            "pares_multi_aviso": len(salida),
+            "analizables": len(validos),
+            "descartados_por_stock_compartido": len(salida) - len(validos),
+            "mediana_pct_por_la_caja": (pcts[len(pcts) // 2] if pcts else None),
+            "con_dato_de_limites": len(con_lim),
+            "segmentan_por_minimo": sum(1 for x in con_lim if x["segmenta_por_minimo"]),
+        },
+        "nota": ("El reparto sale de la CAIDA DE STOCK de cada aviso (con filtro "
+                 "anti-reposicionamiento), no del contador de ordenes: ese es por CUENTA "
+                 "y no se puede repartir entre los avisos. Los casos con inventario "
+                 "compartido salen marcados analizable=false. 'segmenta_por_minimo' queda "
+                 "en null hasta que haya dias de limites capturados (COL32, 29-jul-2026)."),
     })
 
 
