@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL34"
+VERSION       = "COL35"
 VERSION_FECHA = "2026-07-29"
 
 config = {
@@ -131,6 +131,19 @@ config = {
     # Se avisa en el dashboard. Los dias salen de la experiencia de la sesion
     # 28-jul: el ancla driftea si pasan varios dias, el CSV afina calibracion y
     # ticket propio, y el backup protege ante la purga automatica.
+    # ── Contexto macro (COL35): cada cuantos minutos se leen dolar/VIX/cobre.
+    # NO tiene sentido al ritmo del libro P2P (2 min): el VIX y el cobre se
+    # mueven mucho mas lento y ademas cierran los fines de semana. 15 min da
+    # ~96 filas/dia, despreciable, y no castiga la fuente gratuita.
+    "MACRO_MIN":            15,
+    # Desfase minimo (en puntos porcentuales) entre lo que se movio el dolar
+    # forex y lo que se movio el P2P en la misma ventana, para dar aviso.
+    # MEDIDO el 31-jul-2026 sobre 233 pares de horas: el cambio del forex
+    # correlaciona +0,461 con el cambio del P2P de la hora SIGUIENTE, contra
+    # +0,063 en la misma hora y +0,035 en el sentido inverso (control). O sea:
+    # el forex se mueve primero y el P2P lo sigue, no al reves.
+    "MACRO_DESFASE_PCT":    0.15,
+    "MACRO_DESFASE_MIN":    75,    # ventana en minutos para medir ese desfase
     "RUT_ANCLA_DIAS":       3,     # re-anclar inventario (saldos reales)
     "RUT_CSV_DIAS":         10,    # importar CSV de Binance (calibracion)
     "RUT_BACKUP_DIAS":      7,     # backup general de la base
@@ -181,6 +194,9 @@ CONFIG_TYPE_MAP = {
     "CICLO_MONTO_DEFAULT":   float,
     "CICLO_MARGEN_OBJETIVO": float,
     "CICLO_FLUJO_MIN_DIA":   float,
+    "MACRO_MIN":            int,
+    "MACRO_DESFASE_PCT":    float,
+    "MACRO_DESFASE_MIN":    int,
     "RUT_ANCLA_DIAS":       int,
     "RUT_CSV_DIAS":         int,
     "RUT_BACKUP_DIAS":      int,
@@ -449,6 +465,32 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_inv_ancla_ts ON inventario_ancla(ts DESC)")
+            # Dolar formal al momento de anclar (COL35). precio_ref ya guarda el
+            # P2P; con los dos se ve la BRECHA, que es el numero que Sebastian
+            # queria tener claro para anotar en la bitacora. Aditiva: las anclas
+            # viejas quedan en NULL y el historial lo tolera.
+            cur.execute("ALTER TABLE inventario_ancla ADD COLUMN IF NOT EXISTS usdclp_forex NUMERIC")
+            # ── CONTEXTO MACRO (COL35) ───────────────────────────────────
+            # Dolar oficial (forex), VIX y cobre. Sebastian ya opera mirando
+            # estos graficos al lado porque el P2P tiene RETARDO respecto del
+            # mercado formal: si el cobre/dolar se mueven, el P2P los sigue
+            # unos minutos despues. Guardar la serie permite despues MEDIR si
+            # esa anticipacion es real (igual que se hizo con la presion, que
+            # resulto NO predecir el precio) en vez de confiar en el ojo.
+            # Todas las columnas admiten NULL: si una fuente falla, la fila
+            # igual sirve por las otras.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS snapshots_macro (
+                    id SERIAL PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL,
+                    usdclp_forex NUMERIC,
+                    vix NUMERIC,
+                    cobre NUMERIC,
+                    p2p_ref NUMERIC,
+                    brecha_pct NUMERIC
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_macro_ts ON snapshots_macro(ts DESC)")
             # Movimientos MANUALES (taker / externo). Los 'maker' NO se guardan
             # aca: se derivan en vivo de fills_estimados para que no haya doble
             # conteo ni drift si un fill se corrige despues.
@@ -1908,6 +1950,217 @@ def build_detalle_memory_bybit(raw, tipo, now_dt):
                      "min_orden": f["min_orden"], "max_orden": f["max_orden"]})
     prev_detalle_raw_bybit[tipo] = nuevo
     return rows
+
+# ══════════════════════════════════════════════════════════════
+#  CONTEXTO MACRO (COL35) — dolar forex, VIX, cobre
+#  ------------------------------------------------------------
+#  AISLADO A PROPOSITO. Esto es un "nice to have": si la fuente
+#  externa se cae, cambia de formato o empieza a rate-limitear, el
+#  monitor tiene que seguir funcionando igual. Por eso:
+#   - vive en su PROPIO hilo (no toca el ciclo del colector P2P)
+#   - toda llamada de red va con timeout corto y try/except
+#   - el endpoint lee de MEMORIA, nunca dispara red en el request
+#   - si falla, se conserva el ultimo valor bueno y se marca viejo
+#  Nada de esto puede tumbar el colector ni la app.
+# ══════════════════════════════════════════════════════════════
+URL_YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/"
+# un solo proveedor para las tres series (sin API key). Si algun dia
+# hay que cambiarlo, se cambia aca y nada mas.
+MACRO_SIMBOLOS = {"usdclp_forex": "CLP=X", "vix": "^VIX", "cobre": "HG=F"}
+
+ultimo_macro = {}          # cache en memoria, lo lee /api/macro
+macro_lock = threading.Lock()
+
+
+def _yahoo_precio(simbolo):
+    """Ultimo precio de un simbolo. Devuelve None ante CUALQUIER problema
+    (red, timeout, JSON raro, campo faltante): nunca levanta excepcion."""
+    try:
+        r = requests.get(URL_YAHOO + simbolo,
+                         params={"interval": "1d", "range": "1d"},
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        r.raise_for_status()
+        meta = (((r.json() or {}).get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+        v = meta.get("regularMarketPrice")
+        prev = meta.get("chartPreviousClose")
+        if v is None:
+            return None
+        return {"valor": float(v),
+                "previo": float(prev) if prev is not None else None}
+    except Exception as e:
+        print(f"[MACRO {simbolo}] {e}")
+        return None
+
+
+def obtener_macro():
+    """Lee las tres series y las guarda en memoria + DB. Devuelve el dict.
+    Si una fuente falla, esa queda en None y las demas se guardan igual."""
+    now = datetime.now(SANTIAGO_TZ)
+    datos = {"ts": now.strftime("%Y-%m-%d %H:%M:%S")}
+    for clave, simbolo in MACRO_SIMBOLOS.items():
+        d = _yahoo_precio(simbolo)
+        datos[clave] = d["valor"] if d else None
+        # variacion vs el cierre previo: es lo que de verdad interesa mirar
+        # (que el VIX este en 16 no dice nada; que haya saltado 12% si).
+        if d and d.get("previo"):
+            datos[clave + "_var_pct"] = round((d["valor"] / d["previo"] - 1) * 100, 2)
+        else:
+            datos[clave + "_var_pct"] = None
+
+    # brecha del P2P contra el dolar formal: el numero que Sebastian queria
+    # tener a mano al anclar inventario.
+    p2p = None
+    try:
+        p2p = _precio_mid()
+    except Exception as e:
+        print(f"[MACRO p2p] {e}")
+    datos["p2p_ref"] = round(p2p, 2) if p2p else None
+    fx = datos.get("usdclp_forex")
+    datos["brecha_pct"] = (round((p2p / fx - 1) * 100, 3)
+                           if (p2p and fx) else None)
+
+    with macro_lock:
+        ultimo_macro.clear()
+        ultimo_macro.update(datos)
+
+    # persistir: si TODO vino en None no vale la pena escribir una fila vacia
+    if any(datos.get(k) is not None for k in MACRO_SIMBOLOS):
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""INSERT INTO snapshots_macro
+                                   (ts, usdclp_forex, vix, cobre, p2p_ref, brecha_pct)
+                                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                                (datos["ts"], datos["usdclp_forex"], datos["vix"],
+                                 datos["cobre"], datos["p2p_ref"], datos["brecha_pct"]))
+                conn.commit()
+        except Exception as e:
+            print(f"[MACRO guarda] {e}")
+    return datos
+
+
+def calcular_desfase():
+    """LA SENAL OPERATIVA (COL35): cuanto se movio el dolar forex que el P2P
+    TODAVIA no acompano.
+
+    POR QUE EXISTE — medido el 31-jul-2026 sobre 233 pares de horas reales,
+    cruzando snapshots (P2P) contra el USD/CLP horario de Yahoo:
+        forex y P2P en la MISMA hora ............ +0,063  (nada)
+        forex 1h ANTES  -> P2P despues .......... +0,461  <- el retardo
+        forex 2h antes  -> P2P despues .......... +0,134  (se diluye)
+        P2P antes -> forex despues (control) .... +0,035  (nada)
+    El control invertido en ~0 es lo que descarta que sea casualidad o una
+    relacion de ida y vuelta: el forex se mueve PRIMERO y el P2P lo sigue.
+
+    OJO CON LA LECTURA: +0,461 dice que la DIRECCION suele acompanar, NO que
+    el P2P vaya a moverse exactamente lo mismo ni en un plazo garantizado.
+    Por eso el mensaje sugiere, no promete, y la magnitud va como referencia.
+
+    Devuelve None si no hay serie suficiente (recien desplegado, fin de semana
+    con el forex cerrado, o fuente caida)."""
+    with config_lock:
+        vent = int(config.get("MACRO_DESFASE_MIN", 75) or 75)
+        umbral = float(config.get("MACRO_DESFASE_PCT", 0.15) or 0.15)
+    now = datetime.now(SANTIAGO_TZ)
+    # ZONA HORARIA: los ts se guardan en hora Chile NAIVE y la DB corre en UTC,
+    # asi que NOW() de Postgres esta 4 h adelantado y una ventana corta como
+    # esta daria CERO filas. Se pasa la fecha ya formateada (Manual §4.5).
+    desde = (now - timedelta(minutes=vent)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # forex: primera y ultima lectura dentro de la ventana
+                cur.execute("""
+                    SELECT usdclp_forex v, ts FROM snapshots_macro
+                    WHERE ts >= %s AND usdclp_forex IS NOT NULL
+                    ORDER BY ts ASC LIMIT 1
+                """, [desde])
+                fx0 = cur.fetchone()
+                cur.execute("""
+                    SELECT usdclp_forex v, ts FROM snapshots_macro
+                    WHERE usdclp_forex IS NOT NULL ORDER BY ts DESC LIMIT 1
+                """)
+                fx1 = cur.fetchone()
+                # P2P: mismo criterio, sobre el ponderado medio del libro
+                cur.execute("""
+                    SELECT (precio_pond_tab_compra + precio_pond_tab_venta)/2 v
+                    FROM snapshots
+                    WHERE timestamp >= %s AND precio_pond_tab_compra > 0
+                      AND precio_pond_tab_venta > 0
+                    ORDER BY timestamp ASC LIMIT 1
+                """, [desde])
+                p0 = cur.fetchone()
+                cur.execute("""
+                    SELECT (precio_pond_tab_compra + precio_pond_tab_venta)/2 v
+                    FROM snapshots
+                    WHERE precio_pond_tab_compra > 0 AND precio_pond_tab_venta > 0
+                    ORDER BY timestamp DESC LIMIT 1
+                """)
+                p1 = cur.fetchone()
+    except Exception as e:
+        print(f"[MACRO desfase] {e}")
+        return None
+
+    if not (fx0 and fx1 and p0 and p1):
+        return None
+    try:
+        fxa, fxb = float(fx0["v"]), float(fx1["v"])
+        pa, pb = float(p0["v"]), float(p1["v"])
+    except (TypeError, ValueError):
+        return None
+    if fxa <= 0 or pa <= 0:
+        return None
+    # si las dos lecturas del forex son la MISMA fila, no hay ventana que medir
+    if fx0["ts"] == fx1["ts"]:
+        return None
+
+    fx_var = (fxb / fxa - 1) * 100
+    p2p_var = (pb / pa - 1) * 100
+    pendiente = fx_var - p2p_var          # lo que el P2P "debe" segun el forex
+
+    señal, mensaje = None, None
+    if abs(pendiente) >= umbral:
+        if pendiente > 0:
+            señal = "SUBE"
+            mensaje = (f"El dólar formal subió {fx_var:+.2f}% en los últimos {vent} min y el "
+                       f"P2P solo {p2p_var:+.2f}%: suele acompañar después. "
+                       f"Conviene ESPERAR antes de vender, y si vas a recomprar, hacerlo ya.")
+        else:
+            señal = "BAJA"
+            mensaje = (f"El dólar formal se movió {fx_var:+.2f}% y el P2P {p2p_var:+.2f}%: "
+                       f"el P2P quedó adelantado. Suele corregir a la baja — "
+                       f"buen momento para VENDER, y esperar para recomprar.")
+
+    return {"ventana_min": vent,
+            "fx_var_pct": round(fx_var, 3),
+            "p2p_var_pct": round(p2p_var, 3),
+            "pendiente_pct": round(pendiente, 3),
+            "umbral_pct": umbral,
+            "senal": señal, "mensaje": mensaje,
+            "nota": ("Medido: el cambio del forex correlaciona +0,46 con el cambio del P2P "
+                     "de la hora siguiente (control invertido: +0,03). Indica DIRECCION "
+                     "probable, no magnitud garantizada.")}
+
+
+def ciclo_colector_macro():
+    """Hilo propio. El while/try esta armado para que NINGUN error pueda
+    terminar el hilo ni propagarse al resto del proceso."""
+    print("[MACRO] Iniciando thread...")
+    time.sleep(20)          # deja arrancar primero al colector P2P
+    while True:
+        try:
+            d = obtener_macro()
+            print(f"[MACRO] dolar {d.get('usdclp_forex')} · VIX {d.get('vix')} · "
+                  f"cobre {d.get('cobre')} · brecha {d.get('brecha_pct')}%")
+        except Exception as e:
+            print(f"[MACRO ciclo] {e}")
+        try:
+            with config_lock:
+                minutos = int(config.get("MACRO_MIN", 15) or 15)
+        except Exception:
+            minutos = 15
+        time.sleep(max(60, minutos * 60))
+
 
 def ciclo_colector_bybit():
     print("[BYBIT] Iniciando thread...")
@@ -7078,6 +7331,117 @@ function BarraBalance({ pct, banda }) {
   );
 }
 
+/* CONTEXTO MACRO (COL35) — dolar forex, VIX, cobre + brecha del P2P.
+   Un solo componente para los dos usos: 'chip' (compacto, arriba en Plan de
+   Hoy) y 'card' (completo, junto al inventario). Si el backend no tiene dato
+   todavia o la fuente esta caida, NO renderiza nada en vez de mostrar un
+   hueco roto — es contexto, no puede ensuciar la pantalla. */
+function MacroBar({ modo }) {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [m, setM] = React.useState(null);
+  React.useEffect(() => {
+    const load = () => fetch(B + "/api/macro").then(r => r.json()).then(setM).catch(() => {});
+    load();
+    const id = setInterval(load, 300000);   // 5 min: el dato de fondo cambia cada 15
+    return () => clearInterval(id);
+  }, []);
+  if (!m || !m.disponible) return null;
+
+  const nf = (v, d) => v == null ? "—" : Number(v).toLocaleString("es-CL", { minimumFractionDigits: d, maximumFractionDigits: d });
+  const flecha = (v) => v == null ? "" : v > 0 ? "▲" : v < 0 ? "▼" : "=";
+  const tono = (v, invertido) => {
+    if (v == null) return "var(--text-3)";
+    const bueno = invertido ? v < 0 : v > 0;
+    return Math.abs(v) < 0.05 ? "var(--text-3)" : bueno ? "var(--buy)" : "var(--sell)";
+  };
+  // VIX al reves: que SUBA es senal de miedo/volatilidad, no algo "bueno"
+  const items = [
+    { k: "Dólar forex", v: nf(m.usdclp_forex, 2), var: m.usdclp_forex_var_pct, inv: false,
+      t: "USD/CLP en el mercado formal (Yahoo Finance). El P2P suele seguirlo con retardo." },
+    { k: "VIX", v: nf(m.vix, 2), var: m.vix_var_pct, inv: true,
+      t: "Índice de miedo del mercado. Si sube fuerte, suele venir volatilidad." },
+    { k: "Cobre", v: nf(m.cobre, 3), var: m.cobre_var_pct, inv: false,
+      t: "Futuro del cobre (COMEX), en USD/libra. Chile exporta cobre: si sube, el peso tiende a fortalecerse (dólar baja)." },
+  ];
+
+  if (modo === "chip") {
+    return (
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center",
+                    fontSize: 11, color: "var(--text-2)", margin: "6px 0 0" }}>
+        {items.map(it => (
+          <span key={it.k} title={it.t} style={{ cursor: "help" }}>
+            {it.k} <b style={{ fontFamily: "var(--mono)", color: "var(--text)" }}>{it.v}</b>
+            {it.var != null && <span style={{ color: tono(it.var, it.inv) }}> {flecha(it.var)}{Math.abs(it.var)}%</span>}
+          </span>
+        ))}
+        {m.brecha_pct != null && (
+          <span title="Cuánto está el P2P por encima del dólar formal. Es la prima que paga el mercado cripto." style={{ cursor: "help" }}>
+            brecha P2P <b style={{ fontFamily: "var(--mono)", color: "var(--warn)" }}>{nf(m.brecha_pct, 2)}%</b>
+          </span>
+        )}
+        {m.desfase && m.desfase.senal && (
+          <span title={m.desfase.mensaje} style={{ cursor: "help", fontWeight: 600,
+                       color: m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)" }}>
+            {m.desfase.senal === "SUBE" ? "↗" : "↘"} P2P retrasado {Math.abs(m.desfase.pendiente_pct)}%
+          </span>
+        )}
+        {m.viejo && <span style={{ color: "var(--sell)" }} title={"Último dato hace " + m.edad_min + " min: la fuente externa no está respondiendo."}>⚠ dato viejo</span>}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
+      <div style={{ display: "flex", alignItems: "baseline", marginBottom: 8 }}>
+        <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Contexto de mercado</div>
+        <div style={{ marginLeft: "auto", fontSize: 10, color: m.viejo ? "var(--sell)" : "var(--text-3)" }}>
+          {m.viejo ? "⚠ sin actualizar hace " + m.edad_min + " min" : "hace " + m.edad_min + " min"}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {items.map(it => (
+          <div key={it.k} title={it.t} style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)",
+                                                borderRadius: 9, padding: "8px 12px", minWidth: 105, cursor: "help" }}>
+            <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase" }}>{it.k}</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 16, fontWeight: 600 }}>{it.v}</div>
+            {it.var != null && <div style={{ fontSize: 10.5, color: tono(it.var, it.inv) }}>{flecha(it.var)} {Math.abs(it.var)}% vs cierre previo</div>}
+          </div>
+        ))}
+        {m.brecha_pct != null && (
+          <div title="El P2P contra el dólar formal. Este es el número para anotar como precio de referencia en la bitácora."
+               style={{ background: "var(--warn-soft)", border: "1px solid var(--warn)", borderRadius: 9,
+                        padding: "8px 12px", minWidth: 115, cursor: "help" }}>
+            <div style={{ fontSize: 10, color: "var(--warn)", textTransform: "uppercase" }}>Brecha P2P</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 16, fontWeight: 600, color: "var(--warn)" }}>{nf(m.brecha_pct, 2)}%</div>
+            <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>P2P ${nf(m.p2p_ref, 2)} vs forex ${nf(m.usdclp_forex, 2)}</div>
+          </div>
+        )}
+      </div>
+      {m.desfase && m.desfase.senal && (
+        <div style={{ marginTop: 9, padding: "9px 12px", borderRadius: 9,
+                      background: m.desfase.senal === "SUBE" ? "var(--buy-soft)" : "var(--sell-soft)",
+                      border: "1px solid " + (m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)") }}>
+          <div style={{ fontSize: 11.5, fontWeight: 600, marginBottom: 3,
+                        color: m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)" }}>
+            {m.desfase.senal === "SUBE" ? "↗ El P2P viene retrasado hacia arriba" : "↘ El P2P quedó adelantado"}
+          </div>
+          <div style={{ fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.5 }}>{m.desfase.mensaje}</div>
+          <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
+            forex {m.desfase.fx_var_pct > 0 ? "+" : ""}{m.desfase.fx_var_pct}% · P2P {m.desfase.p2p_var_pct > 0 ? "+" : ""}{m.desfase.p2p_var_pct}% · ventana {m.desfase.ventana_min} min
+          </div>
+        </div>
+      )}
+      <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 7, lineHeight: 1.5 }}>
+        El P2P sigue al mercado formal con <b>retardo</b>, y eso está <b>medido</b>: el cambio del dólar forex
+        correlaciona <b>+0,46</b> con el cambio del P2P de la hora siguiente (en la misma hora: +0,06; en el
+        sentido inverso: +0,03 — o sea, el forex va primero). Indica <b>dirección probable, no magnitud garantizada</b>.
+        <br/>El <b>precio de referencia</b> de arriba es el que conviene anotar en la bitácora al anclar saldos.
+        <span style={{ color: "var(--text-3)" }}> Ojo: el cobre resultó mucho más débil (−0,16) que el dólar — probablemente te sirve porque mueve al dólar, no directo.</span>
+      </div>
+    </div>
+  );
+}
+
 function InventarioCard() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [d, setD] = React.useState(null);
@@ -7264,6 +7628,7 @@ function InventarioCard() {
               <table className="intel-table">
                 <thead><tr>
                   <th>Fecha y hora</th><th>Nota</th><th>USDT</th><th>CLP</th>
+                  <th title="Precio de referencia al anclar: el P2P (ponderado del libro) y el dólar formal del forex en ese momento. La brecha es cuánto estaba el P2P por encima del oficial.">Precio ref. (P2P / forex)</th>
                   <th title="Cambio respecto del ancla inmediatamente anterior. No es P&L: incluye depósitos/retiros y trades.">Δ desde el ancla previo</th>
                 </tr></thead>
                 <tbody>{hist.map((h, i) => (
@@ -7272,6 +7637,15 @@ function InventarioCard() {
                     <td>{h.nota || <span style={{ color: "var(--text-3)" }}>—</span>}</td>
                     <td className="tnum">{invFmt(h.usdt, 2)}</td>
                     <td className="tnum">{invFmt(h.clp)}</td>
+                    <td className="tnum">
+                      {h.precio_ref != null ? "$" + invFmt(h.precio_ref, 2) : "—"}
+                      {h.usdclp_forex != null && (
+                        <div style={{ fontSize: 10, color: "var(--text-3)" }}>
+                          forex ${invFmt(h.usdclp_forex, 2)}
+                          {h.brecha_pct != null && <span style={{ color: "var(--warn)" }}> · brecha {h.brecha_pct > 0 ? "+" : ""}{h.brecha_pct}%</span>}
+                        </div>
+                      )}
+                    </td>
                     <td className="tnum" style={{ color: "var(--text-3)" }}>
                       {h.drift_usdt != null ? (h.drift_usdt >= 0 ? "+" : "") + invFmt(h.drift_usdt, 2) + " USDT / " + (h.drift_clp >= 0 ? "+" : "") + invFmt(h.drift_clp) + " CLP" : "—"}
                     </td>
@@ -7297,6 +7671,7 @@ function InventarioCard() {
           </div>
           <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
             <button onClick={() => setANota("Apertura")} style={{ ...btn(aNota === "Apertura"), fontSize: 10.5, padding: "3px 9px" }}>Apertura</button>
+            <button onClick={() => setANota("Control")} style={{ ...btn(aNota === "Control"), fontSize: 10.5, padding: "3px 9px" }}>Control</button>
             <button onClick={() => setANota("Cierre")} style={{ ...btn(aNota === "Cierre"), fontSize: 10.5, padding: "3px 9px" }}>Cierre</button>
           </div>
         </div>
@@ -10373,6 +10748,76 @@ def api_rutinas_marcar():
     return jsonify({"ok": True, "tarea": tarea, "ts": now.strftime("%Y-%m-%d %H:%M:%S")})
 
 
+@app.route("/api/macro")
+def api_macro():
+    """CONTEXTO MACRO (COL35): dolar forex, VIX y cobre + la brecha del P2P
+    contra el dolar formal.
+
+    LEE DE MEMORIA, nunca dispara red: el hilo ciclo_colector_macro es el
+    unico que sale a buscar los datos. Asi este endpoint no puede colgarse
+    aunque la fuente externa este caida.
+
+    Devuelve 'edad_min' para que la UI pueda avisar si el dato quedo viejo
+    (fuente caida) en vez de mostrar un numero rancio como si fuera de ahora.
+    Param opcional: ?historial=N para traer las ultimas N filas guardadas."""
+    with macro_lock:
+        d = dict(ultimo_macro)
+    if not d:
+        return jsonify({"disponible": False,
+                        "nota": "Todavia no se leyo el contexto macro (el hilo "
+                                "corre a los ~20s del arranque y cada MACRO_MIN)."})
+    edad = None
+    try:
+        ts = datetime.strptime(d["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=SANTIAGO_TZ)
+        edad = round((datetime.now(SANTIAGO_TZ) - ts).total_seconds() / 60, 1)
+    except Exception:
+        pass
+    d["disponible"] = True
+    d["edad_min"] = edad
+    # 3x el intervalo esperado = algo no esta actualizando
+    try:
+        with config_lock:
+            lim = int(config.get("MACRO_MIN", 15) or 15) * 3
+    except Exception:
+        lim = 45
+    d["viejo"] = bool(edad is not None and edad > lim)
+
+    # la senal operativa: cuanto se movio el forex que el P2P todavia no siguio
+    try:
+        d["desfase"] = calcular_desfase()
+    except Exception as e:
+        print(f"[macro desfase] {e}")
+        d["desfase"] = None
+
+    try:
+        n = int(request.args.get("historial", 0))
+    except (ValueError, TypeError):
+        n = 0
+    if n > 0:
+        try:
+            with get_conn() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""SELECT ts, usdclp_forex, vix, cobre, p2p_ref, brecha_pct
+                                   FROM snapshots_macro ORDER BY ts DESC LIMIT %s""",
+                                [max(1, min(500, n))])
+                    d["historial"] = [
+                        {"ts": str(r["ts"])[:19],
+                         "usdclp_forex": float(r["usdclp_forex"]) if r["usdclp_forex"] else None,
+                         "vix": float(r["vix"]) if r["vix"] else None,
+                         "cobre": float(r["cobre"]) if r["cobre"] else None,
+                         "p2p_ref": float(r["p2p_ref"]) if r["p2p_ref"] else None,
+                         "brecha_pct": float(r["brecha_pct"]) if r["brecha_pct"] else None}
+                        for r in cur.fetchall()]
+        except Exception as e:
+            print(f"[macro historial] {e}")
+            d["historial"] = []
+    d["nota"] = ("El P2P suele seguir al mercado formal con retardo. La brecha es "
+                 "cuanto esta el P2P por encima del dolar forex. Las variaciones son "
+                 "contra el cierre previo. Serie guardada cada MACRO_MIN para poder "
+                 "MEDIR despues si de verdad anticipa (no asumirlo).")
+    return jsonify(d)
+
+
 @app.route("/api/inventario/historial")
 def api_inventario_historial():
     """HISTORIAL DE ANCLAS (COL34): cada vez que se ancla el inventario queda
@@ -10395,7 +10840,7 @@ def api_inventario_historial():
         with get_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT ts, usdt, clp, precio_ref, nota
+                    SELECT ts, usdt, clp, precio_ref, nota, usdclp_forex
                     FROM inventario_ancla
                     WHERE ts >= NOW() - (%s || ' days')::INTERVAL
                     ORDER BY ts DESC LIMIT %s
@@ -10413,9 +10858,15 @@ def api_inventario_historial():
         anterior = filas[i + 1] if i + 1 < len(filas) else None
         drift_usdt = round(float(f["usdt"]) - float(anterior["usdt"]), 2) if anterior else None
         drift_clp = round(float(f["clp"]) - float(anterior["clp"])) if anterior else None
+        # brecha del P2P contra el dolar formal EN ESE MOMENTO (COL35). Las
+        # anclas anteriores al deploy no tienen forex guardado -> queda None.
+        p_ref = float(f["precio_ref"]) if f["precio_ref"] else None
+        fx = float(f["usdclp_forex"]) if f.get("usdclp_forex") else None
         salida.append({
             "ts": str(f["ts"])[:19], "usdt": float(f["usdt"]), "clp": float(f["clp"]),
-            "precio_ref": float(f["precio_ref"]) if f["precio_ref"] else None,
+            "precio_ref": p_ref,
+            "usdclp_forex": fx,
+            "brecha_pct": (round((p_ref / fx - 1) * 100, 2) if (p_ref and fx) else None),
             "nota": f["nota"] or "",
             "drift_usdt": drift_usdt, "drift_clp": drift_clp,
         })
@@ -10424,9 +10875,12 @@ def api_inventario_historial():
         import csv, io
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["fecha_hora", "usdt", "clp", "precio_ref", "nota", "drift_usdt", "drift_clp"])
+        w.writerow(["fecha_hora", "usdt", "clp", "precio_ref_p2p", "usdclp_forex",
+                    "brecha_pct", "nota", "drift_usdt", "drift_clp"])
         for s in salida:
-            w.writerow([s["ts"], s["usdt"], s["clp"], s["precio_ref"] or "", s["nota"],
+            w.writerow([s["ts"], s["usdt"], s["clp"], s["precio_ref"] or "",
+                       s["usdclp_forex"] or "", s["brecha_pct"] if s["brecha_pct"] is not None else "",
+                       s["nota"],
                        s["drift_usdt"] if s["drift_usdt"] is not None else "",
                        s["drift_clp"] if s["drift_clp"] is not None else ""])
         return Response(buf.getvalue(), mimetype="text/csv",
@@ -10453,6 +10907,14 @@ def api_inventario_ancla():
         return jsonify({"ok": False, "error": "los saldos no pueden ser negativos"}), 400
     precio = _precio_mid()
     now = datetime.now(SANTIAGO_TZ)
+    # dolar formal del momento (COL35): se lee de MEMORIA, no dispara red, asi
+    # que si la fuente macro esta caida el ancla se guarda igual con NULL.
+    fx_oficial = None
+    try:
+        with macro_lock:
+            fx_oficial = ultimo_macro.get("usdclp_forex")
+    except Exception:
+        pass
     # drift: cuanto se desvio la estimacion de la realidad (calibracion gratis)
     drift = None
     try:
@@ -10465,10 +10927,11 @@ def api_inventario_ancla():
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""INSERT INTO inventario_ancla (ts, usdt, clp, precio_ref, nota)
-                               VALUES (%s,%s,%s,%s,%s)""",
+                cur.execute("""INSERT INTO inventario_ancla
+                               (ts, usdt, clp, precio_ref, nota, usdclp_forex)
+                               VALUES (%s,%s,%s,%s,%s,%s)""",
                             (now.strftime("%Y-%m-%d %H:%M:%S"), usdt, clp, precio,
-                             (data.get("nota") or "")[:200]))
+                             (data.get("nota") or "")[:200], fx_oficial))
             conn.commit()
     except Exception as e:
         print(f"[ancla] {e}")
@@ -11029,6 +11492,8 @@ def _boot():
         print(f"[BANDAS boot] {e}")
     threading.Thread(target=ciclo_colector, daemon=True).start()
     threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
+    # macro va en su propio hilo: si la fuente externa falla, no arrastra a nadie
+    threading.Thread(target=ciclo_colector_macro, daemon=True).start()
 
 if __name__ == "__main__":
     _boot()
