@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL35"
-VERSION_FECHA = "2026-07-29"
+VERSION       = "COL36"
+VERSION_FECHA = "2026-07-31"
 
 config = {
     "MONEDA":               "USDT",
@@ -491,6 +491,33 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_macro_ts ON snapshots_macro(ts DESC)")
+            # BTC (COL36): las metas de Merchant estan EN BTC, asi que sin el
+            # precio no se pueden traducir a USDT operables.
+            cur.execute("ALTER TABLE snapshots_macro ADD COLUMN IF NOT EXISTS btc_usd NUMERIC")
+            # ── ANCLA DE MERCHANT (COL36) ────────────────────────────────
+            # Los 6 numeros de la pagina de elegibilidad de Binance, cargados
+            # a mano cuando Sebastian la mira. MISMA FILOSOFIA QUE
+            # inventario_ancla: el monitor estima en vivo, pero la verdad la
+            # fija el ancla y el drift entre ambas mide el error.
+            # Por que hace falta: Binance NO publica el volumen propio por API
+            # publica. El contador de ORDENES si se lee del libro (exacto), el
+            # volumen hay que estimarlo — y esta tabla es lo que permite
+            # calibrar esa estimacion contra el numero real.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS merchant_ancla (
+                    id SERIAL PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL,
+                    ordenes_total INTEGER,
+                    ordenes_30d INTEGER,
+                    vol_total_btc NUMERIC,
+                    vol_30d_btc NUMERIC,
+                    tasa_finalizacion NUMERIC,
+                    dias_verificado INTEGER,
+                    btc_usd NUMERIC,
+                    nota TEXT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_merch_ancla_ts ON merchant_ancla(ts DESC)")
             # Movimientos MANUALES (taker / externo). Los 'maker' NO se guardan
             # aca: se derivan en vivo de fills_estimados para que no haya doble
             # conteo ni drift si un fill se corrige despues.
@@ -1966,7 +1993,10 @@ def build_detalle_memory_bybit(raw, tipo, now_dt):
 URL_YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/"
 # un solo proveedor para las tres series (sin API key). Si algun dia
 # hay que cambiarlo, se cambia aca y nada mas.
-MACRO_SIMBOLOS = {"usdclp_forex": "CLP=X", "vix": "^VIX", "cobre": "HG=F"}
+MACRO_SIMBOLOS = {"usdclp_forex": "CLP=X", "vix": "^VIX", "cobre": "HG=F",
+                  # BTC (COL36): no es contexto de mercado, es una CONVERSION —
+                  # las metas de Merchant estan en BTC y hay que pasarlas a USDT.
+                  "btc_usd": "BTC-USD"}
 
 ultimo_macro = {}          # cache en memoria, lo lee /api/macro
 macro_lock = threading.Lock()
@@ -2029,10 +2059,11 @@ def obtener_macro():
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""INSERT INTO snapshots_macro
-                                   (ts, usdclp_forex, vix, cobre, p2p_ref, brecha_pct)
-                                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                                   (ts, usdclp_forex, vix, cobre, p2p_ref, brecha_pct, btc_usd)
+                                   VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                                 (datos["ts"], datos["usdclp_forex"], datos["vix"],
-                                 datos["cobre"], datos["p2p_ref"], datos["brecha_pct"]))
+                                 datos["cobre"], datos["p2p_ref"], datos["brecha_pct"],
+                                 datos.get("btc_usd")))
                 conn.commit()
         except Exception as e:
             print(f"[MACRO guarda] {e}")
@@ -7042,6 +7073,166 @@ function PlanHoy() {
   );
 }
 
+/* CARRERA A MERCHANT (COL36) — los 6 requisitos REALES de la pagina de
+   elegibilidad de Binance, con conteo en vivo y el plan para llegar.
+   Antes el codigo usaba metas inventadas (300 ordenes, que no existe). */
+function CarreraMerchant() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  const [form, setForm] = React.useState(false);
+  const [msg, setMsg] = React.useState("");
+  const [f, setF] = React.useState({ ordenes_total: "", ordenes_30d: "", vol_total_btc: "",
+                                     vol_30d_btc: "", tasa_finalizacion: "", dias_verificado: "" });
+  const cargar = React.useCallback(() => {
+    fetch(B + "/api/merchant").then(r => r.json()).then(setD).catch(() => {});
+  }, []);
+  React.useEffect(() => { cargar(); const id = setInterval(cargar, 120000); return () => clearInterval(id); }, [cargar]);
+  if (!d || !d.requisitos) return null;
+
+  const nf = (v, dec) => v == null ? "—" : Number(v).toLocaleString("es-CL", { minimumFractionDigits: dec || 0, maximumFractionDigits: dec || 0 });
+  const p = d.plan || {};
+  const NOMBRE = {
+    dias_verificado: "Días desde verificación", tasa_finalizacion: "Tasa de finalización",
+    ordenes_30d: "Órdenes (30d móvil)", vol_30d_btc: "Volumen (30d móvil)",
+    ordenes_total: "Órdenes totales", vol_total_btc: "Volumen total",
+  };
+  const guardar = () => {
+    const body = {};
+    Object.keys(f).forEach(k => { if (String(f[k]).trim() !== "") body[k] = parseFloat(String(f[k]).replace(",", ".")); });
+    window.P2P_AUTH.post(B + "/api/merchant/ancla", body)
+      .then(r => r.json()).then(j => {
+        setMsg(j.ok ? "✓ datos de Binance guardados" : "✗ " + (j.error || "no se pudo"));
+        if (j.ok) { setForm(false); cargar(); }
+        setTimeout(() => setMsg(""), 8000);
+      }).catch(() => setMsg("✗ error de red"));
+  };
+
+  const inp = { background: "var(--bg-1)", border: "1px solid var(--line)", borderRadius: 7,
+                padding: "5px 8px", color: "var(--text)", fontFamily: "var(--mono)", fontSize: 12, width: 95 };
+  const lbl = { fontSize: 9.5, color: "var(--text-3)", textTransform: "uppercase", marginBottom: 2 };
+
+  return (
+    <div className="chart-card" style={{ margin: "10px 0 0", padding: "13px 16px" }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 9, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Carrera a Merchant</div>
+        {d.cumple_todo && <span style={{ color: "var(--buy)", fontWeight: 600, fontSize: 12 }}>✓ cumplís todo</span>}
+        <button onClick={() => setForm(!form)} style={{ marginLeft: "auto", cursor: "pointer", borderRadius: 7,
+          padding: "3px 10px", border: "1px solid var(--line)", background: "transparent",
+          color: "var(--text-3)", fontSize: 10.5, fontFamily: "var(--mono)" }}>
+          {form ? "cancelar" : "actualizar desde Binance"}
+        </button>
+      </div>
+
+      {form && (
+        <div style={{ background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
+          <div style={{ fontSize: 11.5, color: "var(--text-2)", marginBottom: 8 }}>
+            Copiá los números de <b>p2p.binance.com → Solicitud para comerciante</b>. Son la verdad de terreno: con eso el monitor calibra la estimación de volumen.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+            {[["ordenes_30d", "Órdenes 30d"], ["vol_30d_btc", "Volumen 30d (BTC)"], ["ordenes_total", "Órdenes totales"],
+              ["vol_total_btc", "Volumen total (BTC)"], ["tasa_finalizacion", "Tasa final. (%)"], ["dias_verificado", "Días verificado"]].map(([k, l]) => (
+              <div key={k}><div style={lbl}>{l}</div>
+                <input value={f[k]} onChange={e => setF({ ...f, [k]: e.target.value })} inputMode="decimal" style={inp} /></div>
+            ))}
+            <button onClick={guardar} className="btn-apply dirty">Guardar</button>
+          </div>
+        </div>
+      )}
+      {msg && <div style={{ fontFamily: "var(--mono)", fontSize: 11.5, marginBottom: 8, color: msg[0] === "✓" ? "var(--buy)" : "var(--warn)" }}>{msg}</div>}
+
+      {/* los 6 requisitos */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+        {d.requisitos.map(r => (
+          <div key={r.clave} style={{ flex: "1 1 150px", minWidth: 150, background: "var(--bg-2)",
+                border: "1px solid " + (r.cumple ? "var(--buy)" : "var(--line-soft)"), borderRadius: 10, padding: "8px 11px" }}>
+            <div style={{ fontSize: 9.5, color: "var(--text-3)", textTransform: "uppercase" }}>{NOMBRE[r.clave] || r.clave}</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 15, fontWeight: 600, color: r.cumple ? "var(--buy)" : "var(--text)" }}>
+              {r.actual == null ? "—" : nf(r.actual, r.unidad === "BTC" ? 4 : (r.unidad === "%" ? 1 : 0))}
+              <span style={{ fontSize: 10.5, color: "var(--text-3)", fontWeight: 400 }}> / {nf(r.meta, r.unidad === "BTC" ? 1 : 0)}</span>
+            </div>
+            {r.pct != null && (
+              <div className="hbar" style={{ marginTop: 4 }}>
+                <div className="hbar-fill" style={{ width: Math.min(100, r.pct) + "%", background: r.cumple ? "var(--buy)" : "var(--warn)" }} />
+              </div>
+            )}
+            <div style={{ fontSize: 10, color: r.cumple ? "var(--buy)" : "var(--text-3)", marginTop: 3 }}>
+              {r.actual == null ? "cargá los datos de Binance"
+                : r.cumple ? "✓ cumplido"
+                : "faltan " + nf(r.falta, r.unidad === "BTC" ? 4 : 0) + " " + r.unidad}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* el plan */}
+      {p.usdt_por_dia_necesario && (
+        <div style={{ background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 12px" }}>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", marginBottom: 7 }}>Qué hace falta para llegar</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+            {[["USDT/día necesario", nf(p.usdt_por_dia_necesario), "sostenido — la ventana es móvil"],
+              ["tu ritmo hoy", p.usdt_por_dia_real ? nf(p.usdt_por_dia_real) : "—", p.factor_necesario ? "hay que multiplicar x" + p.factor_necesario : "sin medir aún"],
+              ["ticket objetivo", nf(p.ticket_objetivo_usdt), "para que 150 órdenes alcancen"],
+              ["tu ticket", p.ticket_actual_usdt ? nf(p.ticket_actual_usdt, 1) : "—", p.ticket_fuente === "ancla" ? "calibrado con Binance" : "del CSV (subestima)"]
+            ].map(([l, v, s]) => (
+              <div key={l} style={{ flex: "1 1 130px", minWidth: 130 }}>
+                <div style={{ fontSize: 9.5, color: "var(--text-3)", textTransform: "uppercase" }}>{l}</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 15, fontWeight: 600 }}>{v}</div>
+                <div style={{ fontSize: 9.5, color: "var(--text-3)" }}>{s}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.55, paddingTop: 7, borderTop: "1px solid var(--line-soft)" }}>
+            {!p.alcanza_con_ritmo_actual && (
+              <><b style={{ color: "var(--warn)" }}>Con el ticket actual no llegás.</b>{" "}
+              Necesitarías <b>{p.ordenes_dia_con_ticket_actual}</b> órdenes por día todos los días, contra las <b>{p.ordenes_por_dia_necesario}</b> que
+              harían falta si el ticket fuera de {nf(p.ticket_objetivo_usdt)} USDT. <b>La palanca es el ticket, no la cantidad de órdenes.</b><br /></>
+            )}
+            <span style={{ color: "var(--text-3)" }}>
+              La ventana de 30 días es <b>móvil</b>: lo de hace 31 días desaparece. Por debajo del ritmo necesario la meta nunca se alcanza —
+              se cae por atrás al mismo ritmo que entra.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* como subir el ticket: medido */}
+      {d.minimos_medidos && d.minimos_medidos.length > 0 && (
+        <div style={{ marginTop: 9, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 12px" }}>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", marginBottom: 6 }}>Cómo conseguir tickets más grandes (medido en el mercado)</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {d.minimos_medidos.map(m => {
+              const objetivo = p.ticket_objetivo_usdt && m.ticket_mediano >= p.ticket_objetivo_usdt;
+              return (
+                <div key={m.min_desde} style={{ flex: "1 1 120px", minWidth: 120, padding: "7px 10px", borderRadius: 8,
+                      background: objetivo ? "var(--buy-soft)" : "var(--bg-1)",
+                      border: "1px solid " + (objetivo ? "var(--buy)" : "var(--line-soft)") }}>
+                  <div style={{ fontSize: 9.5, color: "var(--text-3)" }}>
+                    mín ${nf(m.min_desde)}{m.min_hasta ? "–" + nf(m.min_hasta) : "+"}
+                  </div>
+                  <div style={{ fontFamily: "var(--mono)", fontSize: 15, fontWeight: 600, color: objetivo ? "var(--buy)" : "var(--text)" }}>
+                    {nf(m.ticket_mediano)} <span style={{ fontSize: 10, fontWeight: 400, color: "var(--text-3)" }}>USDT</span>
+                  </div>
+                  <div style={{ fontSize: 9.5, color: "var(--text-3)" }}>{m.n} anunciantes</div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text-2)", marginTop: 7, lineHeight: 1.5 }}>
+            El <b>mínimo de orden que publicás</b> define el ticket que te llega — correlación medida <b>+0,80</b>.
+            Es una perilla <b>distinta</b> del gap: filtra <i>quién</i> te toma, no <i>a qué precio</i>. Subir el mínimo no te obliga a resignar margen.
+          </div>
+        </div>
+      )}
+
+      <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 7, lineHeight: 1.5 }}>
+        {d.vivo && d.vivo.ordenes_30d != null && <>Órdenes leídas del libro público (exacto, cada 2 min): <b>{d.vivo.ordenes_30d}</b>. </>}
+        El volumen es <b>estimado</b> (órdenes × ticket); se calibra cada vez que cargás los datos de Binance.
+        {d.ancla && <> Último dato real: {String(d.ancla.ts).slice(0, 16)}.</>}
+      </div>
+    </div>
+  );
+}
+
 function MiCampania() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [d, setD] = React.useState(null);
@@ -7822,7 +8013,7 @@ function CalculadoraCruzar() {
   );
 }
 
-window.P2PViews = { TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
+window.P2PViews = { CarreraMerchant, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
 
 </script>
 <script type="text/babel">
@@ -7903,6 +8094,7 @@ function App() {
         {tab === "tr" && <V.ChipBalance />}
         {tab === "tr" && <V.EstrategiaPanel />}
         {tab === "tr" && <V.MiCampania />}
+        {tab === "tr" && <V.CarreraMerchant />}
         {tab === "tr" && <V.InventarioCard />}
         {tab === "tr" && <V.AsistenteOperativo />}
         {tab === "tr" && <V.CalculadoraCruzar />}
@@ -10982,6 +11174,307 @@ def api_inventario_movimiento():
                     "usdt": usdt, "clp": round(clp), "precio": precio})
 
 
+# ══════════════════════════════════════════════════════════════
+#  CARRERA A MERCHANT (COL36)
+#  Los requisitos REALES, tomados de la pagina de elegibilidad de
+#  Binance (captura del 31-jul-2026). Antes el codigo usaba
+#  "300 ordenes", que NO existe como requisito.
+# ══════════════════════════════════════════════════════════════
+MERCHANT_REQ = {
+    "dias_verificado":   90,      # dias desde la verificacion de identidad
+    "ordenes_total":     500,     # historico completo
+    "vol_total_btc":     1.0,     # historico completo
+    "ordenes_30d":       150,     # ventana MOVIL de 30 dias
+    "vol_30d_btc":       0.5,     # ventana MOVIL de 30 dias
+    "tasa_finalizacion": 90.0,    # ultimos 30 dias
+}
+
+
+def _btc_usd():
+    """Precio del BTC para traducir las metas (que estan en BTC) a USDT."""
+    try:
+        with macro_lock:
+            v = ultimo_macro.get("btc_usd")
+        if v:
+            return float(v)
+    except Exception:
+        pass
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""SELECT btc_usd FROM snapshots_macro
+                               WHERE btc_usd IS NOT NULL ORDER BY ts DESC LIMIT 1""")
+                r = cur.fetchone()
+                if r and r["btc_usd"]:
+                    return float(r["btc_usd"])
+    except Exception as e:
+        print(f"[merchant btc] {e}")
+    return None
+
+
+def _minimo_para_ticket():
+    """Tabla MEDIDA de 'que minimo de orden pone cada uno' vs 'que ticket
+    recibe'. Es la respuesta con datos a: como consigo tickets mas grandes.
+
+    Medido el 31-jul-2026 sobre 257 anunciantes: correlacion +0,80 entre el
+    minimo publicado y el ticket recibido. No es teoria, es el mercado."""
+    tramos = [(0, 20000), (20000, 50000), (50000, 150000), (150000, 10 ** 9)]
+    out = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    WITH lim AS (
+                        SELECT anunciante, tipo,
+                               mode() WITHIN GROUP (ORDER BY min_orden) mn
+                        FROM snapshots_detalle
+                        WHERE min_orden IS NOT NULL
+                          AND snapshot_timestamp >= NOW() - INTERVAL '7 days'
+                        GROUP BY 1, 2
+                    ),
+                    tk AS (
+                        SELECT anunciante, tipo,
+                               PERCENTILE_CONT(0.5) WITHIN GROUP (
+                                   ORDER BY monto / NULLIF(ordenes, 0)) ticket
+                        FROM fills_estimados
+                        WHERE metodo = 'directo' AND ordenes > 0
+                          AND monto > 0 AND monto < 5000
+                          AND ts >= NOW() - INTERVAL '7 days'
+                        GROUP BY 1, 2 HAVING COUNT(*) >= 5
+                    )
+                    SELECT l.mn, t.ticket FROM lim l JOIN tk t USING (anunciante, tipo)
+                    WHERE l.mn IS NOT NULL AND t.ticket IS NOT NULL
+                """)
+                filas = [(float(r["mn"]), float(r["ticket"])) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[merchant minimos] {e}")
+        return []
+    for a, b in tramos:
+        g = sorted(t for m, t in filas if a <= m < b)
+        if not g:
+            continue
+        out.append({"min_desde": a, "min_hasta": (None if b > 10 ** 8 else b),
+                    "n": len(g), "ticket_mediano": round(g[len(g) // 2])})
+    return out
+
+
+@app.route("/api/merchant")
+def api_merchant():
+    """CARRERA A MERCHANT (COL36): estado real contra los 6 requisitos, con
+    conteo EN VIVO y proyeccion que respeta la ventana movil.
+
+    ── QUE ES EXACTO Y QUE ES ESTIMADO ──
+    - ORDENES 30d: EXACTO. Se lee monthOrderCount del libro publico cada 2 min
+      cuando estas publicado. Verificado 31-jul: monitor 131 = Binance 131.
+    - VOLUMEN: ESTIMADO. Binance no lo publica. Se calcula
+      ordenes_en_vivo x ticket, donde el ticket sale del ANCLA (volumen real
+      dividido ordenes reales de ese momento). Con el ancla del 31-jul el
+      error medido fue 0,04%.
+    - El resto (ordenes totales, volumen total, tasa, dias) viene del ancla y
+      se proyecta con lo que paso desde entonces.
+
+    ── LA VENTANA MOVIL ──
+    Los requisitos de 30 dias son de ventana MOVIL: lo de hace 31 dias
+    desaparece. Por eso no alcanza con acumular, hay que SOSTENER un ritmo. Si
+    el ritmo diario es menor al necesario, la meta NUNCA se alcanza: se cae por
+    atras al mismo ritmo que entra."""
+    with config_lock:
+        c = dict(config)
+    mi_nick = str(c.get("MI_NICKNAME") or "").strip()
+    btc = _btc_usd()
+
+    # ── ancla: la verdad de terreno ──
+    ancla = None
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""SELECT * FROM merchant_ancla ORDER BY ts DESC LIMIT 1""")
+                r = cur.fetchone()
+                if r:
+                    # los NUMERIC vuelven como Decimal; se pasan a float sin
+                    # importar decimal (hasattr es suficiente y no agrega import)
+                    ancla = {k: (float(v) if hasattr(v, "__float__") and not isinstance(v, (int, float)) else v)
+                             for k, v in dict(r).items()}
+                    ancla["ts"] = str(ancla["ts"])[:19]
+    except Exception as e:
+        print(f"[merchant ancla] {e}")
+
+    # ── conteo EN VIVO desde el libro publico ──
+    vivo = {"ordenes_30d": None, "visto": None, "serie": []}
+    if mi_nick:
+        try:
+            with get_conn() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT MAX(completadas) o, MAX(snapshot_timestamp) ts
+                        FROM snapshots_detalle
+                        WHERE LOWER(anunciante) = LOWER(%s)
+                          AND snapshot_timestamp >= NOW() - INTERVAL '2 days'
+                    """, [mi_nick])
+                    r = cur.fetchone()
+                    if r and r["o"]:
+                        vivo["ordenes_30d"] = int(r["o"])
+                        vivo["visto"] = str(r["ts"])[:19]
+                    # serie diaria: para ver el ritmo real y como se mueve
+                    cur.execute("""
+                        SELECT snapshot_timestamp::date d, MAX(completadas) o
+                        FROM snapshots_detalle
+                        WHERE LOWER(anunciante) = LOWER(%s)
+                        GROUP BY 1 ORDER BY 1
+                    """, [mi_nick])
+                    prev = None
+                    for x in cur.fetchall():
+                        o = int(x["o"] or 0)
+                        vivo["serie"].append({"fecha": str(x["d"]), "ordenes_30d": o,
+                                              "variacion": (o - prev) if prev is not None else None})
+                        prev = o
+        except Exception as e:
+            print(f"[merchant vivo] {e}")
+
+    # ── ticket calibrado: el que hace cuadrar el ancla ──
+    # (volumen REAL del ancla) / (ordenes REALES del ancla). Es mejor que el
+    # ticket del CSV porque sale del mismo numero que Binance publica.
+    ticket_cal, ticket_fuente = None, None
+    if ancla and btc and ancla.get("vol_30d_btc") and ancla.get("ordenes_30d"):
+        ticket_cal = (float(ancla["vol_30d_btc"]) * btc) / float(ancla["ordenes_30d"])
+        ticket_fuente = "ancla"
+    elif c.get("MI_TICKET_MEDIO"):
+        ticket_cal = float(c["MI_TICKET_MEDIO"])
+        ticket_fuente = "csv"
+
+    # ── estado actual de cada requisito ──
+    ord30 = vivo["ordenes_30d"] or (ancla or {}).get("ordenes_30d")
+    vol30_btc = None
+    if ord30 and ticket_cal and btc:
+        vol30_btc = (ord30 * ticket_cal) / btc
+    elif ancla:
+        vol30_btc = ancla.get("vol_30d_btc")
+
+    # totales: el ancla + lo hecho desde entonces (aproximado por el delta)
+    ord_tot, vol_tot_btc = None, None
+    if ancla:
+        ord_tot = ancla.get("ordenes_total")
+        vol_tot_btc = ancla.get("vol_total_btc")
+        if ord_tot and vivo["ordenes_30d"] and ancla.get("ordenes_30d"):
+            delta = vivo["ordenes_30d"] - int(ancla["ordenes_30d"])
+            if delta > 0:                       # solo suma, nunca resta
+                ord_tot = int(ord_tot) + delta
+                if vol_tot_btc and ticket_cal and btc:
+                    vol_tot_btc = float(vol_tot_btc) + (delta * ticket_cal) / btc
+
+    def req(nombre, actual, meta, unidad):
+        falta = None if actual is None else max(0, meta - actual)
+        return {"clave": nombre, "actual": actual, "meta": meta, "unidad": unidad,
+                "cumple": bool(actual is not None and actual >= meta),
+                "falta": falta,
+                "pct": (round(min(100, actual / meta * 100), 1) if actual is not None and meta else None)}
+
+    reqs = [
+        req("dias_verificado", (ancla or {}).get("dias_verificado"), MERCHANT_REQ["dias_verificado"], "días"),
+        req("tasa_finalizacion", (ancla or {}).get("tasa_finalizacion"), MERCHANT_REQ["tasa_finalizacion"], "%"),
+        req("ordenes_30d", ord30, MERCHANT_REQ["ordenes_30d"], "órdenes"),
+        req("vol_30d_btc", (round(vol30_btc, 5) if vol30_btc else None), MERCHANT_REQ["vol_30d_btc"], "BTC"),
+        req("ordenes_total", ord_tot, MERCHANT_REQ["ordenes_total"], "órdenes"),
+        req("vol_total_btc", (round(float(vol_tot_btc), 5) if vol_tot_btc else None), MERCHANT_REQ["vol_total_btc"], "BTC"),
+    ]
+
+    # ── lo que hace falta por dia, con la ventana movil ──
+    plan = None
+    if btc:
+        vol_meta_usdt = MERCHANT_REQ["vol_30d_btc"] * btc
+        ord_meta = MERCHANT_REQ["ordenes_30d"]
+        # ritmo SOSTENIDO necesario: en equilibrio la ventana vale 30 x ritmo
+        usdt_dia = vol_meta_usdt / 30
+        ord_dia = ord_meta / 30
+        # ticket que hace cuadrar las DOS metas a la vez
+        ticket_obj = vol_meta_usdt / ord_meta
+        # ritmo real observado (mediana de las variaciones diarias positivas)
+        vars_ = [s["variacion"] for s in vivo["serie"] if s["variacion"] is not None]
+        ord_dia_real = None
+        if vars_:
+            vs = sorted(vars_)
+            ord_dia_real = vs[len(vs) // 2]
+        usdt_dia_real = (ord_dia_real * ticket_cal) if (ord_dia_real and ticket_cal) else None
+        plan = {
+            "btc_usd": round(btc),
+            "vol_meta_30d_usdt": round(vol_meta_usdt),
+            "usdt_por_dia_necesario": round(usdt_dia),
+            "ordenes_por_dia_necesario": round(ord_dia, 1),
+            "ticket_objetivo_usdt": round(ticket_obj),
+            "ticket_actual_usdt": (round(ticket_cal, 1) if ticket_cal else None),
+            "ticket_fuente": ticket_fuente,
+            "ordenes_por_dia_real": ord_dia_real,
+            "usdt_por_dia_real": (round(usdt_dia_real) if usdt_dia_real else None),
+            "factor_necesario": (round(usdt_dia / usdt_dia_real, 1)
+                                 if usdt_dia_real else None),
+            # si el ticket no sube, cuantas ordenes/dia harian falta
+            "ordenes_dia_con_ticket_actual": (round(usdt_dia / ticket_cal, 1)
+                                              if ticket_cal else None),
+            "alcanza_con_ritmo_actual": bool(usdt_dia_real and usdt_dia_real >= usdt_dia),
+        }
+
+    return jsonify({
+        "requisitos": reqs,
+        "cumple_todo": all(r["cumple"] for r in reqs),
+        "ancla": ancla,
+        "vivo": vivo,
+        "plan": plan,
+        "minimos_medidos": _minimo_para_ticket(),
+        "nota": ("Las órdenes de 30d son EXACTAS (contador oficial leído del libro). "
+                 "El volumen es ESTIMADO: órdenes x ticket, con el ticket calibrado contra "
+                 "el último ancla. Las metas de 30 días son de VENTANA MÓVIL: si el ritmo "
+                 "diario queda por debajo del necesario, la meta nunca se alcanza."),
+    })
+
+
+@app.route("/api/merchant/ancla", methods=["POST"])
+def api_merchant_ancla():
+    """Registra los 6 numeros de la pagina de elegibilidad de Binance.
+    Es la verdad de terreno que calibra toda la estimacion de volumen."""
+    if not _token_ok():
+        return jsonify({"ok": False, "error": "token requerido o invalido"}), 401
+    d = request.get_json() or {}
+
+    def num(k, tipo=float):
+        v = d.get(k)
+        if v in (None, ""):
+            return None
+        try:
+            return tipo(v)
+        except (TypeError, ValueError):
+            return None
+
+    campos = {
+        "ordenes_total": num("ordenes_total", int),
+        "ordenes_30d": num("ordenes_30d", int),
+        "vol_total_btc": num("vol_total_btc"),
+        "vol_30d_btc": num("vol_30d_btc"),
+        "tasa_finalizacion": num("tasa_finalizacion"),
+        "dias_verificado": num("dias_verificado", int),
+    }
+    if all(v is None for v in campos.values()):
+        return jsonify({"ok": False, "error": "hace falta al menos un valor"}), 400
+
+    now = datetime.now(SANTIAGO_TZ)
+    btc = _btc_usd()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO merchant_ancla
+                    (ts, ordenes_total, ordenes_30d, vol_total_btc, vol_30d_btc,
+                     tasa_finalizacion, dias_verificado, btc_usd, nota)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (now.strftime("%Y-%m-%d %H:%M:%S"), campos["ordenes_total"],
+                     campos["ordenes_30d"], campos["vol_total_btc"], campos["vol_30d_btc"],
+                     campos["tasa_finalizacion"], campos["dias_verificado"], btc,
+                     (d.get("nota") or "")[:200]))
+            conn.commit()
+    except Exception as e:
+        print(f"[merchant ancla POST] {e}")
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+    return jsonify({"ok": True, "guardado": campos, "btc_usd": btc})
+
+
 @app.route("/api/mi_posicion")
 def api_mi_posicion():
     """MI POSICION + carrera al verificado. Usa datos que el colector YA junta:
@@ -11061,7 +11554,15 @@ def api_mi_posicion():
                 prog["fills_detectados_30d"] = int(r["f30"] or 0)
     except Exception as e:
         print(f"[mi_posicion] {e}")
-    meta_min, meta_comoda, meta_ord = 32000, 64000, 300
+    # COL36 — METAS CORREGIDAS. Antes decia (32000, 64000, 300): el 300 NO
+    # existe como requisito de Binance, y las dos de volumen estaban mal
+    # etiquetadas como "minima/comoda" cuando en realidad son DOS requisitos
+    # distintos (0,5 BTC en 30 dias movil + 1 BTC historico). Los valores
+    # reales estan en MERCHANT_REQ; el detalle completo va en /api/merchant.
+    _btc = _btc_usd() or 62000
+    meta_min = MERCHANT_REQ["vol_30d_btc"] * _btc        # 0,5 BTC en 30d
+    meta_comoda = MERCHANT_REQ["vol_total_btc"] * _btc   # 1 BTC historico
+    meta_ord = MERCHANT_REQ["ordenes_30d"]               # 150, no 300
     v30 = prog["vol_30d_estimado"]
     o30 = prog["ordenes_30d"]
     return jsonify({
@@ -11080,7 +11581,8 @@ def api_mi_posicion():
         },
         "nota": ("ordenes_30d = contador oficial de Binance (30d moviles, aparece cuando estas en el top-80). "
                  "volumen = estimacion del monitor por fills detectados; validalo contra la pagina de Merchant. "
-                 "metas: 0,5 BTC ~ 32.000 USDT (minimo real) / 1 BTC ~ 64.000 (comodo) + 300 ordenes."),
+                 "metas REALES (COL36): 150 ordenes y 0,5 BTC en la ventana MOVIL de 30 dias, "
+                 "mas 500 ordenes y 1 BTC historicos. Ver /api/merchant para el detalle."),
     })
 
 
