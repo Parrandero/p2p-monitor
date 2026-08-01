@@ -2591,6 +2591,37 @@ body {
 .content { min-height: 60vh; }
 .view { display: flex; flex-direction: column; gap: var(--gap); }
 
+/* ---------- Layout BETA (COL36) ----------
+   El layout normal apila TODO en una columna (.view es flex column), por eso
+   la primera pantalla se llena rapido y hay que bajar mucho. La beta usa una
+   grilla de 12 columnas: las tarjetas conviven a lo ancho y entra mucha mas
+   informacion arriba. Colapsa a una sola columna en pantallas chicas, que es
+   donde el apilado si tiene sentido. */
+.beta-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr));
+             gap: var(--gap); align-items: start; }
+.beta-grid > * { min-width: 0; }              /* evita desbordes de tablas */
+.bc-4  { grid-column: span 4; }
+.bc-5  { grid-column: span 5; }
+.bc-6  { grid-column: span 6; }
+.bc-7  { grid-column: span 7; }
+.bc-8  { grid-column: span 8; }
+.bc-12 { grid-column: span 12; }
+@media (max-width: 1100px) {
+  .bc-4, .bc-5, .bc-6, .bc-7, .bc-8 { grid-column: span 6; }
+}
+@media (max-width: 760px) {
+  .bc-4, .bc-5, .bc-6, .bc-7, .bc-8 { grid-column: span 12; }
+}
+/* barra de precios compacta: reemplaza arriba a las dos tarjetas grandes de
+   precio ponderado, que ocupaban media pantalla para 4 numeros */
+.px-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: stretch; }
+.px-item { flex: 1 1 118px; min-width: 108px; background: var(--bg-1);
+           border: 1px solid var(--line-soft); border-radius: 10px; padding: 7px 11px; }
+.px-lbl { font-size: 9.5px; color: var(--text-3); text-transform: uppercase; letter-spacing: .07em; }
+.px-val { font-family: var(--mono); font-size: 17px; font-weight: 600; line-height: 1.25;
+          font-variant-numeric: tabular-nums; }
+.px-sub { font-size: 9.5px; color: var(--text-3); }
+
 /* ---------- Decision hero ---------- */
 .hero {
   position: relative; overflow: hidden;
@@ -3009,6 +3040,10 @@ window.P2P_CONFIG = {
   pollMs: 30000,
   intervaloMin: 2,   // debe coincidir con INTERVALO_MIN del backend (para la velocidad)
 };
+
+/* Layout beta (COL36): la ruta /beta reemplaza este false por true. Mismo
+   codigo, otra disposicion — no es una copia paralela que haya que mantener. */
+window.P2P_BETA = false;
 
 /* POST autenticado: si el backend tiene APP_TOKEN (env var en Railway), los POST
    sensibles piden el header X-App-Token. Este helper lo agrega desde localStorage;
@@ -4574,7 +4609,7 @@ function AlertBanner({ snap }) {
 }
 
 /* ---------- Tiempo Real ---------- */
-function TiempoReal({ snap, history, showOrderBook, filters, vel }) {
+function TiempoReal({ snap, history, showOrderBook, filters, vel, sinGrafico }) {
   return (
     <div className="view">
       <AlertBanner snap={snap} />
@@ -4587,6 +4622,10 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel }) {
       </div>
       <C.MakerActions snap={snap} />
       <div className="tr-bottom">
+        {/* sinGrafico (COL36, beta): el historico del ponderado se mira, no se
+            decide con el — en la beta vive en la pestaña Precio y libera media
+            pantalla arriba. */}
+        {!sinGrafico && (
         <section className="chart-card">
           <div className="card-head">
             <h3>Spread ponderado · últimas {history.length} muestras</h3>
@@ -4606,6 +4645,7 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel }) {
             ]}
           />
         </section>
+        )}
         <C.TopTraders snap={snap} />
       </div>
       {showOrderBook && <OrderBook snap={snap} />}
@@ -7073,6 +7113,85 @@ function PlanHoy() {
   );
 }
 
+/* PRECIOS COMPACTOS (COL36, beta) — los mismos numeros que las dos tarjetas
+   grandes de precio ponderado, en una franja fina. Sebastian: "eso puede estar
+   mucho mas chiquito y en unos cuadritos bien arriba".
+   Recibe el snapshot ya filtrado, no vuelve a pedir nada al backend. */
+function PreciosCompactos({ snap }) {
+  if (!snap) return null;
+  const f = (v, d) => v == null ? "—" : Number(v).toLocaleString("es-CL",
+    { minimumFractionDigits: d == null ? 2 : d, maximumFractionDigits: d == null ? 2 : d });
+  const gan = Number(snap.ganancia_neta_pct);
+  const tono = gan >= 0.6 ? "var(--buy)" : gan >= 0.2 ? "var(--warn)" : "var(--sell)";
+  const items = [
+    { l: "Vendés a", v: "$" + f(snap.mejor_vendedor_tab_compra), s: snap.lider_tab_compra || "tab compra", c: "var(--buy)" },
+    { l: "Comprás a", v: "$" + f(snap.mejor_comprador_tab_venta), s: snap.lider_tab_venta || "tab venta", c: "var(--sell)" },
+    { l: "Brecha", v: "$" + f(snap.spread_pond_abs), s: f(snap.spread_pond_pct) + "% ponderado" },
+    { l: "Neta est.", v: f(gan) + "%", s: snap.estado || "", c: tono },
+    { l: "Liquidez", v: f(snap.liq_tab_compra, 0), s: "USDT en compra" },
+    { l: "Liquidez", v: f(snap.liq_tab_venta, 0), s: "USDT en venta" },
+  ];
+  return (
+    <div className="px-bar">
+      {items.map((i, k) => (
+        <div key={k} className="px-item">
+          <div className="px-lbl">{i.l}</div>
+          <div className="px-val" style={i.c ? { color: i.c } : null}>{i.v}</div>
+          <div className="px-sub">{i.s}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ESTRATEGIA RAPIDA (COL36, beta) — los presets y el gap, sin tener que bajar
+   al panel completo. Sebastian: "me gustaria cambiarla directamente desde ahi".
+   Es el MISMO endpoint que usa EstrategiaPanel, no una via paralela. */
+function EstrategiaRapida() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [cfg, setCfg] = React.useState(null);
+  const [msg, setMsg] = React.useState("");
+  const cargar = React.useCallback(() => {
+    fetch(B + "/api/config").then(r => r.json()).then(setCfg).catch(() => {});
+  }, []);
+  React.useEffect(() => { cargar(); }, [cargar]);
+  if (!cfg) return null;
+  const PRESETS = [
+    { n: "Margen ancho", gap: 1.35, min: 0.28 },
+    { n: "Equilibrado", gap: 1.25, min: 0.20 },
+    { n: "Rotación", gap: 1.10, min: 0.28 },
+    { n: "Farming", gap: 0.60, min: -0.20 },
+  ];
+  const gapAct = Number(cfg.GAP_OBJETIVO_BRUTO);
+  const minAct = Number(cfg.SPREAD_MIN_OPERATIVO);
+  const aplicar = (p) => {
+    window.P2P_AUTH.post(B + "/api/config", { GAP_OBJETIVO_BRUTO: p.gap, SPREAD_MIN_OPERATIVO: p.min })
+      .then(r => r.json()).then(() => { setMsg("✓ " + p.n); cargar(); setTimeout(() => setMsg(""), 5000); })
+      .catch(() => setMsg("✗ error"));
+  };
+  return (
+    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+      <span style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: ".08em" }}>Estrategia</span>
+      {PRESETS.map(p => {
+        const activo = Math.abs(gapAct - p.gap) < 0.001 && Math.abs(minAct - p.min) < 0.001;
+        return (
+          <button key={p.n} onClick={() => aplicar(p)} title={"gap " + p.gap + "% · mínimo " + p.min + "%"}
+            style={{ cursor: "pointer", borderRadius: 7, padding: "3px 9px", fontSize: 10.5,
+                     fontFamily: "var(--mono)", border: "1px solid " + (activo ? "var(--accent)" : "var(--line)"),
+                     background: activo ? "var(--accent-soft)" : "transparent",
+                     color: activo ? "var(--accent)" : "var(--text-3)" }}>
+            {p.n}
+          </button>
+        );
+      })}
+      <span style={{ fontSize: 10, color: "var(--text-3)" }}>
+        gap {gapAct}% · mín {minAct}% · capital {Number(cfg.CAPITAL_OPERATIVO)}
+      </span>
+      {msg && <span style={{ fontSize: 10.5, fontFamily: "var(--mono)", color: "var(--buy)" }}>{msg}</span>}
+    </div>
+  );
+}
+
 /* CARRERA A MERCHANT (COL36) — los 6 requisitos REALES de la pagina de
    elegibilidad de Binance, con conteo en vivo y el plan para llegar.
    Antes el codigo usaba metas inventadas (300 ordenes, que no existe). */
@@ -8013,7 +8132,7 @@ function CalculadoraCruzar() {
   );
 }
 
-window.P2PViews = { CarreraMerchant, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
+window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
 
 </script>
 <script type="text/babel">
@@ -8046,6 +8165,7 @@ function useEngine() {
 
 function App() {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+  const beta = !!window.P2P_BETA;      // la ruta /beta lo pone en true
   const [tab, setTab] = mS("tr");
   const [state, engRef] = useEngine();
   const [secondsLeft, setSecondsLeft] = mS(30);
@@ -8090,16 +8210,44 @@ function App() {
       <V.VolumenBar />
       {tab !== "backup" && <V.RutinasPanel onGoBackup={() => setTab("backup")} />}
       <main className="content">
-        {tab === "tr" && <V.PlanHoy />}
-        {tab === "tr" && <V.ChipBalance />}
-        {tab === "tr" && <V.EstrategiaPanel />}
-        {tab === "tr" && <V.MiCampania />}
-        {tab === "tr" && <V.CarreraMerchant />}
-        {tab === "tr" && <V.InventarioCard />}
-        {tab === "tr" && <V.AsistenteOperativo />}
-        {tab === "tr" && <V.CalculadoraCruzar />}
-        {tab === "tr" && <V.VelocidadMercado />}
-        {tab === "tr" && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
+        {/* ── LAYOUT BETA (COL36): grilla en vez de pila ──────────────
+            Mismos componentes, otra disposicion. Objetivo: que lo que se
+            decide MIRANDO entre en la primera pantalla. El grafico historico
+            del ponderado se saca de aca (vive en la pestaña Precio) y el
+            libro/listas quedan al final, que es donde se consultan, no donde
+            se decide. */}
+        {tab === "tr" && beta && (
+          <div className="beta-grid">
+            <div className="bc-12"><V.PreciosCompactos snap={viewSnap} /></div>
+            <div className="bc-7">
+              <V.PlanHoy />
+              <V.EstrategiaRapida />
+            </div>
+            <div className="bc-5"><V.AsistenteOperativo /></div>
+            <div className="bc-7"><V.CarreraMerchant /></div>
+            <div className="bc-5">
+              <V.ChipBalance />
+              <V.InventarioCard />
+            </div>
+            <div className="bc-6"><V.MiCampania /></div>
+            <div className="bc-6"><V.VelocidadMercado /></div>
+            <div className="bc-12"><V.CalculadoraCruzar /></div>
+            <div className="bc-12">
+              <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
+                filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} sinGrafico />
+            </div>
+          </div>
+        )}
+        {tab === "tr" && !beta && <V.PlanHoy />}
+        {tab === "tr" && !beta && <V.ChipBalance />}
+        {tab === "tr" && !beta && <V.EstrategiaPanel />}
+        {tab === "tr" && !beta && <V.MiCampania />}
+        {tab === "tr" && !beta && <V.CarreraMerchant />}
+        {tab === "tr" && !beta && <V.InventarioCard />}
+        {tab === "tr" && !beta && <V.AsistenteOperativo />}
+        {tab === "tr" && !beta && <V.CalculadoraCruzar />}
+        {tab === "tr" && !beta && <V.VelocidadMercado />}
+        {tab === "tr" && !beta && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
           filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} />}
         {tab === "hist" && <V.Historico history={history} />}
         {tab === "precio" && <V.PrecioChart />}
@@ -8167,8 +8315,15 @@ def index():
 
 @app.route("/beta")
 def index_beta():
-    """Version beta del dashboard, para probar el rediseno sin afectar '/'."""
-    html = DASHBOARD_BETA.replace("{{VERSION}}", f"{VERSION} · {VERSION_FECHA}")
+    """Version beta del dashboard, para probar el rediseno sin afectar '/'.
+
+    MISMO HTML, un flag distinto: window.P2P_BETA pasa a true y el layout usa
+    grilla en vez de apilar todo en una columna. Asi la beta no es una copia
+    que hay que mantener en paralelo — es el mismo codigo con otra disposicion,
+    y cualquier arreglo aplica a las dos."""
+    html = (DASHBOARD_BETA
+            .replace("{{VERSION}}", f"{VERSION} · {VERSION_FECHA} · beta")
+            .replace("window.P2P_BETA = false;", "window.P2P_BETA = true;"))
     return Response(html, mimetype='text/html')
 
 @app.route("/api/version")
