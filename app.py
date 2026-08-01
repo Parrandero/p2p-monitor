@@ -2177,7 +2177,19 @@ def ciclo_colector_macro():
     """Hilo propio. El while/try esta armado para que NINGUN error pueda
     terminar el hilo ni propagarse al resto del proceso."""
     print("[MACRO] Iniciando thread...")
-    time.sleep(20)          # deja arrancar primero al colector P2P
+    # ESPERAR A QUE EL COLECTOR TENGA PRECIO (COL36). Con un sleep fijo de 20s
+    # la PRIMERA lectura de cada arranque salia sin p2p_ref y por lo tanto sin
+    # brecha — medido: fallaba en 4 de 45 filas, y las 4 eran reinicios.
+    # Se espera hasta 3 min a que ultimo_estado tenga datos; si no llega, se
+    # arranca igual (la fila queda sin brecha pero el dolar/VIX/cobre sirven).
+    for _ in range(18):
+        time.sleep(10)
+        try:
+            with data_lock:
+                if (ultimo_estado or {}).get("precio_pond_tab_compra"):
+                    break
+        except Exception:
+            pass
     while True:
         try:
             d = obtener_macro()
@@ -8132,7 +8144,7 @@ function CalculadoraCruzar() {
   );
 }
 
-window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
+window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, MacroBar, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
 
 </script>
 <script type="text/babel">
@@ -8229,8 +8241,9 @@ function App() {
               <V.ChipBalance />
               <V.InventarioCard />
             </div>
+            <div className="bc-6"><V.MacroBar modo="card" /></div>
             <div className="bc-6"><V.MiCampania /></div>
-            <div className="bc-6"><V.VelocidadMercado /></div>
+            <div className="bc-12"><V.VelocidadMercado /></div>
             <div className="bc-12"><V.CalculadoraCruzar /></div>
             <div className="bc-12">
               <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
@@ -8239,6 +8252,7 @@ function App() {
           </div>
         )}
         {tab === "tr" && !beta && <V.PlanHoy />}
+        {tab === "tr" && !beta && <V.MacroBar modo="card" />}
         {tab === "tr" && !beta && <V.ChipBalance />}
         {tab === "tr" && !beta && <V.EstrategiaPanel />}
         {tab === "tr" && !beta && <V.MiCampania />}
