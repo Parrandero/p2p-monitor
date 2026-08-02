@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL36"
-VERSION_FECHA = "2026-07-31"
+VERSION       = "COL38"
+VERSION_FECHA = "2026-08-02"
 
 config = {
     "MONEDA":               "USDT",
@@ -144,6 +144,26 @@ config = {
     # el forex se mueve primero y el P2P lo sigue, no al reves.
     "MACRO_DESFASE_PCT":    0.15,
     "MACRO_DESFASE_MIN":    75,    # ventana en minutos para medir ese desfase
+    # ── Capacidad real de operacion (COL37) ──────────────────────────
+    # Sebastian trabaja en un restaurant con turnos rotativos: NO puede operar
+    # los 7 dias. Sin esto el plan de Merchant reparte la meta entre 30 dias
+    # como si todos fueran iguales, y da un ritmo diario que no es alcanzable
+    # en la practica. Con 4 dias operables por semana, el ritmo por dia
+    # OPERADO es 7/4 = 1,75 veces el que sale del reparto parejo.
+    # La hoja "Plan" de la bitacora ya distingue dias "Libre / oro" de
+    # "Trabajo": esto es la version simple de ese mismo concepto.
+    "DIAS_OPERABLES_SEMANA": 4,
+    # ── Libro en vivo (COL38) ────────────────────────────────────────
+    # Cada cuantos SEGUNDOS se refresca la cabeza del libro. NO escribe en
+    # la base: solo memoria. Medido 2-ago: la API tarda ~590 ms y aguanta
+    # consultas seguidas; a 10s son ~17.000 req/dia (0,2 por segundo).
+    "LIBRO_VIVO_SEG":       10,
+    # Metodos de pago que PODES usar, por 'identifier' de Binance
+    # (ej. SpecificBank, BCIChile, BancoSantanderChile, BANK...).
+    # VACIO = no filtra nada. Sirve para no calcular el ciclo contra un
+    # precio de alguien con quien no podes operar: medido 2-ago, 15 de 70
+    # anuncios que pasaban los filtros normales no compartian banco.
+    "MIS_METODOS_PAGO":     "",
     "RUT_ANCLA_DIAS":       3,     # re-anclar inventario (saldos reales)
     "RUT_CSV_DIAS":         10,    # importar CSV de Binance (calibracion)
     "RUT_BACKUP_DIAS":      7,     # backup general de la base
@@ -197,6 +217,9 @@ CONFIG_TYPE_MAP = {
     "MACRO_MIN":            int,
     "MACRO_DESFASE_PCT":    float,
     "MACRO_DESFASE_MIN":    int,
+    "DIAS_OPERABLES_SEMANA": int,
+    "LIBRO_VIVO_SEG":       int,
+    "MIS_METODOS_PAGO":     str,
     "RUT_ANCLA_DIAS":       int,
     "RUT_CSV_DIAS":         int,
     "RUT_BACKUP_DIAS":      int,
@@ -1360,6 +1383,104 @@ def obtener_anuncios(tipo):
             time.sleep(0.3)               # respetar rate-limit de Binance
     return resultados[:top]
 
+# ══════════════════════════════════════════════════════════════
+#  LIBRO EN VIVO (COL38)
+#  ------------------------------------------------------------
+#  EL PROBLEMA QUE RESUELVE: para la estrategia de vender y recomprar
+#  rapido, 2 minutos de latencia son una eternidad. Y eran DOS capas
+#  de 2 min: el colector actualiza ultimo_estado cada 2 min, y el chip
+#  del Ciclo consultaba cada 2 min -> hasta 4 min de dato viejo.
+#
+#  POR QUE UN HILO APARTE Y NO BAJAR INTERVALO_MIN: el colector hace
+#  dos cosas con el mismo ciclo, mirar el mercado y GUARDAR historia.
+#  Bajarlo a 10s multiplicaria por 12 el peso de la base (de 25 a
+#  ~300 MB/dia) y reventaria los 500 MB en dos dias.
+#  Este hilo NO ESCRIBE NADA: solo trae la cabeza del libro (una
+#  pagina por lado) y la deja en memoria.
+#
+#  COSTO MEDIDO (2-ago-2026): la API responde en ~590 ms y aguanto 6
+#  consultas seguidas sin cortar. A 10s son 2 req cada 10s = ~17.000
+#  al dia = 0,2 por segundo. El colector ya hace ~5.800.
+# ══════════════════════════════════════════════════════════════
+ultimo_libro_vivo = {"BUY": [], "SELL": [], "ts": None}
+libro_vivo_lock = threading.Lock()
+
+
+def obtener_libro_vivo(tipo):
+    """Solo la primera pagina (top-20) del lado pedido. Devuelve la lista
+    cruda de Binance o None si falla — nunca levanta excepcion."""
+    with config_lock:
+        c = dict(config)
+    try:
+        r = requests.post(URL, json={
+            "asset": c["MONEDA"], "fiat": c["FIAT"], "merchantCheck": False,
+            "page": 1, "publisherType": None, "rows": 20, "tradeType": tipo,
+        }, headers=HEADERS, timeout=8)
+        r.raise_for_status()
+        return r.json().get("data", []) or []
+    except Exception as e:
+        print(f"[LIBRO VIVO {tipo}] {e}")
+        return None
+
+
+def ciclo_libro_vivo():
+    """Hilo propio. Igual que el macro: aislado, con try/except en todo,
+    para que si la fuente falla no arrastre al colector ni a la app."""
+    print("[LIBRO VIVO] Iniciando thread...")
+    time.sleep(12)          # deja arrancar primero al colector principal
+    while True:
+        try:
+            b = obtener_libro_vivo("BUY")
+            s = obtener_libro_vivo("SELL")
+            if b is not None or s is not None:
+                with libro_vivo_lock:
+                    if b is not None:
+                        ultimo_libro_vivo["BUY"] = b
+                    if s is not None:
+                        ultimo_libro_vivo["SELL"] = s
+                    ultimo_libro_vivo["ts"] = datetime.now(SANTIAGO_TZ)
+        except Exception as e:
+            print(f"[LIBRO VIVO ciclo] {e}")
+        try:
+            with config_lock:
+                seg = int(config.get("LIBRO_VIVO_SEG", 10) or 10)
+        except Exception:
+            seg = 10
+        time.sleep(max(5, seg))
+
+
+def libro_vivo_como_detalle(tipo):
+    """Convierte el libro vivo al MISMO formato que usa ultimo_estado
+    (detalle_compra / detalle_venta), para que quien lo consuma no tenga
+    que saber de donde vino. Devuelve (filas, edad_segundos) o (None, None)
+    si no hay dato fresco."""
+    with libro_vivo_lock:
+        crudos = list(ultimo_libro_vivo.get(tipo) or [])
+        ts = ultimo_libro_vivo.get("ts")
+    if not crudos or not ts:
+        return None, None
+    edad = (datetime.now(SANTIAGO_TZ) - ts).total_seconds()
+    filas = []
+    for pos, item in enumerate(crudos, 1):
+        adv = item.get("adv", {})
+        tr = item.get("advertiser", {})
+        mino, maxo = _limites_adv(adv)
+        filas.append({
+            "posicion": pos, "anunciante": tr.get("nickName", ""),
+            "precio": float(adv.get("price", 0) or 0),
+            "disponible": float(adv.get("tradableQuantity", 0) or 0),
+            "completadas": int(tr.get("monthOrderCount", 0) or 0),
+            "tasa_exito": round(float(tr.get("monthFinishRate", 0) or 0) * 100, 1),
+            "es_merchant": tr.get("userType") == "merchant",
+            "min_orden": mino, "max_orden": maxo,
+            # metodos de pago: solo existe en el libro vivo, el detalle
+            # guardado no los persiste (no valdria la pena el peso)
+            "pagos": [m.get("identifier") for m in (adv.get("tradeMethods") or [])
+                      if m.get("identifier")],
+        })
+    return filas, edad
+
+
 def parsear_y_filtrar(anuncios, tipo):
     with config_lock:
         c = dict(config)
@@ -2134,6 +2255,24 @@ def calcular_desfase():
 
     if not (fx0 and fx1 and p0 and p1):
         return None
+
+    # ⚠️ FOREX CERRADO (COL37): el mercado formal no opera sabados, domingos ni
+    # feriados. Yahoo sigue devolviendo el ULTIMO valor (el cierre del viernes),
+    # asi que el monitor guarda el mismo numero una y otra vez.
+    # VERIFICADO 2-ago-2026: usdclp_forex congelado en 930,47 desde el viernes,
+    # mientras el P2P se movio 6,29 CLP el sabado y 5,29 el domingo.
+    # Sin este corte la señal diria "el P2P quedo adelantado, vende" cada fin de
+    # semana — pero el forex no se quedo atras, esta CERRADO. Seria una señal
+    # inventada el 29% del tiempo.
+    if float(fx0["v"]) == float(fx1["v"]):
+        return {"ventana_min": vent, "fx_var_pct": 0.0,
+                "p2p_var_pct": None, "pendiente_pct": None,
+                "umbral_pct": umbral, "senal": None, "mensaje": None,
+                "fuente_quieta": True,
+                "nota": ("El dólar formal no se movió en toda la ventana: o el mercado "
+                         "está cerrado (fin de semana o feriado) o realmente no hubo "
+                         "cambio. Sin movimiento del forex no hay retardo que medir, "
+                         "así que la señal se apaga en vez de inventar una lectura.")}
     try:
         fxa, fxb = float(fx0["v"]), float(fx1["v"])
         pa, pb = float(p0["v"]), float(p1["v"])
@@ -7023,7 +7162,10 @@ function ChipCiclo() {
     const load = () => fetch(B + "/api/ciclo").then(r => r.json())
       .then(j => { if (!stop) setD(j); }).catch(() => {});
     load();
-    const id = setInterval(load, 120000);
+    // COL38: 10s, no 120s. Antes habia DOS capas de 2 min (colector + este
+    // intervalo) = hasta 4 min de dato viejo, inservible para vender y
+    // recomprar rapido. El backend ahora sirve el libro vivo de 10s.
+    const id = setInterval(load, 10000);
     return () => { stop = true; clearInterval(id); };
   }, []);
   if (!d || d.error || d.veredicto !== "VERDE") return null;
@@ -7049,6 +7191,23 @@ function ChipCiclo() {
       <span style={{ fontSize: 11, color: "var(--text-2)" }}>
         con {fN(d.monto)} USDT · {fN(d.ganancia.por_vuelta_usdt, 2)}/vuelta
       </span>
+      {/* profundidad: "voy a poder recomprar rápido?" es lo que se mira acá */}
+      {d.recompra.profundidad_libro != null && (
+        <span style={{ fontSize: 10.5, color: "var(--text-3)" }}
+              title="USDT accesibles para vos en el libro ahora mismo, respetando los límites de cada anuncio. Si es holgado, la recompra es rápida.">
+          · {fN(d.recompra.profundidad_libro)} disp
+        </span>
+      )}
+      {/* la EDAD del dato: sin esto no se sabe si el precio sigue existiendo */}
+      {d.edad_seg != null && (
+        <span style={{ fontSize: 10, marginLeft: "auto",
+                       color: d.edad_seg <= 30 ? "var(--buy)" : d.edad_seg <= 90 ? "var(--warn)" : "var(--sell)" }}
+              title={"Antigüedad del libro con el que se calculó. Fuente: " + (d.fuente_libro === "vivo" ? "libro en vivo (10s)" : "colector (2 min)") +
+                     (d.descartados_sin_pago ? " · " + d.descartados_sin_pago + " anuncio(s) descartado(s) por método de pago" : "")}>
+          {d.edad_seg < 60 ? Math.round(d.edad_seg) + "s" : Math.round(d.edad_seg / 60) + "m"}
+          {d.fuente_libro === "vivo" ? " ⚡" : ""}
+        </span>
+      )}
     </button>
   );
 }
@@ -7312,6 +7471,64 @@ function CarreraMerchant() {
               </div>
             ))}
           </div>
+          {/* días parados: la ventana móvil drena igual (COL37) */}
+          {p.dias_parado != null && p.dias_parado >= 1 && (
+            <div style={{ background: "var(--sell-soft)", border: "1px solid var(--sell)",
+                          borderRadius: 9, padding: "8px 11px", marginBottom: 8 }}>
+              <div style={{ fontSize: 11.5, fontWeight: 600, color: "var(--sell)" }}>
+                ⚠ Hace {p.dias_parado} día{p.dias_parado > 1 ? "s" : ""} que no aparecés en el libro
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-2)", marginTop: 3, lineHeight: 1.5 }}>
+                La ventana de 30 días <b>sigue drenando igual</b>: cada día parado no suma nada
+                y además se te cae lo de hace 30 días. Son <b>{(p.dias_parado * p.usdt_por_dia_necesario).toLocaleString("es-CL")} USDT</b> que
+                había que hacer y no se hicieron.
+              </div>
+            </div>
+          )}
+
+          {/* abanico de escenarios según cuántos días puedas operar (COL37).
+              No se fija un número: la vida real no es tan prolija. */}
+          {p.escenarios_dias && p.escenarios_dias.length > 0 && (
+            <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)",
+                          borderRadius: 9, padding: "9px 11px", marginBottom: 8 }}>
+              <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", marginBottom: 6 }}>
+                Cuánto te exige según los días que puedas operar
+                {p.dias_operables_medidos != null && (
+                  <span style={{ textTransform: "none", color: "var(--warn)" }}>
+                    {" "}· venís operando ~{p.dias_operables_medidos} de 7
+                  </span>
+                )}
+              </div>
+              <div className="intel-scroll">
+                <table className="intel-table">
+                  <thead><tr>
+                    <th>Días/semana</th>
+                    <th title="Cuánto tenés que mover en cada jornada que operás.">USDT por jornada</th>
+                    <th title="Con tu ticket actual.">Órdenes con tu ticket</th>
+                    <th title="Si llevaras el ticket al objetivo.">Con ticket objetivo</th>
+                  </tr></thead>
+                  <tbody>{p.escenarios_dias.map(e => (
+                    <tr key={e.dias_semana} style={{ opacity: e.logrado_alguna_vez === false ? 0.55 : 1 }}>
+                      <td className="tnum"><b>{e.dias_semana}</b> <span style={{ color: "var(--text-3)" }}>({e.dias_en_30} en 30d)</span></td>
+                      <td className="tnum">{e.usdt_por_jornada.toLocaleString("es-CL")}</td>
+                      <td className="tnum" style={{ color: e.logrado_alguna_vez ? "var(--buy)" : "var(--sell)" }}>
+                        {e.ordenes_por_jornada}
+                        {e.logrado_alguna_vez === true && <span title="Ya tuviste un día así"> ✓</span>}
+                      </td>
+                      <td className="tnum" style={{ color: "var(--text-2)" }}>{e.ordenes_ticket_objetivo}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+              <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 6, lineHeight: 1.5 }}>
+                No hace falta comprometerse a un número: mirá qué fila te resulta sostenible.
+                El <span style={{ color: "var(--buy)" }}>✓</span> marca las que ya lograste alguna vez
+                {p.mejor_dia_medido_ordenes && <> (tu mejor día: <b>{p.mejor_dia_medido_ordenes}</b> órdenes)</>}.
+                Menos días operando = más carga por jornada, y ahí es donde el <b>ticket</b> hace la diferencia.
+              </div>
+            </div>
+          )}
+
           <div style={{ fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.55, paddingTop: 7, borderTop: "1px solid var(--line-soft)" }}>
             {!p.alcanza_con_ritmo_actual && (
               <><b style={{ color: "var(--warn)" }}>Con el ticket actual no llegás.</b>{" "}
@@ -10768,22 +10985,64 @@ def api_ciclo():
     monto = max(10.0, min(100000.0, monto))
     margen = max(0.0, min(10.0, margen))
 
-    with data_lock:
-        snap = dict(ultimo_estado)
-    compra = snap.get("detalle_compra") or []   # tab Compra = donde YO recompro
-    venta = snap.get("detalle_venta") or []
+    # ── de donde sale el libro (COL38) ──────────────────────────────
+    # Se PREFIERE el libro vivo (10s). Si el hilo no arranco todavia o la
+    # fuente esta caida, cae al de 2 min del colector — que es lo que habia
+    # antes, asi que en el peor caso funciona igual que siempre.
+    # 'edad_seg' viaja a la UI: operar contra un precio viejo sin saberlo es
+    # justo lo que esto viene a evitar.
+    fuente, edad_seg = "vivo", None
+    compra, edad_seg = libro_vivo_como_detalle("BUY")
+    venta, _ = libro_vivo_como_detalle("SELL")
+    if not compra:
+        fuente = "colector"
+        with data_lock:
+            snap = dict(ultimo_estado)
+        compra = snap.get("detalle_compra") or []
+        venta = snap.get("detalle_venta") or []
+        try:
+            ts_snap = snap.get("timestamp")
+            if ts_snap:
+                edad_seg = (datetime.now(SANTIAGO_TZ)
+                            - datetime.strptime(str(ts_snap)[:19], "%Y-%m-%d %H:%M:%S")
+                            .replace(tzinfo=SANTIAGO_TZ)).total_seconds()
+        except Exception:
+            pass
     if not compra:
         return jsonify({"error": "sin datos del libro aun"}), 503
 
     mi_nick = str(c.get("MI_NICKNAME") or "").strip().lower()
     min_usdt = float(c.get("FILTRO_MIN_USDT", 200))
     min_tasa = float(c.get("FILTRO_MIN_TASA", 90))
+    # ── filtro de METODOS DE PAGO (COL38) ───────────────────────────
+    # Un anuncio con el que no compartis banco NO es un precio disponible
+    # para vos. Medido 2-ago: 15 de 70 anuncios que pasaban los filtros
+    # normales no compartian metodo. Si la lista esta vacia no filtra nada
+    # (y si el libro viene del colector, que no guarda 'pagos', tampoco).
+    mis_pagos = {x.strip() for x in str(c.get("MIS_METODOS_PAGO", "") or "").split(",") if x.strip()}
+    sin_pago = []
+
+    def acepta_pago(a):
+        if not mis_pagos:
+            return True
+        p = a.get("pagos")
+        if not p:                      # sin dato de pagos: no se excluye
+            return True
+        return bool(set(p) & mis_pagos)
+
     # anuncios REALES y sin los mios: no puedo recomprarme a mi mismo
-    reales = [a for a in compra
-              if float(a.get("disponible") or 0) >= min_usdt
-              and float(a.get("tasa_exito") or 0) >= min_tasa
-              and float(a.get("precio") or 0) > 0
-              and (a.get("anunciante") or "").strip().lower() != mi_nick]
+    reales = []
+    for a in compra:
+        if not (float(a.get("disponible") or 0) >= min_usdt
+                and float(a.get("tasa_exito") or 0) >= min_tasa
+                and float(a.get("precio") or 0) > 0
+                and (a.get("anunciante") or "").strip().lower() != mi_nick):
+            continue
+        if not acepta_pago(a):
+            sin_pago.append({"anunciante": a.get("anunciante"),
+                             "precio": round(float(a["precio"]), 2)})
+            continue
+        reales.append(a)
     reales.sort(key=lambda a: float(a["precio"]))
     if not reales:
         return jsonify({"error": "no hay anuncios reales en el libro"}), 503
@@ -10924,6 +11183,12 @@ def api_ciclo():
     return jsonify({
         "monto": round(monto),
         "margen_objetivo": margen,
+        # COL38: de donde salio el libro y hace cuanto. Sin esto no se puede
+        # saber si el precio que se esta mirando sigue existiendo.
+        "fuente_libro": fuente,
+        "edad_seg": (round(edad_seg, 1) if edad_seg is not None else None),
+        "descartados_sin_pago": len(sin_pago),
+        "sin_pago": sin_pago[:5],
         "recompra": {"vwap": round(vwap, 2), "niveles": niveles,
                      "mejor": round(mejor, 2), "alcanza": alcanza,
                      "profundidad_libro": round(profundidad),
@@ -11547,6 +11812,19 @@ def api_merchant():
         req("vol_total_btc", (round(float(vol_tot_btc), 5) if vol_tot_btc else None), MERCHANT_REQ["vol_total_btc"], "BTC"),
     ]
 
+    # ── hace cuanto que no se ve actividad (COL37) ──
+    # El ritmo se calcula con la mediana de las variaciones del contador, que
+    # son de los dias en que SI aparecio en el libro. Si hace dias que no
+    # aparece, ese ritmo es historia vieja y no se puede presentar como "asi
+    # vas". Peor: la ventana movil sigue drenando mientras tanto.
+    dias_parado = None
+    if vivo.get("serie"):
+        try:
+            ult = datetime.strptime(vivo["serie"][-1]["fecha"], "%Y-%m-%d").date()
+            dias_parado = (datetime.now(SANTIAGO_TZ).date() - ult).days
+        except Exception:
+            pass
+
     # ── lo que hace falta por dia, con la ventana movil ──
     plan = None
     if btc:
@@ -11579,8 +11857,59 @@ def api_merchant():
             # si el ticket no sube, cuantas ordenes/dia harian falta
             "ordenes_dia_con_ticket_actual": (round(usdt_dia / ticket_cal, 1)
                                               if ticket_cal else None),
-            "alcanza_con_ritmo_actual": bool(usdt_dia_real and usdt_dia_real >= usdt_dia),
+            # OJO: solo vale si viene operando. Con dias parados el ritmo
+            # medido es de otro momento y no dice nada de como va HOY.
+            "alcanza_con_ritmo_actual": bool(usdt_dia_real and usdt_dia_real >= usdt_dia
+                                             and not (dias_parado and dias_parado >= 2)),
+            "dias_parado": dias_parado,
         }
+
+        # ── AJUSTE POR DIAS OPERABLES (COL37) ──────────────────────────
+        # Repartir la meta entre 30 dias supone que se opera los 30. Sebastian
+        # trabaja en un restaurant por turnos: la meta hay que concentrarla en
+        # los dias que realmente puede sentarse a operar.
+        #
+        # NO SE FIJA UN NUMERO (COL37, corregido): "4 dias" es demasiado
+        # rigido — pueden aparecer imprevistos y tampoco tiene sentido
+        # comprometerse a una cifra exacta. Se devuelve un ABANICO de
+        # escenarios y ademas lo que se MIDIO que hizo, para que la decision
+        # sea informada en vez de un parametro inventado.
+        with config_lock:
+            dias_sem = max(1, min(7, int(config.get("DIAS_OPERABLES_SEMANA", 4) or 4)))
+        mejor = max((s["variacion"] for s in vivo["serie"]
+                     if s["variacion"] is not None), default=None)
+
+        def escenario(d):
+            f = 7.0 / d
+            u = usdt_dia * f
+            return {"dias_semana": d,
+                    "dias_en_30": round(30 * d / 7),
+                    "usdt_por_jornada": round(u),
+                    "ordenes_por_jornada": (round(u / ticket_cal, 1) if ticket_cal else None),
+                    "ordenes_ticket_objetivo": round(u / ticket_obj, 1),
+                    # ¿lo logro alguna vez? se compara contra su MEJOR dia real
+                    "logrado_alguna_vez": (bool(mejor and ticket_cal and mejor >= u / ticket_cal)
+                                           if (mejor and ticket_cal) else None)}
+
+        # dias REALMENTE operados, medidos: dias con variacion positiva del
+        # contador sobre el total de dias con lectura. Es el dato honesto
+        # contra el cual comparar cualquier plan.
+        serie = vivo.get("serie") or []
+        con_var = [s for s in serie if s["variacion"] is not None]
+        activos = [s for s in con_var if s["variacion"] > 0]
+        dias_reales = (round(len(activos) / len(con_var) * 7, 1) if con_var else None)
+
+        plan.update({
+            "dias_operables_semana": dias_sem,          # el de config, como referencia
+            "dias_operables_medidos": dias_reales,      # lo que de verdad viene haciendo
+            "escenarios_dias": [escenario(d) for d in (2, 3, 4, 5, 7)],
+            "mejor_dia_medido_ordenes": mejor,
+            # el escenario que corresponde al config, para el resumen de arriba
+            "usdt_por_dia_operado": round(usdt_dia * 7.0 / dias_sem),
+            "ordenes_por_dia_operado": round(ord_dia * 7.0 / dias_sem, 1),
+            "ordenes_dia_operado_ticket_actual": (round(usdt_dia * 7.0 / dias_sem / ticket_cal, 1)
+                                                  if ticket_cal else None),
+        })
 
     return jsonify({
         "requisitos": reqs,
@@ -12165,6 +12494,7 @@ def _boot():
     threading.Thread(target=ciclo_colector_bybit, daemon=True).start()
     # macro va en su propio hilo: si la fuente externa falla, no arrastra a nadie
     threading.Thread(target=ciclo_colector_macro, daemon=True).start()
+    threading.Thread(target=ciclo_libro_vivo, daemon=True).start()
 
 if __name__ == "__main__":
     _boot()
