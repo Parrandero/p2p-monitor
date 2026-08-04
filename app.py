@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL40"
+VERSION       = "COL41"
 VERSION_FECHA = "2026-08-04"
 
 config = {
@@ -7304,6 +7304,21 @@ function AsistenteOperativo() {
         <span title="Recomendacion generada por ciclo desde: spread neto vs tu minimo operativo, rotacion actual vs promedio 12h (fills confirmados) y presion compra/venta. Es una guia, no una orden." style={{ color: "var(--text-3)", cursor: "help" }}>\u24d8</span>
       </div>
       <div style={{ fontSize: 12.5, color: "var(--text-2)", margin: "6px 0 12px", maxWidth: 900 }}>{d.razon}</div>
+      {d.macro && d.macro.senal && (
+        <div title={d.macro.mensaje} style={{ display: "inline-flex", alignItems: "center", gap: 6, cursor: "help",
+                     fontSize: 11, fontWeight: 600, marginBottom: 10, padding: "3px 9px", borderRadius: 7,
+                     background: d.macro.senal === "SUBE" ? "var(--buy-soft)" : "var(--sell-soft)",
+                     border: "1px solid " + (d.macro.senal === "SUBE" ? "var(--buy)" : "var(--sell)"),
+                     color: d.macro.senal === "SUBE" ? "var(--buy)" : "var(--sell)" }}>
+          {d.macro.senal === "SUBE" ? "↗" : "↘"} dólar formal {d.macro.senal === "SUBE" ? "adelantado" : "el P2P quedó adelantado"} {Math.abs(d.macro.pendiente_pct)}%
+        </div>
+      )}
+      {d.nota_macro && (
+        <div style={{ fontSize: 11.5, color: "var(--text-2)", margin: "0 0 12px", maxWidth: 900,
+                     padding: "6px 10px", background: "var(--bg-2)", borderRadius: 8, borderLeft: "3px solid var(--accent)" }}>
+          <b style={{ color: "var(--accent)" }}>Además (contexto macro):</b> {d.nota_macro}
+        </div>
+      )}
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
         {box("Vender a (flujo)", fmt(p.flujo_vender), "margen " + fmt(p.margen_venta_pct) + "% \u00b7 agresivo: " + fmt(p.agresivo_vender))}
         {box("Comprar a (flujo)", fmt(p.flujo_comprar), "margen " + fmt(p.margen_compra_pct) + "% \u00b7 agresivo: " + fmt(p.agresivo_comprar))}
@@ -10807,6 +10822,24 @@ def api_operativa():
     # ── decision (arbol unificado en decidir_operativa) ──
     decision, color, razon = decidir_operativa(gan, min_op, ratio, presion, rot_lento, rot_dual, sesgo_min)
 
+    # ── señal macro (COL40): conectada, sin tocar el arbol de spread/rotacion ──
+    # decidir_operativa() ya esta probado y calibrado (operativa_historial se
+    # arma con su salida) — no se le mete una entrada mas. El desfase dolar
+    # forex<->P2P es un eje DISTINTO (timing direccional, no "hay margen y
+    # liquidez ahora"), asi que se agrega COMO CAMPO APARTE, no mezclado en
+    # decision/color/razon. La unica conexion real: si el arbol ya dijo
+    # ESPERAR (el caso pasivo, donde una pista de hacia donde va el precio
+    # importa mas) Y hay señal macro activa, se arma una nota aparte que el
+    # frontend puede mostrar junto a la razon — nunca la reemplaza.
+    try:
+        macro_desfase = calcular_desfase()
+    except Exception as e:
+        print(f"[operativa macro] {e}")
+        macro_desfase = None
+    nota_macro = None
+    if macro_desfase and macro_desfase.get("senal") and decision == "ESPERAR":
+        nota_macro = macro_desfase["mensaje"]
+
     # ── precios asimetricos por presion ──
     # presion alta compradora -> tu anuncio de VENTA se llena solo: tomale mas
     # margen; tu anuncio de COMPRA tiene menos flujo: pegalo al lider.
@@ -10918,6 +10951,7 @@ def api_operativa():
     return jsonify({
         "timestamp": f(now),
         "decision": decision, "color": color, "razon": razon,
+        "macro": macro_desfase, "nota_macro": nota_macro,
         "mercado": {
             "spread_neto_pct": gan, "spread_min_operativo": min_op,
             "vs_promedio_12h": ratio, "usdt_min_30m": round(usdt_min_30m, 1),
