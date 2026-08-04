@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL41"
+VERSION       = "COL42"
 VERSION_FECHA = "2026-08-04"
 
 config = {
@@ -5528,6 +5528,105 @@ function VolumenMercado() {
   );
 }
 
+function PnlCiclos() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [dias, setDias] = React.useState(0);   // 0 = historial completo
+  const [d, setD] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    setD(null);
+    const q = dias ? ("?dias=" + dias) : "";
+    fetch(B + "/api/pnl_ciclos" + q).then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => { if (!stop) setD({ ciclos: [] }); });
+    return () => { stop = true; };
+  }, [dias]);
+
+  const fN = (v) => v == null ? "—" : Number(v).toLocaleString("es-CL");
+  const box = (label, val, sub) => (
+    <div style={{ flex: 1, minWidth: 170, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" }}>
+      <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 19, margin: "3px 0 1px", fontVariantNumeric: "tabular-nums" }}>{val}</div>
+      {sub && <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>{sub}</div>}
+    </div>
+  );
+
+  if (!d) return <div className="intel-loading">Calculando P&L real…</div>;
+  if (d.configurado === false) return <div className="intel-loading">{d.nota}</div>;
+
+  const r = d.resumen || {};
+  const pos = (r.pnl_neto_total_clp || 0) >= 0;
+  const pr = d.por_rol || {};
+
+  return (
+    <section className="chart-card">
+      <div className="card-head">
+        <h3>P&L real por ciclo — costo promedio ponderado</h3>
+        <span className="card-sub">cada venta contra el costo real de compra, no un margen teórico · ya descuenta comisión</span>
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, alignItems: "center" }}>
+        {[0, 7, 30, 90].map(n => (
+          <button key={n} className={"intel-tab" + (dias === n ? " active" : "")} onClick={() => setDias(n)}>{n === 0 ? "todo" : n + "d"}</button>
+        ))}
+        <a href={B + "/api/pnl_ciclos?fmt=csv" + (dias ? "&dias=" + dias : "")} download
+           style={{ marginLeft: "auto", fontSize: 11, fontFamily: "var(--mono)", color: "var(--accent)",
+                   textDecoration: "none", border: "1px solid var(--accent)", borderRadius: 7, padding: "3px 9px", whiteSpace: "nowrap" }}>
+          ⬇ CSV
+        </a>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+        {box("P&L neto", <span style={{ color: pos ? "#35e07a" : "var(--warn)" }}>{fN(r.pnl_neto_total_clp)} CLP</span>,
+             fN(r.n_ciclos) + " ciclos · " + fN(r.pnl_medio_clp) + " CLP/ciclo")}
+        {box("Tasa de acierto", (r.tasa_acierto_pct != null ? r.tasa_acierto_pct + "%" : "—"),
+             fN(r.ganadores) + " / " + fN(r.n_ciclos) + " ciclos ganadores")}
+        {d.sin_costo_base && d.sin_costo_base.n > 0 &&
+          box("Sin costo base", fN(d.sin_costo_base.n) + " ventas", fN(d.sin_costo_base.usdt) + " USDT · fondeo externo probable, no entra al P&L")}
+      </div>
+
+      {(pr.maker || pr.taker) && (
+        <div style={{ display: "flex", gap: 18, marginBottom: 14, fontSize: 11.5, color: "var(--text-2)", flexWrap: "wrap" }}>
+          {["maker", "taker"].map(rol => pr[rol] && pr[rol].n_ciclos > 0 && (
+            <span key={rol}>
+              <b style={{ textTransform: "uppercase", color: "var(--text)" }}>{rol}</b>{": "}
+              <span style={{ color: pr[rol].pnl_neto_total_clp >= 0 ? "#35e07a" : "var(--warn)" }}>{fN(pr[rol].pnl_neto_total_clp)} CLP</span>
+              {" en " + fN(pr[rol].n_ciclos) + " ciclos (" + pr[rol].tasa_acierto_pct + "% acierto)"}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {(!d.ciclos || d.ciclos.length === 0) && <div className="intel-loading">Sin ciclos con costo base en este rango.</div>}
+
+      {d.ciclos && d.ciclos.length > 0 && (
+        <div className="intel-scroll">
+          <table className="intel-table">
+            <thead><tr>
+              <th>Fecha y hora</th><th>Rol</th><th>USDT</th><th>Precio venta</th>
+              <th title="El costo promedio ponderado con el que se compró ese USDT hasta ese momento.">Costo base</th>
+              <th>P&L neto</th><th>%</th>
+            </tr></thead>
+            <tbody>{d.ciclos.map((c, i) => (
+              <tr key={c.orden_id || i}>
+                <td className="tnum">{c.ts}</td>
+                <td>{c.rol}</td>
+                <td className="tnum">{fN(c.usdt)}</td>
+                <td className="tnum">${fN(c.precio_venta)}</td>
+                <td className="tnum" style={{ color: "var(--text-3)" }}>${fN(c.costo_base_clp)}</td>
+                <td className="tnum" style={{ fontWeight: 600, color: c.pnl_neto_clp >= 0 ? "#35e07a" : "var(--warn)" }}>{fN(c.pnl_neto_clp)}</td>
+                <td className="tnum" style={{ color: "var(--text-3)" }}>{c.pct >= 0 ? "+" : ""}{c.pct}%</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      )}
+      <div className="intel-explain">
+        <b>Cómo se calcula:</b> costo promedio ponderado sobre TODO tu historial de órdenes reales — cada compra actualiza el costo base, cada venta realiza P&L contra ese costo, menos la comisión de esa orden puntual. Es el mismo método que cualquier libro contable de inventario fungible, no una estimación del monitor.<br/>
+        <b>Lo que NO se inventa:</b> si vendiste USDT que nunca compraste por P2P (probable que lo hayas fondeado por otro lado), esa venta queda en "sin costo base" y no entra al cálculo — inventarle un costo daría un número falso.
+      </div>
+    </section>
+  );
+}
+
 function FichaAnunciante({ inicial }) {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [q, setQ] = React.useState("");
@@ -6044,6 +6143,7 @@ function Inteligencia() {
     ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"]]],
     ["CONTRA QUIÉN",  [["basecomp","🗂️ Base de competidores"],["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"],["doble","🏷️ Doble precio"]]],
     ["CUÁNTO",        [["volumen","📊 Volumen de mercado"]]],
+    ["CÓMO ME FUE",   [["pnl","💰 P&L por ciclo"]]],
   ];
 
   if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
@@ -6066,6 +6166,7 @@ function Inteligencia() {
       {seccion==="ficha" && <FichaAnunciante inicial={fichaSel} />}
       {seccion==="perfilhoras" && <PerfilHoras />}
       {seccion==="volumen" && <VolumenMercado />}
+      {seccion==="pnl" && <PnlCiclos />}
       {seccion==="basecomp" && <BaseCompetidores onElegir={(n) => { setFichaSel(n); setSeccion("ficha"); }} />}
 
       {seccion==="horario" && horario && (
@@ -10203,6 +10304,143 @@ def api_calibracion():
                  "error_pct > 0 = el monitor sobrestima; < 0 = subestima. "
                  "La posicion es la que tenia tu anuncio al momento de la orden: sirve para "
                  "comparar estrategias sin anotar nada a mano."),
+    })
+
+
+@app.route("/api/pnl_ciclos")
+def api_pnl_ciclos():
+    """P&L REAL POR CICLO (COL42): el numero mas pedido en la auditoria del
+    31-jul -- no cuanto CREE el monitor que se gano, sino cuanto se gano DE
+    VERDAD, orden por orden, con costo base real en vez de un margen teorico.
+
+    METODO: costo promedio ponderado (weighted-average cost), igual que
+    cualquier libro contable de inventario fungible -- el USDT es fungible,
+    no tiene sentido tratar de adivinar CUAL dolar puntual se vendio.
+    Recorre mis_ordenes_reales EN ORDEN CRONOLOGICO (siempre desde el
+    principio, nunca solo 'los ultimos N dias': el costo base depende de
+    TODA la historia previa, filtrar el rango de entrada lo rompe):
+    - Cada COMPRA actualiza el costo promedio: nuevo_promedio =
+      (promedio_viejo*stock_viejo + precio*monto) / (stock_viejo+monto).
+    - Cada VENTA realiza P&L contra ese promedio: (precio_venta - costo_base)
+      * monto, menos la comision de ESA orden (convertida a CLP).
+
+    LO QUE NO SE INVENTA: la primera orden del historial (3-may-2026) es una
+    VENTA -- no hay compra previa que le de costo base. Cualquier venta que
+    exceda el USDT con costo base conocido (probable senal de que ese USDT
+    se fondeo por fuera del P2P, ej. una compra en otro exchange) se separa
+    en 'sin_costo_base' en vez de forzarle un costo inventado. Medido al
+    4-ago: 13 de 115 ventas (779 USDT) caen en este caso -- quedan afuera del
+    P&L, no adentro con un numero falso.
+
+    Params: ?dias=N (opcional, solo filtra que ciclos se listan/exportan --
+    el calculo interno SIEMPRE usa el historial completo, ver arriba)."""
+    fmt = (request.args.get("fmt", "json") or "json").lower()
+    try:
+        dias = int(request.args.get("dias", 0)) or None
+    except (ValueError, TypeError):
+        dias = None
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT to_regclass('public.mis_ordenes_reales')")
+                if cur.fetchone()["to_regclass"] is None:
+                    return jsonify({"configurado": False,
+                                    "nota": "todavia no importaste el CSV (scripts/importar_mis_ordenes.bat)"})
+                cur.execute("""
+                    SELECT orden_id, ts, lado, rol, usdt, precio, comision
+                    FROM mis_ordenes_reales
+                    WHERE estado='completada' AND usdt IS NOT NULL AND precio IS NOT NULL
+                      AND usdt > 0 AND precio > 0
+                    ORDER BY ts ASC
+                """)
+                ordenes = cur.fetchall()
+    except Exception as e:
+        print(f"[pnl_ciclos] {e}")
+        return jsonify({"error": str(e)[:200]}), 500
+
+    avg_cost, usdt_con_costo = None, 0.0
+    ciclos = []
+    sin_costo_n, sin_costo_usdt = 0, 0.0
+    for o in ordenes:
+        usdt, precio = float(o["usdt"]), float(o["precio"])
+        comision = float(o["comision"] or 0)
+        if o["lado"] == "compra":
+            if avg_cost is None:
+                avg_cost, usdt_con_costo = precio, usdt
+            else:
+                nuevo_total = usdt_con_costo + usdt
+                avg_cost = (avg_cost * usdt_con_costo + precio * usdt) / nuevo_total
+                usdt_con_costo = nuevo_total
+            continue
+        # venta
+        if avg_cost is None or usdt_con_costo <= 0:
+            sin_costo_n += 1
+            sin_costo_usdt += usdt
+            continue
+        monto_con_costo = min(usdt, usdt_con_costo)
+        monto_sin_costo = usdt - monto_con_costo
+        if monto_sin_costo > 0.01:
+            sin_costo_n += 1
+            sin_costo_usdt += monto_sin_costo
+        comision_clp = comision * precio
+        pnl_bruto = (precio - avg_cost) * monto_con_costo
+        pnl_neto = pnl_bruto - comision_clp
+        usdt_con_costo -= monto_con_costo
+        if usdt_con_costo <= 0.01:
+            usdt_con_costo = 0.0
+        ciclos.append({
+            "orden_id": o["orden_id"], "ts": str(o["ts"])[:19], "rol": o["rol"],
+            "usdt": round(monto_con_costo, 2), "precio_venta": precio,
+            "costo_base_clp": round(avg_cost, 2),
+            "pnl_bruto_clp": round(pnl_bruto), "comision_clp": round(comision_clp),
+            "pnl_neto_clp": round(pnl_neto), "pct": round((precio / avg_cost - 1) * 100, 3),
+        })
+
+    listado = ciclos
+    if dias:
+        try:
+            desde = (datetime.now(SANTIAGO_TZ) - timedelta(days=dias)).replace(tzinfo=None)
+            listado = [c for c in ciclos if datetime.strptime(c["ts"], "%Y-%m-%d %H:%M:%S") >= desde]
+        except Exception:
+            pass
+
+    def _resumen(lista):
+        if not lista:
+            return {"n_ciclos": 0, "pnl_neto_total_clp": 0, "pnl_medio_clp": None,
+                    "ganadores": 0, "tasa_acierto_pct": None}
+        total = sum(c["pnl_neto_clp"] for c in lista)
+        gan = sum(1 for c in lista if c["pnl_neto_clp"] > 0)
+        return {"n_ciclos": len(lista), "pnl_neto_total_clp": round(total),
+                "pnl_medio_clp": round(total / len(lista)), "ganadores": gan,
+                "tasa_acierto_pct": round(gan / len(lista) * 100, 1)}
+
+    por_rol = {rol: _resumen([c for c in listado if c["rol"] == rol]) for rol in ("maker", "taker")}
+
+    if fmt == "csv":
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["orden_id", "fecha_hora", "rol", "usdt", "precio_venta", "costo_base_clp",
+                    "pnl_bruto_clp", "comision_clp", "pnl_neto_clp", "pct"])
+        for c in listado:
+            w.writerow([c["orden_id"], c["ts"], c["rol"], c["usdt"], c["precio_venta"],
+                       c["costo_base_clp"], c["pnl_bruto_clp"], c["comision_clp"],
+                       c["pnl_neto_clp"], c["pct"]])
+        return Response(buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename=pnl_ciclos{'_' + str(dias) + 'd' if dias else ''}.csv"})
+
+    return jsonify({
+        "configurado": True,
+        "resumen": _resumen(listado),
+        "por_rol": por_rol,
+        "sin_costo_base": {"n": sin_costo_n, "usdt": round(sin_costo_usdt, 2)},
+        "ciclos": list(reversed(listado))[:300],
+        "dias": dias,
+        "nota": ("Costo promedio ponderado sobre TODO el historial (aunque dias= filtre que se lista). "
+                 "'sin_costo_base' son ventas de USDT que no tienen una compra P2P previa que las explique "
+                 "(probable fondeo externo) -- no entran al P&L, no se les inventa un costo. "
+                 "pnl_neto_clp ya descuenta la comision de esa orden puntual."),
     })
 
 
