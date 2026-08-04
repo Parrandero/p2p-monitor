@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL46"
+VERSION       = "COL47"
 VERSION_FECHA = "2026-08-04"
 
 config = {
@@ -8739,6 +8739,17 @@ function InventarioCard() {
         <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10,
                       border: "1px solid var(--line-soft)", fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.8 }}>
           <div>Movimientos desde el ancla: <b>{det.movimientos}</b> ({det.maker} maker · {det.taker} taker · {det.externo} externo)</div>
+          {(det.maker_observado_usdt != null || det.maker_estimado_usdt != null) && (() => {
+            const obs = det.maker_observado_usdt || 0, est = det.maker_estimado_usdt || 0, tot = obs + est;
+            const pct = tot > 0 ? Math.round(est / tot * 100) : 0;
+            return (
+              <div title="Observado = se vio caer el stock de tu anuncio. Estimado = subió tu contador de órdenes sin caída visible (recargaste en el mismo ciclo), y se calcula con TU ticket medio. Cuanto más alto el % estimado, más conviene re-anclar.">
+                De lo maker: <b>{invFmt(obs, 2)} USDT</b> observados ·{" "}
+                <b style={{ color: pct >= 40 ? "var(--warn)" : "var(--text)" }}>{invFmt(est, 2)} USDT</b> estimados
+                <span style={{ color: "var(--text-3)" }}> ({pct}% del total)</span>
+              </div>
+            );
+          })()}
           <div>Comisiones pagadas: <b>{invFmt(det.comisiones_usdt, 2)} USDT</b></div>
           <div>Revaluación del USDT que ya tenías: <b style={{ color: (det.revaluacion_clp || 0) >= 0 ? "var(--buy)" : "var(--sell)" }}>{invFmt(det.revaluacion_clp)} CLP</b> <span style={{ color: "var(--text-3)" }}>(el precio se movió, no operaste)</span></div>
           <div>Costo de campaña (trading, sin revaluación): <b style={{ color: (det.costo_campania_clp || 0) >= 0 ? "var(--buy)" : "var(--sell)" }}>{invFmt(det.costo_campania_clp)} CLP</b></div>
@@ -11440,19 +11451,38 @@ def _movimientos_maker(desde_ts, hasta_ts=None):
     La comision maker se cobra en USDT (medido en ordenes reales: 0,14 USDT
     sobre 74,16), por eso se descuenta del saldo en USDT en ambos lados.
 
-    SOLO metodo='directo' (caida de stock OBSERVADA). Los 'enmascarado' son
-    estimaciones con el ticket MEDIANO DEL MERCADO (~408 USDT): sirven para el
-    volumen agregado, pero en un inventario personal con ordenes de 20-170 USDT
-    meterian movimientos fantasma de 400 que nunca pasaron. Lo que el tracker no
-    ve se corrige al re-anclar (ese es justamente el drift)."""
+    INCLUYE 'enmascarado' desde COL47 — antes se excluian, y esa exclusion
+    quedo obsoleta sin que nadie lo notara:
+      - El motivo escrito era "los enmascarado se estiman con el ticket
+        MEDIANO DEL MERCADO (~408 USDT) y meterian movimientos fantasma de
+        400 que nunca pasaron". Cierto cuando se escribio.
+      - Pero COL24 agrego MI_TICKET_MEDIO justamente para eso: los fills
+        enmascarados de MI cuenta se estiman con MI ticket, no con el del
+        mercado (ver FillTracker, 'es_mi_cuenta and mi_ticket > 0').
+        Verificado con datos del 4-ago: 305,60 USDT en 8 ordenes = 38 por
+        orden, o sea el ticket propio, no 408.
+      - Consecuencia de seguir excluyendolos: se tiraba ~31 por ciento de las
+        ventas reales del dia. Medido el 4-ago, con solo 'directo' el saldo
+        CLP daba -63.001 (imposible) y 109 por ciento en USDT; incluyendo los
+        enmascarados da +218.668 CLP y 68,8 por ciento. El PATRIMONIO total
+        casi no cambia (701.038 vs 701.636): las ventas que faltaban solo
+        movian valor de una columna a la otra, que es la firma de que
+        faltaban movimientos y no de que sobrara plata.
+      - Ademas disparaba la alerta de "saldo negativo, perdiste movimientos"
+        contra un inventario que en realidad estaba bien: la alerta acusaba
+        al usuario de no cargar ordenes cuando el que no sumaba era el codigo.
+
+    Sigue siendo una ESTIMACION: se devuelve 'metodo' en cada movimiento para
+    que quien consuma pueda informar que parte es observada y que parte
+    estimada. Lo que el tracker no ve se corrige al re-anclar (el drift)."""
     with config_lock:
         nick = str(config.get("MI_NICKNAME") or "").strip()
         com_pct = float(config.get("COM_MAKER_PCT", 0.20))
     if not nick:
         return []
     f = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
-    sql = """SELECT ts, tipo, monto, precio FROM fills_estimados
-             WHERE exchange='binance' AND metodo='directo'
+    sql = """SELECT ts, tipo, monto, precio, metodo FROM fills_estimados
+             WHERE exchange='binance'
                AND LOWER(anunciante)=LOWER(%(n)s)
                AND ts >= %(d)s"""
     params = {"n": nick, "d": f(desde_ts)}
@@ -11480,6 +11510,10 @@ def _movimientos_maker(desde_ts, hasta_ts=None):
                         "d_clp": (monto * precio) if vendi else -(monto * precio),
                         "precio": precio, "usdt": monto,
                         "fee_usdt": fee,
+                        # COL47: 'directo' = caida de stock observada;
+                        # 'enmascarado' = estimado con MI ticket. Viaja para
+                        # poder decir que parte del saldo es observada.
+                        "metodo": r["metodo"],
                     })
     except Exception as e:
         print(f"[inv maker] {e}")
@@ -11713,6 +11747,14 @@ def api_inventario():
             "maker": sum(1 for m in movs if m["tipo"] == "maker"),
             "taker": sum(1 for m in movs if m["tipo"] == "taker"),
             "externo": sum(1 for m in movs if m["tipo"] == "externo"),
+            # COL47: cuanto del movimiento maker es OBSERVADO y cuanto
+            # ESTIMADO. Antes los estimados no entraban al inventario y eso
+            # rompia el saldo; ahora entran, pero hay que poder ver de que
+            # esta hecho el numero.
+            "maker_observado_usdt": round(sum(m.get("usdt", 0) for m in movs
+                                              if m["tipo"] == "maker" and m.get("metodo") == "directo"), 2),
+            "maker_estimado_usdt": round(sum(m.get("usdt", 0) for m in movs
+                                             if m["tipo"] == "maker" and m.get("metodo") == "enmascarado"), 2),
             "costo_campania_clp": round(costo_campania),
             "comisiones_usdt": round(fees_usdt, 3),
             "revaluacion_clp": round(revaluacion),
