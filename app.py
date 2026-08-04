@@ -11,7 +11,7 @@ from collections import deque
 from flask import Flask, jsonify, Response, request
 import psycopg2
 from psycopg2 import pool as pg_pool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 from contextlib import contextmanager
 
 app = Flask(__name__)
@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL42"
+VERSION       = "COL46"
 VERSION_FECHA = "2026-08-04"
 
 config = {
@@ -36,11 +36,14 @@ config = {
     # arranca), Plata -30% → 0.28% (>6 BTC/mes), Oro -50% → 0.20% (>60 BTC/mes).
     # Al verificarse (Bronce): cambiar COMISION_BN a 0.0016 desde el panel/API.
     "COMISION_BN":          0.002,   # por pierna (0.2% maker CLP, no verificado)
-    "COM_BINANCE_MAKER":    0.002,   # Binance maker CLP 0.2%
-    "COM_BINANCE_TAKER":    0.001,   # Binance taker CLP 0.1%
     "COM_BYBIT_MAKER":      0.0,     # Bybit CLP: sin comision al publicar
-    "COM_BYBIT_TAKER":      0.0,     # Bybit CLP: taker sin comision
-    "COSTO_TRANSFER_USDT":  1.0,     # ~1 USDT fijo por transferir USDT entre exchanges (red TRC20)
+    # BORRADAS en COL43: COM_BINANCE_MAKER, COM_BINANCE_TAKER, COM_BYBIT_TAKER
+    # y COSTO_TRANSFER_USDT. Ninguna se leia en el codigo (COMISION_BN es la
+    # que manda para Binance) ni se habia persistido nunca en config_persistente
+    # -- verificado contra la DB antes de sacarlas. La taker real ademas NO es
+    # un %, son 0,07 USDT FIJOS por orden (medido, ver Doctrina), asi que
+    # COM_BINANCE_TAKER=0.001 era ademas un valor equivocado esperando a que
+    # alguien lo usara.
     # Spread neto mínimo (después de comisiones) para considerar operable.
     "SPREAD_MIN_OPERATIVO": 0.35,
     # Cuantos dias de detalle crudo (top-80 cada 2 min) se conservan.
@@ -158,12 +161,28 @@ config = {
     # la base: solo memoria. Medido 2-ago: la API tarda ~590 ms y aguanta
     # consultas seguidas; a 10s son ~17.000 req/dia (0,2 por segundo).
     "LIBRO_VIVO_SEG":       10,
-    # Metodos de pago que PODES usar, por 'identifier' de Binance
-    # (ej. SpecificBank, BCIChile, BancoSantanderChile, BANK...).
+    # Metodos de pago que PODES usar, por 'identifier' de Binance.
     # VACIO = no filtra nada. Sirve para no calcular el ciclo contra un
-    # precio de alguien con quien no podes operar: medido 2-ago, 15 de 70
-    # anuncios que pasaban los filtros normales no compartian banco.
-    "MIS_METODOS_PAGO":     "",
+    # precio de alguien con quien no podes operar.
+    #
+    # RESUELTO 4-ago (COL46): Sebastian mostro su pantalla de metodos y dijo
+    # "solo utilizo la opcion de transferencia con banco especifico".
+    # Verificado contra el libro EN VIVO que el identifier de eso es
+    # exactamente "SpecificBank" (nombre mostrado: "Transfers with specific
+    # bank") — no se asumio, se leyo de los tradeMethods reales.
+    # MEDIDO antes de activarlo, en el lado donde recompra (tradeType=BUY):
+    #   - 43 de 80 anuncios (54%) aceptan SpecificBank
+    #   - el VWAP de una tanda de 240 USDT pasa de 917,89 a 918,31 = 0,036%
+    # Ese 0,036% es el precio de que TODO lo que muestre sea operable de
+    # verdad; contra el 0,20% de comision por pierna, es barato.
+    # Sumar "BANK" (Transferencia Bancaria, que tambien tiene registrada)
+    # agrega 6 anuncios pero NO mejora el VWAP: no se incluye.
+    #
+    # OJO con la direccion de los lados al re-medir esto: tradeType=BUY es
+    # donde Sebastian COMPRA (los anunciantes venden) y hay que barrer desde
+    # el precio MAS BARATO; tradeType=SELL es donde vende y se barre desde el
+    # MAS CARO. Mezclarlos da un "spread" de 3,7% que no existe.
+    "MIS_METODOS_PAGO":     "SpecificBank",
     "RUT_ANCLA_DIAS":       3,     # re-anclar inventario (saldos reales)
     "RUT_CSV_DIAS":         10,    # importar CSV de Binance (calibracion)
     "RUT_BACKUP_DIAS":      7,     # backup general de la base
@@ -2259,6 +2278,105 @@ def obtener_macro():
     return datos
 
 
+def backfill_macro(rango="6mo"):
+    """Trae el HISTORICO horario de Yahoo y rellena snapshots_macro hacia
+    atras. Se autolimita: solo escribe horas que todavia no tienen fila.
+
+    POR QUE (COL45): el colector macro arranco el 31-jul, pero snapshots (P2P)
+    tiene datos desde el 18-mar. Medir el retardo forex->P2P con 4 dias de
+    macro cuando hay 4,5 MESES de P2P al lado era desperdiciar la mitad del
+    experimento. Yahoo devuelve 1h de granularidad hasta 6 meses atras, que
+    cubre todo el solapamiento.
+
+    Lo que se rellena: usdclp_forex, vix, cobre, btc_usd (cada uno con su
+    propia serie de Yahoo) + p2p_ref y brecha_pct calculados contra el
+    promedio horario real de snapshots. Las horas sin dato de mercado (fin de
+    semana, feriado) simplemente no existen en la respuesta de Yahoo y no se
+    inventan."""
+    insertadas = 0
+    try:
+        # ── 1. bajar cada serie a un dict {hora_chile: valor} ──
+        series = {}
+        for clave, simbolo in MACRO_SIMBOLOS.items():
+            try:
+                r = requests.get(URL_YAHOO + simbolo,
+                                 params={"interval": "1h", "range": rango},
+                                 headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+                r.raise_for_status()
+                res = ((r.json() or {}).get("chart") or {}).get("result") or []
+                if not res:
+                    continue
+                res = res[0]
+                ts_list = res.get("timestamp") or []
+                quote = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+                closes = quote.get("close") or []
+                d = {}
+                for t, c in zip(ts_list, closes):
+                    if c is None:
+                        continue
+                    # fromtimestamp con tz convierte el epoch directo a hora
+                    # Chile. Se usa SANTIAGO_TZ (ZoneInfo) y no un offset fijo
+                    # -4 a proposito: Chile cambia de hora, y la DB guarda hora
+                    # local naive — con offset fijo, marzo/abril quedarian
+                    # corridos una hora contra los snapshots.
+                    dt = datetime.fromtimestamp(t, tz=SANTIAGO_TZ)
+                    d[dt.replace(minute=0, second=0, microsecond=0)] = float(c)
+                series[clave] = d
+                print(f"[MACRO backfill] {simbolo}: {len(d)} horas")
+            except Exception as e:
+                print(f"[MACRO backfill {simbolo}] {e}")
+
+        if not series.get("usdclp_forex"):
+            print("[MACRO backfill] sin forex, se aborta")
+            return 0
+
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # ── 2. horas que YA tienen fila: no se pisan ──
+                cur.execute("SELECT DISTINCT date_trunc('hour', ts) h FROM snapshots_macro")
+                ya = {r["h"] for r in cur.fetchall()}
+                # ── 3. P2P promedio por hora, para p2p_ref y la brecha ──
+                cur.execute("""
+                    SELECT date_trunc('hour', timestamp) h,
+                           AVG((precio_pond_tab_compra + precio_pond_tab_venta)/2) v
+                    FROM snapshots
+                    WHERE precio_pond_tab_compra > 0 AND precio_pond_tab_venta > 0
+                    GROUP BY 1
+                """)
+                p2p_hora = {r["h"]: float(r["v"]) for r in cur.fetchall()}
+
+                filas = []
+                for hora, fx in sorted(series["usdclp_forex"].items()):
+                    # comparar naive contra naive: la DB guarda hora Chile sin tz
+                    hora_naive = hora.replace(tzinfo=None)
+                    if hora_naive in ya:
+                        continue
+                    p2p = p2p_hora.get(hora_naive)
+                    brecha = round((p2p / fx - 1) * 100, 3) if (p2p and fx) else None
+                    filas.append((
+                        hora_naive.strftime("%Y-%m-%d %H:%M:%S"), fx,
+                        series.get("vix", {}).get(hora),
+                        series.get("cobre", {}).get(hora),
+                        round(p2p, 2) if p2p else None, brecha,
+                        series.get("btc_usd", {}).get(hora),
+                    ))
+                if filas:
+                    # execute_values y NO executemany: son ~1.500 filas y
+                    # executemany manda una sentencia por fila — medido, tarda
+                    # mas de un minuto contra la base remota. Con VALUES en
+                    # lote es un solo viaje.
+                    execute_values(cur, """INSERT INTO snapshots_macro
+                                           (ts, usdclp_forex, vix, cobre, p2p_ref, brecha_pct, btc_usd)
+                                           VALUES %s""", filas)
+                    insertadas = len(filas)
+            conn.commit()
+        if insertadas:
+            print(f"[MACRO backfill] {insertadas} horas historicas insertadas")
+    except Exception as e:
+        print(f"[MACRO backfill] {e}")
+    return insertadas
+
+
 def calcular_desfase():
     """LA SENAL OPERATIVA (COL35): cuanto se movio el dolar forex que el P2P
     TODAVIA no acompano.
@@ -2397,6 +2515,23 @@ def ciclo_colector_macro():
                     break
         except Exception:
             pass
+    # BACKFILL HISTORICO (COL45), una sola vez: si la serie macro cubre menos
+    # de 30 dias es que arranco hace poco (el colector macro es de COL35, muy
+    # posterior a snapshots) y conviene traer los 6 meses que Yahoo ofrece en
+    # 1h. Se autolimita solo: una vez rellenado, el rango supera los 30 dias y
+    # no vuelve a correr. Va DESPUES de la espera del precio para que p2p_ref
+    # y la brecha se puedan calcular contra snapshots.
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT MIN(ts), MAX(ts) FROM snapshots_macro")
+                r = cur.fetchone()
+        dias_cubiertos = (r[1] - r[0]).days if (r and r[0] and r[1]) else 0
+        if dias_cubiertos < 30:
+            print(f"[MACRO] serie de solo {dias_cubiertos} dias -> backfill historico")
+            backfill_macro("6mo")
+    except Exception as e:
+        print(f"[MACRO backfill arranque] {e}")
     while True:
         try:
             d = obtener_macro()
@@ -3237,11 +3372,6 @@ body {
 .intel-explain b { color:var(--text); }
 
 /* ---------- Backup banner & panel ---------- */
-.backup-banner { display:flex; align-items:center; gap:12px; margin:8px 0 0; padding:8px 14px; border-radius:10px; background:var(--bg-1); border:1px solid var(--line-soft); border-left:3px solid var(--warn); font-size:12.5px; color:var(--text-2); }
-.bb-dot { width:7px; height:7px; border-radius:50%; background:var(--warn); flex:none; }
-.bb-txt { flex:1; }
-.bb-go { font-family:var(--font); font-size:12.5px; font-weight:600; color:var(--bg); background:var(--warn); border:none; padding:7px 14px; border-radius:8px; cursor:pointer; }
-.bb-x { background:transparent; border:none; color:var(--text-3); cursor:pointer; font-size:14px; line-height:1; }
 .backup-wrap { max-width:680px; }
 .backup-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:16px 0 4px; }
 .backup-actions { display:flex; align-items:center; gap:14px; margin-top:12px; flex-wrap:wrap; }
@@ -5843,7 +5973,19 @@ function CicloRecompra() {
   const tono = CICLO_TONO[d.veredicto] || "var(--text-3)";
   const r = d.recompra || {}, v = d.venta || {}, co = d.costos || {},
         fl = d.flujo || {}, g = d.ganancia || {};
-  const PRESETS = [300, 600, 1200, 2500];
+  // COL44: los presets salen de las recompras REALES, no de numeros redondos.
+  // La estrategia es vender de a poco e ir recomprando en tandas mientras
+  // tanto — no esperar a vender todo para recomprar de una — asi que ofrecer
+  // "tu saldo completo" sugeria una operacion que nunca ocurre. Medido sobre
+  // sus taker de compra: p25=210 / mediana=235 / p75=320 / max 425.
+  const saldo = d.saldo_real_usdt;
+  const t = d.tandas;
+  const PRESETS = t
+    ? [["chica", t.chica], ["habitual", t.habitual], ["grande", t.grande], ["máxima", t.maxima]]
+        .filter(([, v]) => v > 0)
+        // sin duplicados: si dos percentiles redondean al mismo numero, sobra uno
+        .filter(([, v], i, arr) => arr.findIndex(([, w]) => w === v) === i)
+    : [["", 200], ["", 300], ["", 400], ["", 600]];
 
   return (
     <section className="chart-card" style={{ marginBottom: 14 }}>
@@ -5855,11 +5997,17 @@ function CicloRecompra() {
       {/* controles */}
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
         <div>
-          <div style={{ fontSize: 10.5, color: "var(--text-3)", marginBottom: 4 }}>Monto a ciclar (USDT)</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)", marginBottom: 4 }}>
+            Tanda a recomprar (USDT)
+            {t && <span style={{ marginLeft: 6, color: "var(--text-3)" }}
+                    title={"Salen de tus " + t.n + " recompras taker reales, no de números redondos."}>
+              · según tus {t.n} recompras reales</span>}
+          </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-            {PRESETS.map(p => (
+            {PRESETS.map(([etq, p]) => (
               <button key={p} className={"pr-btn" + (Number(monto) === p ? " on" : "")}
-                onClick={() => setMonto(p)}>{fN(p)}</button>
+                title={etq ? ("tu tanda " + etq) : ""}
+                onClick={() => setMonto(p)}>{fN(p)}{etq && <span style={{ fontSize: 9, opacity: 0.7 }}> {etq}</span>}</button>
             ))}
             {/* clase 0-9 explicita: un backslash aca dispararia SyntaxWarning
                 dentro del string de Python que contiene el DASHBOARD */}
@@ -5899,6 +6047,25 @@ function CicloRecompra() {
           </span>
         )}
       </div>
+
+      {/* COL44: dos avisos distintos, en orden de gravedad.
+          El de saldo es el duro (plata que no existe); el de tanda es blando
+          (podés hacerlo, pero nunca lo hiciste y el VWAP empeora al barrer
+          más hondo). */}
+      {saldo != null && nMonto > saldo + 1 && (
+        <div style={{ marginBottom: 12, padding: "7px 11px", borderRadius: 8, fontSize: 11.5,
+                     background: "rgba(255,145,0,0.1)", border: "1px solid var(--warn)", color: "var(--warn)" }}>
+          ⚠ Estás simulando {fN(nMonto)} USDT pero tu saldo real es {fN(saldo)}. Sirve para ver el escenario,
+          no para operar ahora.
+        </div>
+      )}
+      {t && t.maxima && nMonto > t.maxima && (saldo == null || nMonto <= saldo + 1) && (
+        <div style={{ marginBottom: 12, padding: "7px 11px", borderRadius: 8, fontSize: 11.5,
+                     background: "var(--bg-2)", border: "1px solid var(--line)", color: "var(--text-2)" }}>
+          Tu recompra más grande hasta hoy fue {fN(t.maxima)} USDT (habitual: {fN(t.habitual)}).
+          Barrer una tanda más honda empeora el VWAP — el precio de acá arriba ya lo tiene en cuenta.
+        </div>
+      )}
 
       {/* LOS DOS PRECIOS: lo unico que se copia para operar */}
       <div style={{ background: "var(--bg-2)", border: "1px solid " + tono, borderRadius: 12,
@@ -6694,37 +6861,13 @@ function Backup() {
   );
 }
 
-function BackupBanner({ onGo }) {
-  const [dismissed, setDismissed] = React.useState(false);
-  const [pct, setPct] = React.useState(null);
-  React.useEffect(() => {
-    const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
-    fetch(B + "/api/storage").then(r => r.json()).then(d => setPct(d.pct)).catch(() => {});
-  }, []);
-  const last = (() => { try { return parseInt(localStorage.getItem("ua_p2p_last_backup") || "0"); } catch (e) { return 0; } })();
-  const diasDesde = last ? Math.floor((Date.now() - last) / 86400000) : null;
-  const backupVencido = diasDesde === null || diasDesde >= 7;
-  const discoAlto = pct != null && pct >= 70;
-  if (dismissed || (!backupVencido && !discoAlto)) return null;
-  const txt = discoAlto
-    ? ("Disco al " + pct + "%. Hacé el backup general y después vaciá las listas.")
-    : ((diasDesde === null ? "Todavía no registraste ninguna copia de la base de datos." : ("Tu última copia fue hace " + diasDesde + " días.")) + " Conviene exportar un backup.");
-  return (
-    <div className="backup-banner" style={discoAlto ? { borderLeftColor: "var(--sell)" } : {}}>
-      <span className="bb-dot"></span>
-      <span className="bb-txt">{txt}</span>
-      <button className="bb-go" onClick={onGo}>{discoAlto ? "Ir a Backup" : "Hacer backup"}</button>
-      <button className="bb-x" onClick={() => setDismissed(true)} aria-label="cerrar">✕</button>
-    </div>
-  );
-}
-
 /* ============================================================
    RUTINAS DE MANTENIMIENTO (COL25)
-   Reemplaza al BackupBanner viejo, que guardaba la fecha en localStorage y
-   por eso cada dispositivo creia una cosa distinta. Ahora el estado sale de
-   la DB: ancla y CSV se detectan solos de la actividad real; el backup se
-   marca a mano porque el ZIP se descarga fuera del monitor.
+   Reemplaza al BackupBanner viejo (BORRADO en COL43), que guardaba la fecha
+   en localStorage y por eso cada dispositivo creia una cosa distinta. Ahora
+   el estado sale de la DB: ancla y CSV se detectan solos de la actividad
+   real; el backup se marca a mano porque el ZIP se descarga fuera del
+   monitor.
    ============================================================ */
 const RUT_COLOR = { vencida: "var(--sell)", nunca: "var(--sell)", pronto: "var(--warn)", ok: "var(--buy)" };
 
@@ -8701,7 +8844,7 @@ function CalculadoraCruzar() {
   );
 }
 
-window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, MacroBar, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, BackupBanner, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
+window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, MacroBar, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
 
 </script>
 <script type="text/babel">
@@ -10307,6 +10450,51 @@ def api_calibracion():
     })
 
 
+def _tandas_recompra():
+    """CUANTO RECOMPRA DE VERDAD, medido de sus propias ordenes (COL44b).
+
+    Por que existe: los presets del Ciclo eran numeros redondos puestos a
+    mano (300/600/1200/2500) y el default de config tambien. Medido sobre las
+    compras TAKER reales (que son las recompras rapidas de la estrategia):
+    p25=210 · mediana=235 · p75=319 · max historico=425 USDT.
+    O sea que 600, 1200 y 2500 estaban TODOS fuera de lo que alguna vez hizo,
+    y ofrecer "tu saldo completo" (~638) como preset sugeria una operacion
+    que nunca ocurrio: la estrategia es vender de a poco e ir recomprando en
+    tandas mientras tanto, no esperar a vender todo para recomprar de una.
+    Verificado en los datos: el 30-jul recompro 11:03, 11:48 y 12:27 — tres
+    tandas en 90 minutos.
+
+    Se usan las TAKER porque son las recompras deliberadas (cruzar para
+    reponer stock rapido). Las maker de compra son otra cosa: son el anuncio
+    de compra llenandose solo, con ticket mucho menor (mediana 58)."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT to_regclass('public.mis_ordenes_reales')")
+                if cur.fetchone()["to_regclass"] is None:
+                    return None
+                cur.execute("""
+                    SELECT COUNT(*) AS n,
+                           PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY usdt) AS p25,
+                           PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY usdt) AS p50,
+                           PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY usdt) AS p75,
+                           MAX(usdt) AS maximo
+                    FROM mis_ordenes_reales
+                    WHERE estado = 'completada' AND lado = 'compra' AND rol = 'taker'
+                      AND usdt > 0
+                """)
+                r = cur.fetchone()
+    except Exception as e:
+        print(f"[tandas] {e}")
+        return None
+    if not r or not r["n"] or int(r["n"]) < 5:
+        return None      # con menos de 5 recompras no hay percentil que valga
+    def _r(v):
+        return int(round(float(v) / 10) * 10) if v else None
+    return {"n": int(r["n"]), "chica": _r(r["p25"]), "habitual": _r(r["p50"]),
+            "grande": _r(r["p75"]), "maxima": _r(r["maximo"])}
+
+
 @app.route("/api/pnl_ciclos")
 def api_pnl_ciclos():
     """P&L REAL POR CICLO (COL42): el numero mas pedido en la auditoria del
@@ -11550,14 +11738,33 @@ def api_ciclo():
     Params: ?monto=1200&margen=0.30"""
     with config_lock:
         c = dict(config)
+    monto_pedido = request.args.get("monto")
     try:
-        monto = float(request.args.get("monto") or c.get("CICLO_MONTO_DEFAULT", 1200))
+        monto = float(monto_pedido or c.get("CICLO_MONTO_DEFAULT", 1200))
     except (TypeError, ValueError):
         monto = float(c.get("CICLO_MONTO_DEFAULT", 1200))
     try:
         margen = float(request.args.get("margen") or c.get("CICLO_MARGEN_OBJETIVO", 0.30))
     except (TypeError, ValueError):
         margen = float(c.get("CICLO_MARGEN_OBJETIVO", 0.30))
+
+    # ── ACOTAR AL SALDO REAL (COL44) ────────────────────────────────
+    # Guarda-rail, no protagonista: nunca calcular con plata que no existe.
+    # Solo cuando NO se pidio un monto explicito — si se escribe un numero en
+    # el panel es una simulacion deliberada y pisarla seria pelear con el
+    # usuario. En la practica casi nunca ata, porque la tanda tipica de
+    # recompra es MUY menor al saldo total (ver _tandas_recompra).
+    saldo_real = None
+    if not monto_pedido:
+        try:
+            inv = api_inventario().get_json()
+            if inv.get("configurado") and inv.get("saldos"):
+                saldo_real = float(inv["saldos"].get("usdt") or 0)
+        except Exception as e:
+            print(f"[ciclo saldo] {e}")
+        if saldo_real and saldo_real >= 10:
+            monto = min(monto, saldo_real)
+
     monto = max(10.0, min(100000.0, monto))
     margen = max(0.0, min(10.0, margen))
 
@@ -11759,6 +11966,12 @@ def api_ciclo():
     return jsonify({
         "monto": round(monto),
         "margen_objetivo": margen,
+        # COL44: saldo real (guarda-rail) y las tandas MEDIDAS de recompra,
+        # que son las que de verdad importan para esta estrategia.
+        "saldo_real_usdt": (round(saldo_real, 2) if saldo_real else None),
+        "acotado_por_saldo": bool(saldo_real and not monto_pedido
+                                  and float(c.get("CICLO_MONTO_DEFAULT", 1200)) > saldo_real),
+        "tandas": _tandas_recompra(),
         # COL38: de donde salio el libro y hace cuanto. Sin esto no se puede
         # saber si el precio que se esta mirando sigue existiendo.
         "fuente_libro": fuente,
