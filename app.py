@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL47"
+VERSION       = "COL48"
 VERSION_FECHA = "2026-08-04"
 
 config = {
@@ -3423,11 +3423,14 @@ window.P2P_BETA = false;
    ante un 401 lo pide UNA vez con prompt() y reintenta. Sin APP_TOKEN en el
    backend, funciona igual que un fetch comun. */
 window.P2P_AUTH = {
-  post: function (url, body) {
+  /* COL48: generalizado a cualquier metodo (PATCH/DELETE para corregir
+     movimientos). 'post' se mantiene como atajo para no tocar los llamados
+     que ya existian. El reintento pidiendo token vale para todos por igual. */
+  req: function (metodo, url, body) {
     var mk = function (tk) {
       var h = { "Content-Type": "application/json" };
       if (tk) h["X-App-Token"] = tk;
-      return fetch(url, { method: "POST", headers: h, body: body ? JSON.stringify(body) : undefined });
+      return fetch(url, { method: metodo, headers: h, body: body ? JSON.stringify(body) : undefined });
     };
     var tk = "";
     try { tk = localStorage.getItem("ua_app_token") || ""; } catch (e) {}
@@ -3438,7 +3441,8 @@ window.P2P_AUTH = {
       try { localStorage.setItem("ua_app_token", nuevo); } catch (e) {}
       return mk(nuevo);
     });
-  }
+  },
+  post: function (url, body) { return this.req("POST", url, body); }
 };
 
 </script>
@@ -8436,6 +8440,61 @@ function InventarioCard() {
   // historial de anclas (COL34)
   const [hist, setHist] = React.useState(null);
   const [histAbierto, setHistAbierto] = React.useState(false);
+  // movimientos manuales, para corregirlos (COL48)
+  const [movs, setMovs] = React.useState(null);
+  const [movsAbierto, setMovsAbierto] = React.useState(false);
+  const [editId, setEditId] = React.useState(null);      // fila en edicion
+  const [eU, setEU] = React.useState(""); const [eP, setEP] = React.useState("");
+  const [confirmMov, setConfirmMov] = React.useState(null);   // aviso de salto raro
+
+  const cargarMovs = React.useCallback(() => {
+    fetch(B + "/api/inventario/movimientos?dias=7").then(r => r.json())
+      .then(j => setMovs(j.movimientos || [])).catch(() => setMovs([]));
+  }, []);
+  const verMovs = () => {
+    const abrir = !movsAbierto;
+    setMovsAbierto(abrir);
+    if (abrir && !movs) cargarMovs();
+  };
+  const abrirEdicion = (m) => {
+    setEditId(m.id); setEU(String(m.usdt)); setEP(String(m.precio)); setConfirmMov(null); setMsg("");
+  };
+  const guardarMov = (id, forzar) => {
+    if (busy) return;
+    const body = { usdt: parseFloat(String(eU).replace(",", ".")), precio: parseFloat(String(eP).replace(",", ".")) };
+    if (forzar) body.confirmar = true;
+    setBusy(true); setMsg("Guardando…");
+    window.P2P_AUTH.req("PATCH", B + "/api/inventario/movimiento/" + id, body)
+      .then(r => r.json()).then(j => {
+        setBusy(false);
+        if (j && j.requiere_confirmacion) { setConfirmMov(j.aviso); setMsg(""); return; }
+        if (!j || j.ok === false) { setMsg("✗ " + ((j && j.error) || "no se pudo guardar")); return; }
+        setConfirmMov(null); setEditId(null);
+        setMsg("✓ movimiento corregido");
+        cargarMovs(); cargar();
+        setTimeout(() => setMsg(""), 8000);
+      })
+      .catch(() => { setBusy(false); setMsg("✗ error de red"); });
+  };
+  const borrarMov = (m) => {
+    if (busy) return;
+    /* OJO: los saltos de linea van con doble backslash. Esto vive dentro de
+       un string de Python, asi que un \\n simple lo consumiria Python y
+       partiria el string de JS en dos (lo agarro esbuild en COL48). */
+    if (!window.confirm("¿Borrar este movimiento?\\n\\n" + m.ts + "\\n" + m.tipo +
+                        (m.lado ? " " + m.lado : "") + " · " + m.usdt + " USDT @ " + m.precio +
+                        "\\n\\nNo se puede deshacer.")) return;
+    setBusy(true); setMsg("Borrando…");
+    window.P2P_AUTH.req("DELETE", B + "/api/inventario/movimiento/" + m.id)
+      .then(r => r.json()).then(j => {
+        setBusy(false);
+        if (!j || j.ok === false) { setMsg("✗ " + ((j && j.error) || "no se pudo borrar")); return; }
+        setMsg("✓ movimiento borrado");
+        cargarMovs(); cargar();
+        setTimeout(() => setMsg(""), 8000);
+      })
+      .catch(() => { setBusy(false); setMsg("✗ error de red"); });
+  };
   const verHistorial = () => {
     const abrir = !histAbierto;
     setHistAbierto(abrir);
@@ -8618,10 +8677,78 @@ function InventarioCard() {
         <button onClick={verHistorial} style={{ ...btn(histAbierto), fontSize: 11 }}>
           {histAbierto ? "ocultar historial" : "📋 historial de saldos"}
         </button>
+        <button onClick={verMovs} style={{ ...btn(movsAbierto), fontSize: 11 }}
+          title="Ver, corregir o borrar las órdenes que cargaste a mano">
+          {movsAbierto ? "ocultar movimientos" : "✏️ corregir movimientos"}
+        </button>
         <button onClick={() => setDetalle(!detalle)} style={{ ...btn(false), border: "none", background: "transparent", marginLeft: "auto" }}>
           {detalle ? "ocultar detalle" : "ver detalle"}
         </button>
       </div>
+
+      {movsAbierto && (
+        <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
+          <div style={{ fontSize: 11.5, color: "var(--text-2)", marginBottom: 8 }}>
+            Solo los movimientos que cargaste <b>a mano</b> (taker y externos), últimos 7 días.
+            Los maker los deriva el monitor de los fills y no se editan: si esos están mal, lo que corresponde es re-anclar.
+          </div>
+          {movs === null && <div style={{ fontSize: 11.5, color: "var(--text-3)" }}>Cargando…</div>}
+          {movs && movs.length === 0 && <div style={{ fontSize: 11.5, color: "var(--text-3)" }}>Sin movimientos manuales en los últimos 7 días.</div>}
+          {movs && movs.length > 0 && (
+            <div className="intel-scroll">
+              <table className="intel-table">
+                <thead><tr>
+                  <th>Fecha y hora</th><th>Tipo</th><th>USDT</th><th>Precio</th><th>CLP</th><th></th>
+                </tr></thead>
+                <tbody>{movs.map(m => (
+                  <tr key={m.id}>
+                    <td className="tnum">{m.ts.replace("T", " ")}</td>
+                    <td>{m.tipo}{m.lado ? " " + m.lado : ""}</td>
+                    {editId === m.id ? (
+                      <>
+                        <td><input value={eU} onChange={e => setEU(e.target.value)} inputMode="decimal"
+                              style={{ ...inp, width: 90, padding: "4px 7px", fontSize: 12 }} /></td>
+                        <td><input value={eP} onChange={e => setEP(e.target.value)} inputMode="decimal"
+                              style={{ ...inp, width: 90, padding: "4px 7px", fontSize: 12 }} /></td>
+                        <td className="tnum" style={{ color: "var(--text-3)" }}>
+                          {invFmt((parseFloat(String(eU).replace(",", ".")) || 0) * (parseFloat(String(eP).replace(",", ".")) || 0))}
+                        </td>
+                        <td style={{ whiteSpace: "nowrap" }}>
+                          <button disabled={busy} onClick={() => guardarMov(m.id, false)}
+                            style={{ ...btn(true), fontSize: 10.5, padding: "3px 9px" }}>Guardar</button>{" "}
+                          <button onClick={() => { setEditId(null); setConfirmMov(null); }}
+                            style={{ ...btn(false), fontSize: 10.5, padding: "3px 9px" }}>Cancelar</button>
+                        </td>
+                      </>
+                    ) : (
+                      <>
+                        <td className="tnum">{invFmt(m.usdt, 2)}</td>
+                        <td className="tnum">${invFmt(m.precio, 2)}</td>
+                        <td className="tnum" style={{ color: "var(--text-3)" }}>{invFmt(m.clp)}</td>
+                        <td style={{ whiteSpace: "nowrap" }}>
+                          <button onClick={() => abrirEdicion(m)}
+                            style={{ ...btn(false), fontSize: 10.5, padding: "3px 9px" }}>Editar</button>{" "}
+                          <button disabled={busy} onClick={() => borrarMov(m)}
+                            style={{ ...btn(false), fontSize: 10.5, padding: "3px 9px", color: "var(--sell)", borderColor: "var(--sell)" }}>Borrar</button>
+                        </td>
+                      </>
+                    )}
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          )}
+          {confirmMov && (
+            <div style={{ marginTop: 8, padding: "8px 10px", background: "rgba(255,145,0,0.1)", border: "1px solid var(--warn)", borderRadius: 8, fontSize: 11.5, color: "var(--warn)" }}>
+              ⚠ {confirmMov}
+              <div style={{ marginTop: 6 }}>
+                <button onClick={() => guardarMov(editId, true)}
+                  style={{ ...btn(true), fontSize: 10.5, padding: "3px 9px" }}>Guardar igual</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {histAbierto && (
         <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
@@ -12489,6 +12616,116 @@ def api_inventario_movimiento():
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
     return jsonify({"ok": True, "id": nuevo, "tipo": tipo, "lado": lado,
                     "usdt": usdt, "clp": round(clp), "precio": precio})
+
+
+@app.route("/api/inventario/movimientos")
+def api_inventario_movimientos():
+    """Lista los movimientos MANUALES cargados, para poder corregirlos (COL48).
+
+    Solo los manuales: los maker se derivan en vivo de fills_estimados y no
+    son filas editables — si uno de esos esta mal, lo que corresponde es
+    re-anclar, no 'editar' una estimacion.
+    Params: ?dias=7 (default) — desde el ancla vigente si es mas reciente."""
+    try:
+        dias = max(1, min(365, int(request.args.get("dias", 7))))
+    except (ValueError, TypeError):
+        dias = 7
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""SELECT id, ts, tipo, lado, usdt, clp, precio, nota
+                               FROM movimientos_inventario
+                               WHERE ts >= NOW() - (%s || ' days')::INTERVAL
+                               ORDER BY ts DESC LIMIT 200""", [dias])
+                filas = [{"id": r["id"], "ts": str(r["ts"])[:19], "tipo": r["tipo"],
+                          "lado": r["lado"],
+                          "usdt": float(r["usdt"] or 0), "clp": float(r["clp"] or 0),
+                          "precio": float(r["precio"] or 0), "nota": r["nota"] or ""}
+                         for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[movimientos lista] {e}")
+        return jsonify({"error": str(e)[:200]}), 500
+    return jsonify({"movimientos": filas, "dias": dias})
+
+
+@app.route("/api/inventario/movimiento/<int:mid>", methods=["PATCH", "DELETE"])
+def api_inventario_movimiento_editar(mid):
+    """Corregir o borrar un movimiento manual (COL48).
+
+    POR QUE EXISTE: el 4-ago Sebastian cargo una orden con el precio mal
+    tipeado (919,90 en vez de 917,90 — un 9 por un 7) y NO habia forma de
+    arreglarlo desde la app; hubo que hacerlo con SQL a mano contra la base
+    de produccion. Un dato mal cargado envenena el inventario, el P&L y el
+    costo de campania, asi que tiene que poder corregirse donde se cargo.
+
+    PATCH acepta usdt / precio / lado / nota. El CLP NO se acepta como
+    parametro en trades: se recalcula usdt*precio, que es como se guardo en
+    el POST — dejar que entren descoordinados es justamente lo que rompe el
+    cuadre. En 'externo' si se acepta clp directo (un deposito no tiene
+    precio).
+    DELETE borra la fila. Devuelve lo borrado para poder rehacerlo a mano si
+    fue un error."""
+    if not _token_ok():
+        return jsonify({"ok": False, "error": "token requerido o invalido"}), 401
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""SELECT id, ts, tipo, lado, usdt, clp, precio, nota
+                               FROM movimientos_inventario WHERE id = %s""", [mid])
+                actual = cur.fetchone()
+                if not actual:
+                    return jsonify({"ok": False, "error": f"no existe el movimiento {mid}"}), 404
+                antes = {"id": actual["id"], "ts": str(actual["ts"])[:19],
+                         "tipo": actual["tipo"], "lado": actual["lado"],
+                         "usdt": float(actual["usdt"] or 0), "clp": float(actual["clp"] or 0),
+                         "precio": float(actual["precio"] or 0), "nota": actual["nota"] or ""}
+
+                if request.method == "DELETE":
+                    cur.execute("DELETE FROM movimientos_inventario WHERE id = %s", [mid])
+                    conn.commit()
+                    return jsonify({"ok": True, "borrado": antes})
+
+                data = request.get_json() or {}
+                tipo = antes["tipo"]
+                lado = (data.get("lado") or antes["lado"] or "").strip().lower() or None
+                if tipo != "externo" and lado not in ("compra", "venta"):
+                    return jsonify({"ok": False, "error": "lado debe ser compra o venta"}), 400
+                try:
+                    usdt = float(data["usdt"]) if "usdt" in data else antes["usdt"]
+                    precio = float(data["precio"]) if "precio" in data else antes["precio"]
+                    clp = float(data["clp"]) if "clp" in data else antes["clp"]
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "error": "valores numericos invalidos"}), 400
+                if tipo != "externo":
+                    if usdt <= 0 or precio <= 0:
+                        return jsonify({"ok": False, "error": "usdt y precio deben ser > 0"}), 400
+                    clp = usdt * precio          # mismo criterio que el POST
+                elif usdt == 0 and clp == 0:
+                    return jsonify({"ok": False, "error": "un movimiento externo necesita usdt o clp"}), 400
+
+                # SALVAGUARDA, mismo espiritu que el ancla (COL40): un cambio
+                # de 8x+ en el precio es casi siempre un typo, no una
+                # correccion real. Se puede forzar con confirmar=true.
+                if (tipo != "externo" and antes["precio"] > 0 and not data.get("confirmar")
+                        and (precio / antes["precio"] >= 8 or precio / antes["precio"] <= 1 / 8)):
+                    return jsonify({
+                        "ok": False, "requiere_confirmacion": True,
+                        "aviso": (f"El precio pasa de {antes['precio']:,.2f} a {precio:,.2f} "
+                                  f"({precio / antes['precio']:.1f}x). Si es correcto, guardá de nuevo."),
+                    }), 409
+
+                cur.execute("""UPDATE movimientos_inventario
+                               SET lado=%s, usdt=%s, clp=%s, precio=%s, nota=%s
+                               WHERE id=%s""",
+                            (lado, usdt, clp, precio,
+                             (data.get("nota") if "nota" in data else antes["nota"])[:200], mid))
+            conn.commit()
+    except Exception as e:
+        print(f"[movimiento editar] {e}")
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+    return jsonify({"ok": True, "antes": antes,
+                    "ahora": {"id": mid, "tipo": tipo, "lado": lado, "usdt": usdt,
+                              "clp": round(clp), "precio": precio}})
 
 
 # ══════════════════════════════════════════════════════════════
