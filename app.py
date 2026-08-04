@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL38"
-VERSION_FECHA = "2026-08-02"
+VERSION       = "COL40"
+VERSION_FECHA = "2026-08-04"
 
 config = {
     "MONEDA":               "USDT",
@@ -541,6 +541,27 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_merch_ancla_ts ON merchant_ancla(ts DESC)")
+            # ── VOLUMEN DE MERCADO, historico diario (COL39) ─────────────
+            # fills_estimados ya calcula esto (lo usa /api/volumen_v2), pero
+            # esa tabla se purga a los 30 dias (purgar_fills_antiguos) y nunca
+            # queda una SERIE para mirar la tendencia. Esta tabla congela 1
+            # fila por (fecha, exchange) -- el MISMO calculo, solo que
+            # persistido antes de que se recicle el detalle. Costo real:
+            # ~2 filas/dia para siempre, nada que ver con los limites del
+            # servidor que preocupan al ir a 2min o a 10s en el libro vivo.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS volumen_mercado_dia (
+                    fecha DATE NOT NULL,
+                    exchange TEXT NOT NULL,
+                    volumen_usdt NUMERIC,
+                    ordenes INTEGER,
+                    pct_enmascarado NUMERIC,
+                    presion_compra_pct NUMERIC,
+                    anunciantes_activos INTEGER,
+                    PRIMARY KEY (fecha, exchange)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_volmerc_fecha ON volumen_mercado_dia(fecha)")
             # Movimientos MANUALES (taker / externo). Los 'maker' NO se guardan
             # aca: se derivan en vivo de fills_estimados para que no haya doble
             # conteo ni drift si un fill se corrige despues.
@@ -1097,6 +1118,53 @@ def guardar_agregados_dia(fecha=None):
             print(f"[AGREGADOS] {total:,} filas anunciante/dia congeladas")
     except Exception as e:
         print(f"[AGREGADOS] {e}")
+    return total
+
+
+def guardar_volumen_mercado_dia(fecha=None):
+    """Congela el volumen TOTAL de mercado (todos los anunciantes, no solo
+    Sebastian) antes de que purgar_fills_antiguos() recicle fills_estimados
+    a los 30 dias. Es el MISMO calculo que ya usa /api/volumen_v2 (SUM(monto)
+    agrupado), asi que el numero de hoy en el dashboard y la fila que queda
+    grabada siempre van a coincidir -- no es una segunda formula.
+
+    Por que vale la pena (COL39, pedido de Sebastian): es la unica forma de
+    ver la TENDENCIA de cuanta plata mueve el mercado, en vez de un numero
+    instantaneo que se pierde al otro dia. Costo: 1-2 filas por dia para
+    siempre (una por exchange), nada comparado con snapshots_detalle."""
+    f = fecha or (datetime.now(SANTIAGO_TZ).date() - timedelta(days=1))
+    total = 0
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO volumen_mercado_dia
+                        (fecha, exchange, volumen_usdt, ordenes, pct_enmascarado,
+                         presion_compra_pct, anunciantes_activos)
+                    SELECT ts::date, exchange,
+                           ROUND(SUM(monto)::numeric, 2),
+                           SUM(ordenes)::int,
+                           ROUND(100.0 * SUM(monto) FILTER (WHERE metodo = 'enmascarado')
+                                 / NULLIF(SUM(monto), 0), 1),
+                           ROUND(100.0 * SUM(monto) FILTER (WHERE tipo = 'BUY')
+                                 / NULLIF(SUM(monto), 0), 1),
+                           COUNT(DISTINCT anunciante)
+                    FROM fills_estimados
+                    WHERE ts::date = %(f)s
+                    GROUP BY 1, 2
+                    ON CONFLICT (fecha, exchange) DO UPDATE SET
+                        volumen_usdt = EXCLUDED.volumen_usdt,
+                        ordenes = EXCLUDED.ordenes,
+                        pct_enmascarado = EXCLUDED.pct_enmascarado,
+                        presion_compra_pct = EXCLUDED.presion_compra_pct,
+                        anunciantes_activos = EXCLUDED.anunciantes_activos
+                """, {"f": f})
+                total = cur.rowcount
+            conn.commit()
+        if total:
+            print(f"[VOLUMEN DIA] {f}: {total} filas (exchange) congeladas")
+    except Exception as e:
+        print(f"[VOLUMEN DIA] {e}")
     return total
 
 
@@ -2508,6 +2576,23 @@ def ciclo_colector():
         backfill_fills(horas=48)
     except Exception as e:
         print(f"[FILLS backfill] {e}")
+    # Backfill de volumen_mercado_dia (COL39): si la tabla esta vacia (deploy
+    # nuevo o tabla recien creada), reconstruye desde lo que fills_estimados
+    # todavia tiene en disco (~21-30 dias) en vez de arrancar el historial
+    # desde cero. Se autolimita: una vez que hay filas, no vuelve a correr.
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM volumen_mercado_dia")
+                if cur.fetchone()[0] == 0:
+                    cur.execute("SELECT DISTINCT ts::date FROM fills_estimados ORDER BY 1")
+                    dias_disp = [r[0] for r in cur.fetchall()]
+        if dias_disp:
+            for d in dias_disp:
+                guardar_volumen_mercado_dia(d)
+            print(f"[VOLUMEN DIA] backfill: {len(dias_disp)} dias reconstruidos")
+    except Exception as e:
+        print(f"[VOLUMEN DIA backfill] {e}")
     _ultima_purga = None   # controla que la purga se ejecute 1x/día
     while True:
         try:
@@ -2521,6 +2606,13 @@ def ciclo_colector():
                     guardar_agregados_dia(hoy)   # parcial del dia en curso
                 except Exception as e:
                     print(f"[AGREGADOS diario] {e}")
+                try:
+                    # mismo orden que arriba: congelar ANTES de que
+                    # purgar_fills_antiguos() se coma fills_estimados.
+                    guardar_volumen_mercado_dia(hoy - timedelta(days=1))
+                    guardar_volumen_mercado_dia(hoy)
+                except Exception as e:
+                    print(f"[VOLUMEN DIA diario] {e}")
                 with config_lock:
                     _det_dias = int(config.get("DETALLE_DIAS", 10) or 10)
                 purgar_detalle_antiguo(dias=_det_dias)
@@ -5352,6 +5444,90 @@ function PerfilHoras() {
   );
 }
 
+function VolumenMercado() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [dias, setDias] = React.useState(30);
+  const [d, setD] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    setD(null);
+    fetch(B + "/api/volumen_mercado?dias=" + dias).then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => { if (!stop) setD({ serie: [] }); });
+    return () => { stop = true; };
+  }, [dias]);
+
+  const fN = (v) => v == null ? "—" : Number(v).toLocaleString("es-CL");
+
+  if (!d) return <div className="intel-loading">Cargando volumen de mercado…</div>;
+  const serie = d.serie || [];
+  const hoy = serie.length ? serie[serie.length - 1] : null;
+  const prevs = serie.slice(0, -1);
+  const promPrevio = prevs.length ? prevs.reduce((s, r) => s + (r.volumen_usdt || 0), 0) / prevs.length : null;
+  const cambioPct = (hoy && hoy.volumen_usdt != null && promPrevio) ? Math.round((hoy.volumen_usdt / promPrevio - 1) * 1000) / 10 : null;
+
+  return (
+    <section className="chart-card">
+      <div className="card-head">
+        <h3>Volumen de mercado — cuánta plata se mueve</h3>
+        <span className="card-sub">todos los anunciantes del top-80, no solo lo tuyo · Binance + Bybit · congelado a diario, no se pierde con la purga</span>
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, alignItems: "center" }}>
+        {[7, 14, 30, 60, 90].map(n => (
+          <button key={n} className={"intel-tab" + (dias === n ? " active" : "")} onClick={() => setDias(n)}>{n}d</button>
+        ))}
+        <a href={B + "/api/volumen_mercado?dias=" + dias + "&fmt=csv"} download
+           style={{ marginLeft: "auto", fontSize: 11, fontFamily: "var(--mono)", color: "var(--accent)",
+                   textDecoration: "none", border: "1px solid var(--accent)", borderRadius: 7, padding: "3px 9px", whiteSpace: "nowrap" }}>
+          ⬇ CSV
+        </a>
+      </div>
+
+      {!serie.length && <div className="intel-loading">Todavía sin historial — se arma solo, un día a la vez.</div>}
+
+      {serie.length > 0 && (
+        <>
+          {hoy && (
+            <div style={{ fontSize: 12.5, color: "var(--text-2)", marginBottom: 8 }}>
+              Hoy: <b style={{ color: "var(--text-1)" }}>{fN(hoy.volumen_usdt)} USDT</b> en {fN(hoy.ordenes)} órdenes
+              {cambioPct != null && (
+                <span style={{ color: cambioPct >= 0 ? "#35e07a" : "var(--warn)" }}>
+                  {" "}({cambioPct >= 0 ? "+" : ""}{cambioPct}% vs. promedio de los {prevs.length} días previos)
+                </span>
+              )}
+            </div>
+          )}
+          <div className="intel-scroll">
+            <table className="intel-table">
+              <thead><tr>
+                <th>Fecha</th>
+                <th title="Estimado desde las caídas de stock de los anuncios del top-80 (mismo método que ya usa el indicador de volumen en vivo). No es el 100% del mercado, es lo visible en el libro público.">Volumen (USDT)</th>
+                <th title="Órdenes completadas contadas en las mismas caídas de stock.">Órdenes</th>
+                <th title="Anunciantes distintos con al menos un fill ese día.">Anunciantes activos</th>
+                <th title="% del volumen que fue ESTIMADO indirectamente (anunciante con dos avisos a la vez) en vez de observado directo. Más alto = número menos confiable ese día.">% estimado</th>
+                <th title="Qué parte del volumen fue gente COMPRANDO USDT (tab Compra) vs. vendiendo. 50% = equilibrado.">Presión compra</th>
+              </tr></thead>
+              <tbody>{serie.slice().reverse().map(r => (
+                <tr key={r.fecha}>
+                  <td className="tnum">{r.fecha}</td>
+                  <td className="tnum" style={{ fontWeight: 600 }}>{fN(r.volumen_usdt)}</td>
+                  <td className="tnum">{fN(r.ordenes)}</td>
+                  <td className="tnum">{fN(r.anunciantes_activos)}</td>
+                  <td className="tnum" style={{ color: "var(--text-3)" }}>{r.pct_enmascarado != null ? r.pct_enmascarado + "%" : "—"}</td>
+                  <td className="tnum" style={{ color: "var(--text-3)" }}>{r.presion_compra_pct != null ? r.presion_compra_pct + "%" : "—"}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </>
+      )}
+      <div className="intel-explain">
+        <b>Qué es:</b> la plata que se movió en TODO el libro top-80 ese día (no solo lo tuyo) — mismo cálculo que ya usa el indicador de volumen en vivo, pero guardado para poder mirar la tendencia en vez de solo el instante.<br/>
+        <b>Límite honesto:</b> es una estimación desde caídas de stock públicas, no el número real de Binance. El "% estimado" te dice cuánto de ese día fue indirecto (anunciantes con 2+ avisos a la vez) — con eso más alto, confiá menos en el número de ese día puntual.
+      </div>
+    </section>
+  );
+}
+
 function FichaAnunciante({ inicial }) {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [q, setQ] = React.useState("");
@@ -5867,6 +6043,7 @@ function Inteligencia() {
     ["CUÁNDO",        [["perfilhoras","🕐 Perfil por hora"]]],
     ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"]]],
     ["CONTRA QUIÉN",  [["basecomp","🗂️ Base de competidores"],["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"],["doble","🏷️ Doble precio"]]],
+    ["CUÁNTO",        [["volumen","📊 Volumen de mercado"]]],
   ];
 
   if (loading) return <div className="intel-loading">Consultando base de datos…</div>;
@@ -5888,6 +6065,7 @@ function Inteligencia() {
       {seccion==="cruzar" && <div id="ciclo-recompra"><CicloRecompra /><CruzarOEsperar /></div>}
       {seccion==="ficha" && <FichaAnunciante inicial={fichaSel} />}
       {seccion==="perfilhoras" && <PerfilHoras />}
+      {seccion==="volumen" && <VolumenMercado />}
       {seccion==="basecomp" && <BaseCompetidores onElegir={(n) => { setFichaSel(n); setSeccion("ficha"); }} />}
 
       {seccion==="horario" && horario && (
@@ -7991,6 +8169,7 @@ function InventarioCard() {
   // ancla
   const [aU, setAU] = React.useState(""); const [aC, setAC] = React.useState("");
   const [aNota, setANota] = React.useState("");   // COL34: para distinguir apertura/cierre en el historial
+  const [confirmAviso, setConfirmAviso] = React.useState(null);   // COL40: salto sospechoso, pendiente de confirmar
   // movimiento
   const [mTipo, setMTipo] = React.useState("taker");
   const [mLado, setMLado] = React.useState("compra");
@@ -8031,6 +8210,35 @@ function InventarioCard() {
       .catch(() => { setBusy(false); setMsg("✗ error de red"); });
   };
 
+  // Guardar el ancla es un caso aparte de post() generico (COL40): el
+  // backend puede devolver 409 pidiendo confirmacion (salto de magnitud
+  // sospechoso, ej. el typo de 51.517 USDT que motivo esto). Lee SIEMPRE
+  // los inputs actuales al click, asi que si el usuario edita el numero
+  // despues de ver el aviso, "Guardar igual" manda lo nuevo, no lo viejo.
+  const guardarAncla = (forzar) => {
+    if (busy) return;
+    const body = { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")), nota: aNota };
+    if (forzar) body.confirmar = true;
+    setBusy(true); setMsg("Guardando…");
+    window.P2P_AUTH.post(B + "/api/inventario/ancla", body)
+      .then(r => r.json().then(j => ({ j })))
+      .then(({ j }) => {
+        setBusy(false);
+        if (j && j.requiere_confirmacion) { setConfirmAviso(j.aviso); setMsg(""); return; }
+        if (!j || j.ok === false) { setConfirmAviso(null); setMsg("✗ " + ((j && j.error) || "no se pudo guardar")); return; }
+        setConfirmAviso(null);
+        let extra = "";
+        if (j.drift && (Math.abs(j.drift.usdt) > 0.01 || Math.abs(j.drift.clp) > 1)) {
+          extra = " · drift vs estimado: " + invFmt(j.drift.usdt, 2) + " USDT / " + invFmt(j.drift.clp) + " CLP";
+        }
+        if (j.aviso_duplicado) extra += " · ⚠ " + j.aviso_duplicado;
+        setMsg("✓ saldos actualizados" + extra);
+        setForm(null); setANota(""); cargar();
+        setTimeout(() => setMsg(""), 9000);
+      })
+      .catch(() => { setBusy(false); setMsg("✗ error de red"); });
+  };
+
   const box = { background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" };
   const lbl = { fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" };
   const val = { fontFamily: "var(--mono)", fontSize: 19, color: "var(--text)", margin: "3px 0 1px", fontVariantNumeric: "tabular-nums" };
@@ -8056,9 +8264,17 @@ function InventarioCard() {
             <div><div style={lbl}>USDT en Binance</div><input value={aU} onChange={e => setAU(e.target.value)} inputMode="decimal" style={{ ...inp, width: 120 }} /></div>
             <div><div style={lbl}>CLP en Mercado Pago</div><input value={aC} onChange={e => setAC(e.target.value)} inputMode="decimal" style={{ ...inp, width: 140 }} /></div>
             <div><div style={lbl}>Nota (opcional)</div><input value={aNota} onChange={e => setANota(e.target.value)} placeholder="apertura / cierre" style={{ ...inp, width: 150 }} /></div>
-            <button disabled={busy} style={btn(true)}
-              onClick={() => post("/api/inventario/ancla", { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")), nota: aNota }, "saldos fijados")}>Guardar</button>
-            <button onClick={() => setForm(null)} style={btn(false)}>Cancelar</button>
+            <button disabled={busy} style={btn(true)} onClick={() => guardarAncla(false)}>Guardar</button>
+            <button onClick={() => { setForm(null); setConfirmAviso(null); }} style={btn(false)}>Cancelar</button>
+          </div>
+        )}
+        {confirmAviso && (
+          <div style={{ marginTop: 8, padding: "8px 10px", background: "rgba(255,145,0,0.1)", border: "1px solid var(--warn)", borderRadius: 8, fontSize: 11.5, color: "var(--warn)" }}>
+            ⚠ {confirmAviso}
+            <div style={{ marginTop: 6, display: "flex", gap: 6 }}>
+              <button onClick={() => guardarAncla(true)} style={{ ...btn(true), fontSize: 10.5, padding: "3px 9px" }}>Guardar igual</button>
+              <button onClick={() => setConfirmAviso(null)} style={{ ...btn(false), fontSize: 10.5, padding: "3px 9px" }}>Cancelar</button>
+            </div>
           </div>
         )}
         {msg && <div style={{ fontFamily: "var(--mono)", fontSize: 11.5, marginTop: 8, color: msg[0] === "✓" ? "var(--buy)" : "var(--warn)" }}>{msg}</div>}
@@ -8205,14 +8421,22 @@ function InventarioCard() {
             <div><div style={lbl}>USDT en Binance</div><input value={aU} onChange={e => setAU(e.target.value)} inputMode="decimal" style={{ ...inp, width: 120 }} /></div>
             <div><div style={lbl}>CLP en Mercado Pago</div><input value={aC} onChange={e => setAC(e.target.value)} inputMode="decimal" style={{ ...inp, width: 140 }} /></div>
             <div><div style={lbl}>Nota (opcional)</div><input value={aNota} onChange={e => setANota(e.target.value)} placeholder="apertura / cierre" style={{ ...inp, width: 150 }} /></div>
-            <button disabled={busy} style={btn(true)}
-              onClick={() => post("/api/inventario/ancla", { usdt: parseFloat(String(aU).replace(",", ".")), clp: parseFloat(String(aC).replace(",", ".")), nota: aNota }, "saldos actualizados")}>Guardar</button>
+            <button disabled={busy} style={btn(true)} onClick={() => guardarAncla(false)}>Guardar</button>
           </div>
           <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
             <button onClick={() => setANota("Apertura")} style={{ ...btn(aNota === "Apertura"), fontSize: 10.5, padding: "3px 9px" }}>Apertura</button>
-            <button onClick={() => setANota("Control")} style={{ ...btn(aNota === "Control"), fontSize: 10.5, padding: "3px 9px" }}>Control</button>
+            <button onClick={() => setANota("Chequeo")} style={{ ...btn(aNota === "Chequeo"), fontSize: 10.5, padding: "3px 9px" }}>Chequeo</button>
             <button onClick={() => setANota("Cierre")} style={{ ...btn(aNota === "Cierre"), fontSize: 10.5, padding: "3px 9px" }}>Cierre</button>
           </div>
+          {confirmAviso && (
+            <div style={{ marginTop: 8, padding: "8px 10px", background: "rgba(255,145,0,0.1)", border: "1px solid var(--warn)", borderRadius: 8, fontSize: 11.5, color: "var(--warn)" }}>
+              ⚠ {confirmAviso}
+              <div style={{ marginTop: 6, display: "flex", gap: 6 }}>
+                <button onClick={() => guardarAncla(true)} style={{ ...btn(true), fontSize: 10.5, padding: "3px 9px" }}>Guardar igual</button>
+                <button onClick={() => setConfirmAviso(null)} style={{ ...btn(false), fontSize: 10.5, padding: "3px 9px" }}>Cancelar</button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -10356,6 +10580,71 @@ def api_volumen_v2():
     return jsonify({"binance": binance, "bybit": bybit, "metodo": "fills confirmados (directo + enmascarado)"})
 
 
+@app.route("/api/volumen_mercado")
+def api_volumen_mercado():
+    """Serie diaria PERSISTIDA de volumen total de mercado (COL39).
+
+    /api/volumen_v2 ya calcula esto pero solo mira las ultimas 48h en vivo
+    desde fills_estimados, que se purga a los 30 dias -- no hay forma de ver
+    la tendencia. Esta serie viene de volumen_mercado_dia, que guardar_
+    volumen_mercado_dia() congela 1x/dia con el MISMO calculo, asi que el
+    numero de "hoy" siempre coincide con lo que ya se ve en vivo.
+
+    Suma Binance + Bybit por dia (Bybit es marginal, no aporta separarlo
+    aca). Los porcentajes se promedian PONDERADOS por volumen, no a secas.
+    Params: ?dias=30&fmt=json|csv"""
+    try:
+        dias = max(1, min(365, int(request.args.get("dias", 30))))
+    except (ValueError, TypeError):
+        dias = 30
+    fmt = (request.args.get("fmt", "json") or "json").lower()
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT fecha,
+                           SUM(volumen_usdt) volumen_usdt,
+                           SUM(ordenes) ordenes,
+                           SUM(anunciantes_activos) anunciantes_activos,
+                           ROUND(SUM(volumen_usdt * COALESCE(pct_enmascarado, 0))
+                                 / NULLIF(SUM(volumen_usdt), 0), 1) pct_enmascarado,
+                           ROUND(SUM(volumen_usdt * COALESCE(presion_compra_pct, 50))
+                                 / NULLIF(SUM(volumen_usdt), 0), 1) presion_compra_pct
+                    FROM volumen_mercado_dia
+                    WHERE fecha >= CURRENT_DATE - %s
+                    GROUP BY fecha ORDER BY fecha
+                """, [dias])
+                filas = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[volumen_mercado] {e}")
+        return jsonify({"error": str(e)[:200]}), 500
+
+    salida = []
+    for f in filas:
+        salida.append({
+            "fecha": str(f["fecha"]),
+            "volumen_usdt": float(f["volumen_usdt"]) if f["volumen_usdt"] is not None else None,
+            "ordenes": int(f["ordenes"]) if f["ordenes"] is not None else None,
+            "anunciantes_activos": int(f["anunciantes_activos"]) if f["anunciantes_activos"] is not None else None,
+            "pct_enmascarado": float(f["pct_enmascarado"]) if f["pct_enmascarado"] is not None else None,
+            "presion_compra_pct": float(f["presion_compra_pct"]) if f["presion_compra_pct"] is not None else None,
+        })
+
+    if fmt == "csv":
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["fecha", "volumen_usdt", "ordenes", "anunciantes_activos",
+                    "pct_enmascarado", "presion_compra_pct"])
+        for s in salida:
+            w.writerow([s["fecha"], s["volumen_usdt"], s["ordenes"], s["anunciantes_activos"],
+                       s["pct_enmascarado"], s["presion_compra_pct"]])
+        return Response(buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename=volumen_mercado_{dias}d.csv"})
+    return jsonify({"serie": salida})
+
+
 @app.route("/api/velocidad_mercado")
 def api_velocidad_mercado():
     """Velocidad de rotacion del MERCADO desde fills confirmados.
@@ -10432,13 +10721,28 @@ def api_operativa():
     """ASISTENTE OPERATIVO — convierte las senales en una recomendacion:
     operar/esperar, precios asimetricos por presion de flujo, limites de
     orden segun ticket real, proyeccion por capital y vacios de liquidez.
-    Params: ?capital=USDT (default: config CAPITAL_OPERATIVO)."""
+    Params: ?capital=USDT (default: patrimonio REAL del inventario en vivo;
+    si no esta configurado, cae a CAPITAL_OPERATIVO)."""
     with config_lock:
         c = dict(config)
     try:
-        capital = float(request.args.get("capital", 0)) or float(c.get("CAPITAL_OPERATIVO", 2000))
+        capital = float(request.args.get("capital", 0))
     except (ValueError, TypeError):
-        capital = float(c.get("CAPITAL_OPERATIVO", 2000))
+        capital = 0.0
+    if not capital:
+        # COL40: el Asistente SIEMPRE llega hasta aca sin ?capital= (ningun
+        # caller del frontend lo manda), asi que hasta ahora esto usaba
+        # SIEMPRE el numero configurado a mano en vez de lo que Sebastian
+        # tiene de verdad -- la auditoria del 31-jul lo encontro desalineado
+        # (config 700 vs inventario real bien distinto).
+        try:
+            inv = api_inventario().get_json()
+            if inv.get("configurado") and inv.get("patrimonio_clp") and inv.get("precio_ref_actual"):
+                capital = float(inv["patrimonio_clp"]) / float(inv["precio_ref_actual"])
+        except Exception as e:
+            print(f"[operativa capital] {e}")
+        if not capital:
+            capital = float(c.get("CAPITAL_OPERATIVO", 2000))
     with data_lock:
         snap = dict(ultimo_estado)
     if not snap or snap.get("spread_pond_pct") is None:
@@ -11520,7 +11824,19 @@ def api_inventario_historial():
 
 @app.route("/api/inventario/ancla", methods=["POST"])
 def api_inventario_ancla():
-    """Fija los saldos REALES (la verdad). Devuelve el drift vs lo estimado."""
+    """Fija los saldos REALES (la verdad). Devuelve el drift vs lo estimado.
+
+    COL40: dos salvaguardas agregadas tras la auditoria del 31-jul, que
+    encontro un 51.517 USDT (typo de ~100x) cargado sin ningun chequeo.
+    - SALTO DE MAGNITUD: bloquea (409) si usdt o clp saltan 8x+ contra el
+      ancla anterior, salvo que venga confirmar=true. No es un limite fijo
+      en USDT/CLP (un deposito grande legitimo puede pasar cualquier techo
+      fijo) -- es un limite RELATIVO al ancla previa, que es lo que de verdad
+      distingue un typo de un movimiento real.
+    - DUPLICADO: solo avisa, nunca bloquea. El boton "Chequeo" invita a
+      re-anclar seguido a proposito, asi que dos valores parecidos en poco
+      tiempo puede ser el chequeo cumpliendo su funcion, no un error.
+    """
     if not _token_ok():
         return jsonify({"ok": False, "error": "token requerido o invalido"}), 401
     data = request.get_json() or {}
@@ -11533,6 +11849,45 @@ def api_inventario_ancla():
         return jsonify({"ok": False, "error": "los saldos no pueden ser negativos"}), 400
     precio = _precio_mid()
     now = datetime.now(SANTIAGO_TZ)
+
+    # verdad de terreno previa: alimenta el drift de siempre Y las dos
+    # salvaguardas nuevas. Una sola lectura para las tres cosas.
+    prev_row = None
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT ts, usdt, clp FROM inventario_ancla ORDER BY ts DESC LIMIT 1")
+                r = cur.fetchone()
+                if r:
+                    prev_row = {"ts": r["ts"], "usdt": float(r["usdt"]), "clp": float(r["clp"])}
+    except Exception as e:
+        print(f"[ancla prev] {e}")
+
+    UMBRAL_SALTO = 8.0
+    if prev_row and not data.get("confirmar"):
+        for campo, nuevo in (("usdt", usdt), ("clp", clp)):
+            anterior = prev_row[campo]
+            if anterior >= 1 and (nuevo / anterior >= UMBRAL_SALTO or nuevo / anterior <= 1 / UMBRAL_SALTO):
+                factor = round(nuevo / anterior, 1)
+                return jsonify({
+                    "ok": False, "requiere_confirmacion": True,
+                    "aviso": (f"{campo.upper()} pasa de {anterior:,.2f} a {nuevo:,.2f} "
+                              f"({factor}x) contra el ancla anterior — un salto asi suele ser "
+                              f"un typo, no un movimiento real. Si es correcto, guardá de nuevo para confirmar."),
+                }), 409
+
+    aviso_duplicado = None
+    if prev_row:
+        try:
+            minutos = (now - prev_row["ts"].replace(tzinfo=SANTIAGO_TZ)).total_seconds() / 60
+        except Exception:
+            minutos = None
+        cerca = (prev_row["usdt"] > 0 and prev_row["clp"] > 0
+                 and abs(usdt - prev_row["usdt"]) / prev_row["usdt"] < 0.005
+                 and abs(clp - prev_row["clp"]) / prev_row["clp"] < 0.005)
+        if minutos is not None and minutos < 5 and cerca:
+            aviso_duplicado = f"Casi los mismos valores que hace {round(minutos)} min — revisá que no sea una carga repetida."
+
     # dolar formal del momento (COL35): se lee de MEMORIA, no dispara red, asi
     # que si la fuente macro esta caida el ancla se guarda igual con NULL.
     fx_oficial = None
@@ -11563,7 +11918,8 @@ def api_inventario_ancla():
         print(f"[ancla] {e}")
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
     return jsonify({"ok": True, "usdt": usdt, "clp": clp,
-                    "precio_ref": round(precio, 2), "drift": drift})
+                    "precio_ref": round(precio, 2), "drift": drift,
+                    "aviso_duplicado": aviso_duplicado})
 
 
 @app.route("/api/inventario/movimiento", methods=["POST"])
