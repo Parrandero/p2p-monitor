@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL48"
+VERSION       = "COL47"
 VERSION_FECHA = "2026-08-04"
 
 config = {
@@ -4991,15 +4991,7 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel, sinGrafico }) 
     <div className="view">
       <AlertBanner snap={snap} />
       <C.DecisionHero snap={snap} />
-      {/* COL49 — se fueron dos cosas, por las notas de Sebastian (5-ago):
-          · <C.VelocityStrip>: "quitar velocidad de mercado antiguo". Era la
-            version vieja, previa a la tarjeta VelocidadMercado; mostraban lo
-            mismo y la de arriba no tenia ni el detalle ni el contexto.
-          · el grafico "Spread ponderado · ultimas N muestras": "quitar el
-            grafico de muestras del spread ponderado". El historico del
-            ponderado se mira, no se decide con el, y ya vive en la pestaña
-            Precio. Se va de las DOS vistas (antes solo la beta lo ocultaba
-            con sinGrafico, que por eso queda sin uso). */}
+      <C.VelocityStrip vel={vel} />
       <div className="market">
         <C.SideCard side="buy" snap={snap} history={history} />
         <C.BrechaSpine snap={snap} />
@@ -5007,6 +4999,30 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel, sinGrafico }) 
       </div>
       <C.MakerActions snap={snap} />
       <div className="tr-bottom">
+        {/* sinGrafico (COL36, beta): el historico del ponderado se mira, no se
+            decide con el — en la beta vive en la pestaña Precio y libera media
+            pantalla arriba. */}
+        {!sinGrafico && (
+        <section className="chart-card">
+          <div className="card-head">
+            <h3>Spread ponderado · últimas {history.length} muestras</h3>
+            <span className="card-sub">pasá el dedo para ver la hora</span>
+          </div>
+          <TimeChart
+            height={220}
+            yUnit="%"
+            times={history.map((h) => h.timestamp.slice(5, 16).replace("T", " "))}
+            series={[
+              { data: history.map((h) => h.spread_pond_pct), tone: "warn", label: "Spread ponderado", fill: true },
+              { data: history.map((h) => h.spread_pct), tone: "accent", label: "Spread puntual", dashed: true },
+            ]}
+            thresholds={[
+              { value: window.P2P.ALERTA_SPREAD, tone: "buy", label: "MUY APTO 0,8%" },
+              { value: window.P2P.SPREAD_MINIMO, tone: "warn-low", label: "APTO 0,2%" },
+            ]}
+          />
+        </section>
+        )}
         <C.TopTraders snap={snap} />
       </div>
       {showOrderBook && <OrderBook snap={snap} />}
@@ -7366,20 +7382,13 @@ function SystemBar({ snapTs }) {
 }
 
 function VolumenBar() {
-  /* COL49 \u2014 rehecho segun las notas de Sebastian (5-ago):
-     \u00b7 SE FUE LA v1. Se mostraban las dos estimaciones (caidas crudas y fills
-       confirmados) una debajo de la otra para poder compararlas mientras la
-       v2 se validaba. Ya validada, tener las dos al lado solo confunde: la
-       buena es la v2 (fills confirmados, con anti-reposicion).
-     \u00b7 VERTICAL en vez de horizontal: las ventanas (hoy/1h/4h/24h) van como
-       FILAS y los exchanges como COLUMNAS. Antes cada exchange era una fila
-       larga con scroll horizontal \u2014 imposible de comparar Binance contra
-       Bybit de un vistazo, que es justo para lo que sirve. */
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [v, setV] = React.useState(null);
   const [v2, setV2] = React.useState(null);
   React.useEffect(() => {
     let stop = false;
     const load = () => {
+      fetch(B + "/api/volumen").then(r => r.json()).then(d => { if (!stop) setV(d); }).catch(() => {});
       fetch(B + "/api/volumen_v2").then(r => r.json()).then(d => { if (!stop) setV2(d); }).catch(() => {});
     };
     load();
@@ -7387,66 +7396,41 @@ function VolumenBar() {
     return () => { stop = true; clearInterval(id); };
   }, []);
   const fmt = (x) => x == null ? "\u2014" : Number(x).toLocaleString("es-CL");
-  const chgTag = (p) => p == null ? null :
-    <b style={{ color: p >= 0 ? "var(--buy)" : "var(--sell)", fontSize: 10, marginLeft: 4 }}>
-      {p >= 0 ? "\u25b2" : "\u25bc"}{Math.abs(p)}%</b>;
-  if (!v2) return null;
-  const bn = v2.binance, by = v2.bybit;
-  if (!bn && !by) return null;
+  const chgTag = (p) => p == null ? <span style={{ color: "var(--text-3)" }}>\u2014</span> :
+    <b style={{ color: p >= 0 ? "var(--buy)" : "var(--sell)" }}>{p >= 0 ? "\u25b2" : "\u25bc"}{Math.abs(p)}%</b>;
+  if (!v) return null;
 
-  const VENTANAS = [
-    ["hoy",  "hoy",      null,             "Acumulado desde las 00:00 de hoy (hora Chile). Vuelve a CERO a la medianoche."],
-    ["1h",   "hora",     "cambio_1h_pct",  "Ventana m\u00f3vil: \u00faltimos 60 min. La flecha compara contra los 60 min anteriores."],
-    ["4h",   "vol_4h",   "cambio_4h_pct",  "Ventana m\u00f3vil: \u00faltimas 4 horas."],
-    ["24h",  "vol_24h",  "cambio_24h_pct", "Ventana m\u00f3vil: \u00faltimas 24 horas."],
-  ];
-  const celda = (d, campo, campoChg) => (
-    <td className="tnum" style={{ textAlign: "right", padding: "2px 10px", whiteSpace: "nowrap" }}>
-      {!d ? <span style={{ color: "var(--text-3)" }}>\u2014</span> : <>
-        <b style={{ color: "var(--text)" }}>{fmt(d[campo])}</b>
-        {campoChg && chgTag(d[campoChg])}
+  const fila = (nombre, d) => (
+    <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "nowrap", whiteSpace: "nowrap", overflowX: "auto" }}>
+      <span style={{ width: 60, flexShrink: 0, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.06em", fontSize: 10, fontWeight: 600 }}>{nombre}</span>
+      {!d ? <span style={{ color: "var(--text-3)" }}>sin datos a\u00fan</span> : <>
+        <span style={{ flexShrink: 0 }} title="Acumulado desde las 00:00 de hoy (hora Chile). Se pone en CERO a la medianoche.">Hoy: <b style={{ color: "var(--text)" }}>{fmt(d.hoy)}</b></span>
+        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimos 60 min. La flecha compara contra los 60 min anteriores.">1h: <b style={{ color: "var(--text)" }}>{fmt(d.hora)}</b> {chgTag(d.cambio_1h_pct)}</span>
+        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimas 4 horas.">4h: <b style={{ color: "var(--text)" }}>{fmt(d.vol_4h)}</b> {chgTag(d.cambio_4h_pct)}</span>
+        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimas 24 horas.">24h: <b style={{ color: "var(--text)" }}>{fmt(d.vol_24h)}</b> {chgTag(d.cambio_24h_pct)}</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+          Presi\u00f3n:
+          <span style={{ width: 90, height: 7, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block" }}>
+            <span style={{ display: "block", height: "100%", width: d.presion_compra_pct + "%", background: "var(--buy)" }}></span>
+          </span>
+          <b style={{ color: "var(--buy)" }}>{fmt(d.presion_compra_pct)}%</b> <span style={{ color: "var(--text-3)" }}>compran</span>
+        </span>
       </>}
-    </td>
+    </div>
   );
 
   return (
-    <div style={{ margin: "8px 0 0", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", fontSize: 12, color: "var(--text-2)", fontVariantNumeric: "tabular-nums" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+    <div style={{ margin: "8px 0 0", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", fontSize: 12, color: "var(--text-2)", fontVariantNumeric: "tabular-nums", display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Volumen USDT \u00b7 estimaci\u00f3n</span>
-        <span title="Estimacion propia del tope del libro (no dato oficial), por fills confirmados. Sirve para la TENDENCIA, no para el USDT exacto. Ya descuenta el ruido de reposicion de avisos." style={{ color: "var(--text-3)", cursor: "help" }}>\u24d8</span>
+        <span title="Estimacion propia del tope del libro (no dato oficial). Sirve para la TENDENCIA (sube/baja), no para el USDT exacto. Ya descuenta el ruido de reposicion de avisos." style={{ color: "var(--text-3)", cursor: "help" }}>\u24d8</span>
       </div>
-      <table style={{ borderCollapse: "collapse" }}>
-        <thead><tr style={{ color: "var(--text-3)", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>
-          <th style={{ textAlign: "left", padding: "2px 10px 2px 0", fontWeight: 600 }}></th>
-          <th style={{ textAlign: "right", padding: "2px 10px", fontWeight: 600 }}>Binance</th>
-          <th style={{ textAlign: "right", padding: "2px 10px", fontWeight: 600 }}>Bybit</th>
-        </tr></thead>
-        <tbody>{VENTANAS.map(([etq, campo, chg, ayuda]) => (
-          <tr key={etq}>
-            <td title={ayuda} style={{ cursor: "help", color: "var(--text-2)", padding: "2px 10px 2px 0", fontWeight: 600 }}>{etq}</td>
-            {celda(bn, campo, chg)}
-            {celda(by, campo, chg)}
-          </tr>
-        ))}
-        <tr>
-          <td style={{ color: "var(--text-2)", padding: "4px 10px 2px 0", fontWeight: 600 }} title="Qu\u00e9 parte del volumen fue gente COMPRANDO USDT.">presi\u00f3n</td>
-          {[bn, by].map((d, i) => (
-            <td key={i} style={{ padding: "4px 10px 2px", textAlign: "right", whiteSpace: "nowrap" }}>
-              {!d ? <span style={{ color: "var(--text-3)" }}>\u2014</span> : (
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
-                  <span style={{ width: 60, height: 6, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block" }}>
-                    <span style={{ display: "block", height: "100%", width: d.presion_compra_pct + "%", background: "var(--buy)" }}></span>
-                  </span>
-                  <b style={{ color: "var(--buy)", fontSize: 11 }}>{fmt(d.presion_compra_pct)}%</b>
-                </span>
-              )}
-            </td>
-          ))}
-        </tr>
-        </tbody>
-      </table>
-      {bn && <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
-        {fmt(bn.ordenes_hoy)} \u00f3rdenes hoy \u00b7 ticket medio {fmt(bn.ticket_med_hoy)} USDT \u00b7 {fmt(bn.pct_enmascarado_hoy)}% estimado por recarga
+      {fila("Binance", v.binance)}
+      {v2 && v2.binance && fila("BN v2 \u2713", v2.binance)}
+      {fila("Bybit", v.bybit)}
+      {v2 && v2.bybit && fila("BY v2 \u2713", v2.bybit)}
+      {v2 && v2.binance && <div style={{ fontSize: 10, color: "var(--text-3)" }}>
+        v2 = fills confirmados \u00b7 {fmt(v2.binance.ordenes_hoy)} \u00f3rdenes hoy \u00b7 ticket medio {fmt(v2.binance.ticket_med_hoy)} USDT \u00b7 {fmt(v2.binance.pct_enmascarado_hoy)}% estimado por recarga
       </div>}
     </div>
   );
@@ -8038,82 +8022,28 @@ function CarreraMerchant() {
   );
 }
 
-function CalibracionCard() {
-  /* COL49 — sacada de adentro de "Carrera al verificado" (nota de Sebastian:
-     "individualizar tarjeta de calibracion"). Vivia colgada abajo de un panel
-     que hablaba de otra cosa; es un tema propio — cuanto le podes creer al
-     monitor — y merece su propia tarjeta. */
+function MiCampania() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
   const [cal, setCal] = React.useState(null);
   React.useEffect(() => {
     let stop = false;
-    const load = () => fetch(B + "/api/calibracion").then(r => r.json())
-      .then(j => { if (!stop) setCal(j); }).catch(() => {});
-    load();
-    const id = setInterval(load, 60000);
-    return () => { stop = true; clearInterval(id); };
-  }, []);
-  if (!cal || !cal.resumen || !cal.resumen.ordenes_maker_reales) return null;
-  const r = cal.resumen;
-  const fmt = (x) => x == null ? "—" : Number(x).toLocaleString("es-CL");
-  const boxSt = { flex: 1, minWidth: 165, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" };
-  const lbl = { fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" };
-  const val = { fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)", margin: "3px 0 1px", fontVariantNumeric: "tabular-nums" };
-  const sub = { fontSize: 10.5, color: "var(--text-3)" };
-  return (
-    <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderLeft: "4px solid var(--text-3)", borderRadius: 14, padding: "13px 16px" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
-        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Calibración · realidad vs monitor</span>
-        <span title={cal.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
-        <span style={{ fontSize: 10.5, color: "var(--text-3)" }}>últimos {r.dias} días · solo órdenes maker</span>
-      </div>
-      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-        <div style={boxSt}>
-          <div style={lbl}>Detección</div>
-          <div style={val}>{fmt(r.ordenes_detectadas)}/{fmt(r.ordenes_maker_reales)}</div>
-          <div style={sub}>{r.tasa_deteccion_pct != null ? fmt(r.tasa_deteccion_pct) + "% de tus órdenes vistas" : "—"}</div>
-        </div>
-        <div style={boxSt}>
-          <div style={lbl}>Volumen real vs estimado</div>
-          <div style={val}>{fmt(r.usdt_real)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>vs</span> {fmt(r.usdt_monitor)}</div>
-          <div style={{ ...sub, color: r.error_pct == null ? "var(--text-3)" : Math.abs(r.error_pct) <= 5 ? "var(--buy)" : "var(--warn)" }}>
-            {r.error_pct == null ? "—" : (r.error_pct > 0 ? "+" : "") + fmt(r.error_pct) + "% de error"}
-          </div>
-        </div>
-        <div style={boxSt}>
-          <div style={lbl}>Latencia de detección</div>
-          <div style={val}>{r.latencia_media_min != null ? fmt(r.latencia_media_min) + " min" : "—"}</div>
-          <div style={sub}>demora en confirmarte una orden</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function MisAnuncios() {
-  /* COL49 — era "MiCampania"/"Carrera al verificado". Nota de Sebastian:
-     "quitar la tarjeta de carrera al verificado, esta demas vs. el nuevo que
-     pusimos con los datos oficiales".
-     LO QUE SE FUE: las barras de progreso (Ordenes 30d "meta 300" y Volumen
-     30d). Estaban duplicadas contra CarreraMerchant (COL36) y ademas con la
-     meta EQUIVOCADA — 300 ordenes no es un requisito de Binance, ya se habia
-     corregido en /api/merchant pero esta tarjeta seguia mostrando el numero
-     viejo. Dos paneles con metas distintas para lo mismo.
-     LO QUE SE QUEDA: donde estan parados MIS anuncios (posicion, precio,
-     stock, si estoy en el top objetivo). Eso NO lo muestra CarreraMerchant y
-     borrarlo hubiera sido perder lo unico util que tenia la tarjeta. */
-  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
-  const [d, setD] = React.useState(null);
-  React.useEffect(() => {
-    let stop = false;
-    const load = () => fetch(B + "/api/mi_posicion").then(r => r.json())
-      .then(j => { if (!stop) setD(j); }).catch(() => {});
+    const load = () => {
+      fetch(B + "/api/mi_posicion").then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
+      fetch(B + "/api/calibracion").then(r => r.json()).then(j => { if (!stop) setCal(j); }).catch(() => {});
+    };
     load();
     const id = setInterval(load, 60000);
     return () => { stop = true; clearInterval(id); };
   }, []);
   if (!d || !d.configurado) return null;
   const fmt = (x) => x == null ? "—" : Number(x).toLocaleString("es-CL");
+  const pr = d.progreso || {};
+  const bar = (pct, tone) => (
+    <div className="hbar" style={{ marginTop: 5 }}>
+      <div className="hbar-fill" style={{ width: Math.min(100, pct || 0) + "%", background: tone }} />
+    </div>
+  );
   const boxSt = { flex: 1, minWidth: 170, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" };
   const lbl = { fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" };
   const val = { fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)", margin: "3px 0 1px", fontVariantNumeric: "tabular-nums" };
@@ -8140,13 +8070,54 @@ function MisAnuncios() {
   return (
     <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderLeft: "4px solid var(--accent)", borderRadius: 14, padding: "13px 16px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
-        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Mis anuncios en el libro</span>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Carrera al verificado</span>
         <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--accent)", fontWeight: 600 }}>{d.nick}</span>
+        <span title={d.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
         {!d.en_libro && <span style={{ fontSize: 11, color: "var(--text-3)" }}>· no aparecés en el libro ahora</span>}
       </div>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
         {(d.anuncios || []).map(adBox)}
+        <div style={boxSt}>
+          <div style={lbl}>Órdenes 30d (meta 300)</div>
+          <div style={val}>{fmt(pr.ordenes_30d)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>/ 300</span></div>
+          {bar(pr.ordenes_pct, "var(--accent)")}
+          <div style={sub}>{pr.ordenes_ganadas_7d != null ? "+" + fmt(pr.ordenes_ganadas_7d) + " esta semana" : "contador oficial de Binance"}</div>
+        </div>
+        <div style={boxSt}>
+          <div style={lbl}>Volumen 30d estimado</div>
+          <div style={val}>{fmt(pr.vol_30d_estimado)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span></div>
+          {bar(pr.vol_pct_minima, "var(--buy)")}
+          <div style={sub}>{fmt(pr.vol_pct_minima)}% de 0,5 BTC (mínimo) · {fmt(pr.vol_pct_comoda)}% de 1 BTC</div>
+        </div>
       </div>
+      {cal && cal.resumen && cal.resumen.ordenes_maker_reales > 0 && (
+        <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--line-soft)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+            <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Calibración · realidad vs monitor</span>
+            <span title={cal.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
+            <span style={{ fontSize: 10.5, color: "var(--text-3)" }}>últimos {cal.resumen.dias} días · solo órdenes maker</span>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <div style={boxSt}>
+              <div style={lbl}>Detección</div>
+              <div style={val}>{fmt(cal.resumen.ordenes_detectadas)}/{fmt(cal.resumen.ordenes_maker_reales)}</div>
+              <div style={sub}>{cal.resumen.tasa_deteccion_pct != null ? fmt(cal.resumen.tasa_deteccion_pct) + "% de tus órdenes vistas" : "—"}</div>
+            </div>
+            <div style={boxSt}>
+              <div style={lbl}>Volumen real vs estimado</div>
+              <div style={val}>{fmt(cal.resumen.usdt_real)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>vs</span> {fmt(cal.resumen.usdt_monitor)}</div>
+              <div style={{ ...sub, color: cal.resumen.error_pct == null ? "var(--text-3)" : Math.abs(cal.resumen.error_pct) <= 5 ? "var(--buy)" : "var(--warn)" }}>
+                {cal.resumen.error_pct == null ? "—" : (cal.resumen.error_pct > 0 ? "+" : "") + fmt(cal.resumen.error_pct) + "% de error"}
+              </div>
+            </div>
+            <div style={boxSt}>
+              <div style={lbl}>Latencia de detección</div>
+              <div style={val}>{cal.resumen.latencia_media_min != null ? fmt(cal.resumen.latencia_media_min) + " min" : "—"}</div>
+              <div style={sub}>demora en confirmarte una orden</div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -8345,14 +8316,111 @@ function BarraBalance({ pct, banda }) {
    Hoy) y 'card' (completo, junto al inventario). Si el backend no tiene dato
    todavia o la fuente esta caida, NO renderiza nada en vez de mostrar un
    hueco roto — es contexto, no puede ensuciar la pantalla. */
-/* MacroBar (la tarjeta "Contexto de mercado") SE BORRO EN COL49.
-   Nota de Sebastian (5-ago): "todavia no me convence ni lo utilizo".
-   OJO — lo que se fue es SOLO la tarjeta. El dato macro se sigue
-   recolectando (ciclo_colector_macro, /api/macro, snapshots_macro con los
-   6 meses que se rellenaron en COL45) y sigue alimentando el aviso de
-   desfase dolar->P2P que el Asistente muestra desde COL41, que es la forma
-   util del mismo dato. Si alguna vez se quiere la tarjeta de vuelta, esta
-   entera en versiones_app/app_p2p_monitor_COL48.py. */
+function MacroBar({ modo }) {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [m, setM] = React.useState(null);
+  React.useEffect(() => {
+    const load = () => fetch(B + "/api/macro").then(r => r.json()).then(setM).catch(() => {});
+    load();
+    const id = setInterval(load, 300000);   // 5 min: el dato de fondo cambia cada 15
+    return () => clearInterval(id);
+  }, []);
+  if (!m || !m.disponible) return null;
+
+  const nf = (v, d) => v == null ? "—" : Number(v).toLocaleString("es-CL", { minimumFractionDigits: d, maximumFractionDigits: d });
+  const flecha = (v) => v == null ? "" : v > 0 ? "▲" : v < 0 ? "▼" : "=";
+  const tono = (v, invertido) => {
+    if (v == null) return "var(--text-3)";
+    const bueno = invertido ? v < 0 : v > 0;
+    return Math.abs(v) < 0.05 ? "var(--text-3)" : bueno ? "var(--buy)" : "var(--sell)";
+  };
+  // VIX al reves: que SUBA es senal de miedo/volatilidad, no algo "bueno"
+  const items = [
+    { k: "Dólar forex", v: nf(m.usdclp_forex, 2), var: m.usdclp_forex_var_pct, inv: false,
+      t: "USD/CLP en el mercado formal (Yahoo Finance). El P2P suele seguirlo con retardo." },
+    { k: "VIX", v: nf(m.vix, 2), var: m.vix_var_pct, inv: true,
+      t: "Índice de miedo del mercado. Si sube fuerte, suele venir volatilidad." },
+    { k: "Cobre", v: nf(m.cobre, 3), var: m.cobre_var_pct, inv: false,
+      t: "Futuro del cobre (COMEX), en USD/libra. Chile exporta cobre: si sube, el peso tiende a fortalecerse (dólar baja)." },
+  ];
+
+  if (modo === "chip") {
+    return (
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center",
+                    fontSize: 11, color: "var(--text-2)", margin: "6px 0 0" }}>
+        {items.map(it => (
+          <span key={it.k} title={it.t} style={{ cursor: "help" }}>
+            {it.k} <b style={{ fontFamily: "var(--mono)", color: "var(--text)" }}>{it.v}</b>
+            {it.var != null && <span style={{ color: tono(it.var, it.inv) }}> {flecha(it.var)}{Math.abs(it.var)}%</span>}
+          </span>
+        ))}
+        {m.brecha_pct != null && (
+          <span title="Cuánto está el P2P por encima del dólar formal. Es la prima que paga el mercado cripto." style={{ cursor: "help" }}>
+            brecha P2P <b style={{ fontFamily: "var(--mono)", color: "var(--warn)" }}>{nf(m.brecha_pct, 2)}%</b>
+          </span>
+        )}
+        {m.desfase && m.desfase.senal && (
+          <span title={m.desfase.mensaje} style={{ cursor: "help", fontWeight: 600,
+                       color: m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)" }}>
+            {m.desfase.senal === "SUBE" ? "↗" : "↘"} P2P retrasado {Math.abs(m.desfase.pendiente_pct)}%
+          </span>
+        )}
+        {m.viejo && <span style={{ color: "var(--sell)" }} title={"Último dato hace " + m.edad_min + " min: la fuente externa no está respondiendo."}>⚠ dato viejo</span>}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
+      <div style={{ display: "flex", alignItems: "baseline", marginBottom: 8 }}>
+        <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Contexto de mercado</div>
+        <div style={{ marginLeft: "auto", fontSize: 10, color: m.viejo ? "var(--sell)" : "var(--text-3)" }}>
+          {m.viejo ? "⚠ sin actualizar hace " + m.edad_min + " min" : "hace " + m.edad_min + " min"}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {items.map(it => (
+          <div key={it.k} title={it.t} style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)",
+                                                borderRadius: 9, padding: "8px 12px", minWidth: 105, cursor: "help" }}>
+            <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase" }}>{it.k}</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 16, fontWeight: 600 }}>{it.v}</div>
+            {it.var != null && <div style={{ fontSize: 10.5, color: tono(it.var, it.inv) }}>{flecha(it.var)} {Math.abs(it.var)}% vs cierre previo</div>}
+          </div>
+        ))}
+        {m.brecha_pct != null && (
+          <div title="El P2P contra el dólar formal. Este es el número para anotar como precio de referencia en la bitácora."
+               style={{ background: "var(--warn-soft)", border: "1px solid var(--warn)", borderRadius: 9,
+                        padding: "8px 12px", minWidth: 115, cursor: "help" }}>
+            <div style={{ fontSize: 10, color: "var(--warn)", textTransform: "uppercase" }}>Brecha P2P</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 16, fontWeight: 600, color: "var(--warn)" }}>{nf(m.brecha_pct, 2)}%</div>
+            <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>P2P ${nf(m.p2p_ref, 2)} vs forex ${nf(m.usdclp_forex, 2)}</div>
+          </div>
+        )}
+      </div>
+      {m.desfase && m.desfase.senal && (
+        <div style={{ marginTop: 9, padding: "9px 12px", borderRadius: 9,
+                      background: m.desfase.senal === "SUBE" ? "var(--buy-soft)" : "var(--sell-soft)",
+                      border: "1px solid " + (m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)") }}>
+          <div style={{ fontSize: 11.5, fontWeight: 600, marginBottom: 3,
+                        color: m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)" }}>
+            {m.desfase.senal === "SUBE" ? "↗ El P2P viene retrasado hacia arriba" : "↘ El P2P quedó adelantado"}
+          </div>
+          <div style={{ fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.5 }}>{m.desfase.mensaje}</div>
+          <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
+            forex {m.desfase.fx_var_pct > 0 ? "+" : ""}{m.desfase.fx_var_pct}% · P2P {m.desfase.p2p_var_pct > 0 ? "+" : ""}{m.desfase.p2p_var_pct}% · ventana {m.desfase.ventana_min} min
+          </div>
+        </div>
+      )}
+      <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 7, lineHeight: 1.5 }}>
+        El P2P sigue al mercado formal con <b>retardo</b>, y eso está <b>medido</b>: el cambio del dólar forex
+        correlaciona <b>+0,46</b> con el cambio del P2P de la hora siguiente (en la misma hora: +0,06; en el
+        sentido inverso: +0,03 — o sea, el forex va primero). Indica <b>dirección probable, no magnitud garantizada</b>.
+        <br/>El <b>precio de referencia</b> de arriba es el que conviene anotar en la bitácora al anclar saldos.
+        <span style={{ color: "var(--text-3)" }}> Ojo: el cobre resultó mucho más débil (−0,16) que el dólar — probablemente te sirve porque mueve al dólar, no directo.</span>
+      </div>
+    </div>
+  );
+}
 
 function InventarioCard() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
@@ -8914,7 +8982,7 @@ function CalculadoraCruzar() {
   );
 }
 
-window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MisAnuncios, CalibracionCard, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
+window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, MacroBar, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
 
 </script>
 <script type="text/babel">
@@ -9011,8 +9079,8 @@ function App() {
               <V.ChipBalance />
               <V.InventarioCard />
             </div>
-            <div className="bc-6"><V.MisAnuncios /></div>
-            <div className="bc-6"><V.CalibracionCard /></div>
+            <div className="bc-6"><V.MacroBar modo="card" /></div>
+            <div className="bc-6"><V.MiCampania /></div>
             <div className="bc-12"><V.VelocidadMercado /></div>
             <div className="bc-12"><V.CalculadoraCruzar /></div>
             <div className="bc-12">
@@ -9022,13 +9090,13 @@ function App() {
           </div>
         )}
         {tab === "tr" && !beta && <V.PlanHoy />}
+        {tab === "tr" && !beta && <V.MacroBar modo="card" />}
         {tab === "tr" && !beta && <V.ChipBalance />}
         {tab === "tr" && !beta && <V.EstrategiaPanel />}
-        {tab === "tr" && !beta && <V.MisAnuncios />}
+        {tab === "tr" && !beta && <V.MiCampania />}
         {tab === "tr" && !beta && <V.CarreraMerchant />}
         {tab === "tr" && !beta && <V.InventarioCard />}
         {tab === "tr" && !beta && <V.AsistenteOperativo />}
-        {tab === "tr" && !beta && <V.CalibracionCard />}
         {tab === "tr" && !beta && <V.CalculadoraCruzar />}
         {tab === "tr" && !beta && <V.VelocidadMercado />}
         {tab === "tr" && !beta && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
