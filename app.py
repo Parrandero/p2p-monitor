@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL50"
+VERSION       = "COL51"
 VERSION_FECHA = "2026-08-05"
 
 config = {
@@ -2909,7 +2909,13 @@ body {
 }
 .tnum { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
 
-.app { max-width: 1320px; margin: 0 auto; padding: 0 clamp(12px, 3vw, 28px) 40px; }
+/* COL51 — ANCHO REAL DE LA PANTALLA.
+   Estaba clavado en 1320px. Sebastian trabaja en un monitor de 30" (~2560px):
+   la MITAD de la pantalla era margen vacio por diseño, y ninguna
+   reorganizacion de tarjetas lo iba a arreglar. 2100px deja usar el monitor
+   grande sin que en una pantalla 4K las lineas de texto se vuelvan
+   ilegibles de tan largas. */
+.app { max-width: 2100px; margin: 0 auto; padding: 0 clamp(12px, 2vw, 28px) 40px; }
 .loading { display: grid; place-items: center; height: 80vh; color: var(--text-3); font-family: var(--mono); }
 
 /* ---------- TopBar ---------- */
@@ -4593,6 +4599,14 @@ function DecisionHero({ snap }) {
 }
 
 /* ---------- Side card (compra / venta) ---------- */
+/* SideCard — SIN USO desde COL51, a proposito y no por descuido.
+   Eran las dos tarjetas grandes de precio (una por lado) que ocupaban media
+   pantalla para mostrar 4 numeros; se reemplazaron por PreciosCompactos, la
+   tira fina. Se deja definida y registrada en window.P2PCore porque el
+   cambio es de gusto visual, no de datos: si Sebastian prefiere volver a las
+   tarjetas grandes, alcanza con reponer la fila .market en TiempoReal.
+   Aparece en el chequeo de huerfanos — es esperado, no la borres pensando
+   que se colo. */
 function SideCard({ side, snap, history }) {
   const isBuy = side === "buy";
   const tone = isBuy ? "buy" : "sell";
@@ -5104,11 +5118,15 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel, sinGrafico }) 
             ponderado se mira, no se decide con el, y ya vive en la pestaña
             Precio. Se va de las DOS vistas (antes solo la beta lo ocultaba
             con sinGrafico, que por eso queda sin uso). */}
-      <div className="market">
-        <C.SideCard side="buy" snap={snap} history={history} />
-        <C.BrechaSpine snap={snap} />
-        <C.SideCard side="sell" snap={snap} history={history} />
-      </div>
+      {/* COL51 — las DOS tarjetas grandes de precio se reemplazan por la tira
+          compacta. Sebastian: "hay mucha información [...] empecemos a
+          simplificar" y "se ve mucho espacio desperdiciado". Las SideCard
+          ocupaban media pantalla para mostrar 4 números que entran en una
+          línea. PreciosCompactos ya existía (COL36) justamente para esto,
+          pero solo se usaba en /beta. La brecha queda debajo, que es el
+          número que sí conviene destacar. */}
+      <PreciosCompactos snap={snap} />
+      <C.BrechaSpine snap={snap} />
       <C.MakerActions snap={snap} />
       <div className="tr-bottom">
         <C.TopTraders snap={snap} />
@@ -9136,47 +9154,45 @@ function App() {
       <V.VolumenBar />
       {tab !== "backup" && <V.RutinasPanel onGoBackup={() => setTab("backup")} />}
       <main className="content">
-        {/* ── LAYOUT BETA (COL36): grilla en vez de pila ──────────────
-            Mismos componentes, otra disposicion. Objetivo: que lo que se
-            decide MIRANDO entre en la primera pantalla. El grafico historico
-            del ponderado se saca de aca (vive en la pestaña Precio) y el
-            libro/listas quedan al final, que es donde se consultan, no donde
-            se decide. */}
-        {tab === "tr" && beta && (
+        {/* ── LAYOUT UNICO EN GRILLA (COL51) ────────────────────────────
+            ANTES habia DOS disposiciones: la ruta normal apilaba TODO en una
+            columna y la grilla vivia solo en /beta. Sebastian trabaja en la
+            ruta normal, en un monitor de 30" — o sea que veia una tira
+            vertical dentro de una franja de 1320px, con media pantalla
+            vacia, y tenia que pasar por DIEZ tarjetas para llegar a los
+            precios. Ahora hay una sola disposicion, en grilla, para las dos
+            rutas.
+            EL ORDEN LO ELIGIO EL: velocidad de mercado, precio ponderado,
+            punteros y brecha son lo que mira sin querer bajar. Los tres
+            ultimos viven adentro de TiempoReal, asi que TiempoReal SUBE al
+            tope — antes se renderizaba ultimo. */}
+        {tab === "tr" && (
           <div className="beta-grid">
-            <div className="bc-12"><V.PreciosCompactos snap={viewSnap} /></div>
+            {/* fila 1: lo que se mira sin bajar */}
+            <div className="bc-12">
+              <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
+                filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} sinGrafico />
+            </div>
+            <div className="bc-12"><V.VelocidadMercado /></div>
+            {/* fila 2: que hacer ahora */}
             <div className="bc-7">
               <V.PlanHoy />
               <V.EstrategiaRapida />
             </div>
             <div className="bc-5"><V.AsistenteOperativo /></div>
-            <div className="bc-7"><V.CarreraMerchant /></div>
+            {/* fila 3: como voy */}
             <div className="bc-5">
               <V.ChipBalance />
               <V.InventarioCard />
             </div>
+            <div className="bc-7"><V.CarreraMerchant /></div>
+            {/* fila 4: consulta, no decision */}
             <div className="bc-6"><V.MisAnuncios /></div>
             <div className="bc-6"><V.CalibracionCard /></div>
-            <div className="bc-12"><V.VelocidadMercado /></div>
             <div className="bc-12"><V.CalculadoraCruzar /></div>
-            <div className="bc-12">
-              <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
-                filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} sinGrafico />
-            </div>
+            {!beta && <div className="bc-12"><V.EstrategiaPanel /></div>}
           </div>
         )}
-        {tab === "tr" && !beta && <V.PlanHoy />}
-        {tab === "tr" && !beta && <V.ChipBalance />}
-        {tab === "tr" && !beta && <V.EstrategiaPanel />}
-        {tab === "tr" && !beta && <V.MisAnuncios />}
-        {tab === "tr" && !beta && <V.CarreraMerchant />}
-        {tab === "tr" && !beta && <V.InventarioCard />}
-        {tab === "tr" && !beta && <V.AsistenteOperativo />}
-        {tab === "tr" && !beta && <V.CalibracionCard />}
-        {tab === "tr" && !beta && <V.CalculadoraCruzar />}
-        {tab === "tr" && !beta && <V.VelocidadMercado />}
-        {tab === "tr" && !beta && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
-          filters={{ cfg: filters, onApply: applyFilters, info: viewSnap._filtro }} />}
         {tab === "hist" && <V.Historico history={history} />}
         {tab === "precio" && <V.PrecioChart />}
         {tab === "intel" && <V.Inteligencia />}
