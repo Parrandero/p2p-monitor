@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL48"
-VERSION_FECHA = "2026-08-04"
+VERSION       = "COL50"
+VERSION_FECHA = "2026-08-05"
 
 config = {
     "MONEDA":               "USDT",
@@ -36,6 +36,12 @@ config = {
     # arranca), Plata -30% → 0.28% (>6 BTC/mes), Oro -50% → 0.20% (>60 BTC/mes).
     # Al verificarse (Bronce): cambiar COMISION_BN a 0.0016 desde el panel/API.
     "COMISION_BN":          0.002,   # por pierna (0.2% maker CLP, no verificado)
+    # Comision IDA Y VUELTA una vez verificado, en % (COL50). El descuento es
+    # POR NIVEL: Bronce -20% -> 0,32% (donde se arranca al verificarse),
+    # Plata -30% -> 0,28% (>6 BTC/mes), Oro -50% -> 0,20% (>60 BTC/mes).
+    # Se usa para mostrar la brecha NETA "como verificado" al lado de la de
+    # hoy: Sebastian esta a semanas de eso y es el numero con el que decide.
+    "COMISION_VERIFICADO_RT": 0.32,
     "COM_BYBIT_MAKER":      0.0,     # Bybit CLP: sin comision al publicar
     # BORRADAS en COL43: COM_BINANCE_MAKER, COM_BINANCE_TAKER, COM_BYBIT_TAKER
     # y COSTO_TRANSFER_USDT. Ninguna se leia en el codigo (COMISION_BN es la
@@ -203,6 +209,7 @@ CONFIG_TYPE_MAP = {
     "DETALLE_DIAS":         int,
     "INTERVALO_MIN":        int,
     "COMISION_BN":          float,
+    "COMISION_VERIFICADO_RT": float,
     "SPREAD_MIN_OPERATIVO": float,
     "ALERTA_SPREAD":        float,
     "SPREAD_MINIMO":        float,
@@ -4646,13 +4653,51 @@ function SideCard({ side, snap, history }) {
 
 /* ---------- Center spine: brecha ---------- */
 function BrechaSpine({ snap }) {
+  /* COL50 — compactado. Nota de Sebastian (5-ago): "es como muy grande,
+     podría ser más chico [...] el spread ponderado pasa a un segundo plano,
+     porque el semáforo va a ser las brechas entre los competidores con
+     órdenes mínimas [...] los tres valores son los que se necesita".
+     Los tres:
+       1. ponderado  — promedia TODO el libro, incluida la basura que nunca
+                       vas a poder tomar. Queda como referencia, chico.
+       2. punteros   — vendedor más barato vs comprador más caro, ya
+                       filtrando avisos muertos. Es el margen tomable de
+                       verdad, y por eso va destacado.
+       3. neto       — el mismo, menos comisión. Se muestra COMO VERIFICADO
+                       (0,32% RT) porque es el número con el que decide: está
+                       a semanas de eso. La de hoy va en el tooltip. */
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [sp, setSp] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/punteros").then(r => r.json())
+      .then(j => { if (!stop) setSp(j && j.spread_punteros); }).catch(() => {});
+    load();
+    const id = setInterval(load, 15000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  const neto = sp && sp.neto_verificado_pct;
+  const tono = neto == null ? "var(--text-3)"
+             : neto >= 0.15 ? "var(--buy)" : neto >= 0 ? "var(--warn)" : "var(--sell)";
   return (
     <div className="spine">
       <div className="spine-line" />
-      <div className="spine-pill">
-        <div className="spine-label">Brecha</div>
-        <div className="spine-val tnum">{fP(snap.spread_pond_abs)}</div>
-        <div className="spine-pct tnum">{fPc(snap.spread_pond_pct)}</div>
+      <div className="spine-pill" style={{ padding: "6px 10px" }}>
+        <div className="spine-label" title="Promedio de TODO el libro, incluidos avisos que no podrías tomar. Referencia, no operativo.">
+          pond. <b className="tnum" style={{ color: "var(--text-2)" }}>{fPc(snap.spread_pond_pct)}</b>
+        </div>
+        {sp ? <>
+          <div className="spine-val tnum" style={{ fontSize: 17, margin: "1px 0" }}
+            title={"Vendedor más barato $" + sp.venta + " vs comprador más caro $" + sp.compra + ", ya filtrando avisos muertos. Es el margen realmente tomable."}>
+            {fPc(sp.bruto_pct)}
+          </div>
+          <div className="spine-pct tnum" style={{ color: tono, fontWeight: 600 }}
+            title={"Neto ya verificado (−" + sp.comision_verificado_pct + "% ida y vuelta). Con la comisión de HOY (−" + sp.comision_hoy_pct + "%) sería " + sp.neto_hoy_pct + "%."}>
+            {neto >= 0 ? "+" : ""}{neto}% neto
+          </div>
+        </> : (
+          <div className="spine-val tnum" style={{ fontSize: 15, color: "var(--text-3)" }}>—</div>
+        )}
       </div>
       <div className="spine-line" />
     </div>
@@ -4661,38 +4706,97 @@ function BrechaSpine({ snap }) {
 
 /* ---------- Maker actions ---------- */
 function MakerActions({ snap }) {
-  const cards = [
-    {
-      tone: "buy", side: "Tab Compra",
-      title: "Para VENDER USDT", price: snap.precio_maker_vender,
-      note: <>Un centavo menos que <b>{snap.lider_tab_compra}</b> (pide {fP(snap.mejor_vendedor_tab_compra)})</>,
-      tip: "Aparecés primero entre los vendedores",
-    },
-    {
-      tone: "sell", side: "Tab Venta",
-      title: "Para COMPRAR USDT", price: snap.precio_maker_comprar,
-      note: <>Un centavo más que <b>{snap.lider_tab_venta}</b> (paga {fP(snap.mejor_comprador_tab_venta)})</>,
-      tip: "Aparecés primero entre los compradores",
-    },
-  ];
+  /* COL50 — era "Acción maker" (un precio para ponerse primero de todo).
+     Nota de Sebastian (5-ago): "cambiar la tarjeta acción maker por punteros
+     de caja y ordenarlos por límite mínimo de orden".
+     POR QUE: el precio del tope del libro no dice contra quién competís. Un
+     aviso puede estar primero pidiendo 3.000 CLP de mínimo y otro quinto
+     pidiendo 200.000 — no juegan el mismo partido porque no los ve el mismo
+     comprador. Lo que define la competencia real es el MÍNIMO. */
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  const [lado, setLado] = React.useState("compra");   // donde publica su venta
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/punteros").then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => {});
+    load();
+    const id = setInterval(load, 15000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  if (!d || !d.compra) return null;
+  const fN = (x, n) => x == null ? "—" : Number(x).toLocaleString("es-CL",
+    { minimumFractionDigits: n || 0, maximumFractionDigits: n || 0 });
+  const tramos = lado === "compra" ? d.compra : d.venta;
+  const ext = lado === "compra" ? d.extremos_compra : d.extremos_venta;
+  const rango = (t) => t.hasta ? (fN(t.desde / 1000) + "–" + fN(t.hasta / 1000) + "k")
+                               : (fN(t.desde / 1000) + "k+");
+  const viejo = d.edad_seg != null && d.edad_seg > 180;
+
   return (
-    <section className="maker">
-      <div className="maker-head">
-        <span className="maker-kicker">Acción maker</span>
-        <span className="maker-hint">Postealo un centavo mejor que el líder para encabezar la lista</span>
+    <section className="chart-card" style={{ marginBottom: 12 }}>
+      <div className="card-head">
+        <h3>Punteros por tramo de mínimo</h3>
+        <span className="card-sub">
+          quién encabeza cada nivel de competencia · el mínimo del aviso es lo que decide contra quién competís
+          {d.edad_seg != null && <span style={{ color: viejo ? "var(--warn)" : "var(--text-3)" }}>
+            {" · "}{d.fuente_libro === "vivo" ? "⚡ " : ""}{Math.round(d.edad_seg)}s</span>}
+        </span>
       </div>
-      <div className="maker-grid">
-        {cards.map((c, i) => (
-          <div key={i} className={"maker-card tone-" + c.tone}>
-            <div className="mc-top">
-              <span className="mc-title">{c.title}</span>
-              <span className="mc-side">postear en {c.side}</span>
-            </div>
-            <div className="mc-price tnum">{fP(c.price)}</div>
-            <div className="mc-note">{c.note}</div>
-            <div className="mc-tip">→ {c.tip}</div>
-          </div>
-        ))}
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, alignItems: "center", flexWrap: "wrap" }}>
+        <button className={"intel-tab" + (lado === "compra" ? " active" : "")} onClick={() => setLado("compra")}
+          title="Tab Compra del libro: ahí están los que VENDEN. Es donde vos recomprás, y donde aparece tu anuncio de venta.">
+          Tab Compra</button>
+        <button className={"intel-tab" + (lado === "venta" ? " active" : "")} onClick={() => setLado("venta")}
+          title="Tab Venta del libro: ahí están los que COMPRAN.">
+          Tab Venta</button>
+        {ext && (
+          <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-2)" }}>
+            mejor precio en <b style={{ color: "var(--accent)" }}>{ext.mejor_tramo}</b>
+            {" · "}<b>{ext.ventaja_pct}%</b> mejor que <b>{ext.peor_tramo}</b>
+          </span>
+        )}
+      </div>
+      <div className="intel-scroll">
+        <table className="intel-table">
+          <thead><tr>
+            <th title="Tramo de mínimo de orden en CLP. Salen de medir la distribución real del libro, no de números redondos.">Tramo (mín. CLP)</th>
+            <th>Puntero</th>
+            <th>Precio</th>
+            <th title="El mínimo que pide ESE anunciante.">Su mínimo</th>
+            <th title="USDT que tiene publicados.">Stock</th>
+            <th title="Cuántos avisos compiten en ese tramo, ya filtrando los muertos.">Compiten</th>
+            <th title="USDT totales parados en ese tramo: cuánta plata hay peleando ahí.">Capital del tramo</th>
+          </tr></thead>
+          <tbody>{tramos.map(t => {
+            const p = t.puntero;
+            const mejor = ext && t.tramo === ext.mejor_tramo;
+            return (
+              <tr key={t.tramo} style={mejor ? { background: "var(--bg-2)" } : undefined}>
+                <td>
+                  <b style={{ color: mejor ? "var(--accent)" : "var(--text)" }}>{t.tramo}</b>
+                  <div style={{ fontSize: 10, color: "var(--text-3)" }}>{rango(t)}</div>
+                </td>
+                {!p ? <td colSpan={6} style={{ color: "var(--text-3)" }}>sin avisos que pasen el filtro</td> : <>
+                  <td>
+                    {p.soy_yo ? <b style={{ color: "var(--accent)" }}>VOS</b> : p.anunciante}
+                    {p.es_merchant && <span title="Verified Merchant" style={{ color: "var(--warn)" }}> ★</span>}
+                    {!p.soy_yo && t.mi_puesto && <div style={{ fontSize: 10, color: "var(--accent)" }}>vos: #{t.mi_puesto}</div>}
+                  </td>
+                  <td className="tnum" style={{ fontWeight: 600 }}>${fN(p.precio, 2)}</td>
+                  <td className="tnum" style={{ color: "var(--text-3)" }}>{fN(p.min_orden)}</td>
+                  <td className="tnum">{fN(p.disponible)}</td>
+                  <td className="tnum" style={{ color: "var(--text-3)" }}>{t.n}</td>
+                  <td className="tnum" style={{ color: "var(--text-3)" }}>{fN(t.capital_usdt)}</td>
+                </>}
+              </tr>
+            );
+          })}</tbody>
+        </table>
+      </div>
+      <div className="intel-explain">
+        <b>Cómo leerlo:</b> en <b>Tab Compra</b> el mejor precio es el más BARATO (ahí recomprás); en <b>Tab Venta</b>, el más CARO. Si tu tramo tiene mucho capital compitiendo, vas a llenar más lento aunque el precio sea bueno.<br/>
+        <b>Los tramos no los inventé:</b> salen de medir la distribución real de mínimos en el libro (5-ago) — se agrupan en 10k, 20k, 50k, 100k y 150k. El piso real del mercado es 1.860 CLP.
       </div>
     </section>
   );
@@ -4991,7 +5095,15 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel, sinGrafico }) 
     <div className="view">
       <AlertBanner snap={snap} />
       <C.DecisionHero snap={snap} />
-      <C.VelocityStrip vel={vel} />
+      {/* COL49 — se fueron dos cosas, por las notas de Sebastian (5-ago):
+          · <C.VelocityStrip>: "quitar velocidad de mercado antiguo". Era la
+            version vieja, previa a la tarjeta VelocidadMercado; mostraban lo
+            mismo y la de arriba no tenia ni el detalle ni el contexto.
+          · el grafico "Spread ponderado · ultimas N muestras": "quitar el
+            grafico de muestras del spread ponderado". El historico del
+            ponderado se mira, no se decide con el, y ya vive en la pestaña
+            Precio. Se va de las DOS vistas (antes solo la beta lo ocultaba
+            con sinGrafico, que por eso queda sin uso). */}
       <div className="market">
         <C.SideCard side="buy" snap={snap} history={history} />
         <C.BrechaSpine snap={snap} />
@@ -4999,30 +5111,6 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel, sinGrafico }) 
       </div>
       <C.MakerActions snap={snap} />
       <div className="tr-bottom">
-        {/* sinGrafico (COL36, beta): el historico del ponderado se mira, no se
-            decide con el — en la beta vive en la pestaña Precio y libera media
-            pantalla arriba. */}
-        {!sinGrafico && (
-        <section className="chart-card">
-          <div className="card-head">
-            <h3>Spread ponderado · últimas {history.length} muestras</h3>
-            <span className="card-sub">pasá el dedo para ver la hora</span>
-          </div>
-          <TimeChart
-            height={220}
-            yUnit="%"
-            times={history.map((h) => h.timestamp.slice(5, 16).replace("T", " "))}
-            series={[
-              { data: history.map((h) => h.spread_pond_pct), tone: "warn", label: "Spread ponderado", fill: true },
-              { data: history.map((h) => h.spread_pct), tone: "accent", label: "Spread puntual", dashed: true },
-            ]}
-            thresholds={[
-              { value: window.P2P.ALERTA_SPREAD, tone: "buy", label: "MUY APTO 0,8%" },
-              { value: window.P2P.SPREAD_MINIMO, tone: "warn-low", label: "APTO 0,2%" },
-            ]}
-          />
-        </section>
-        )}
         <C.TopTraders snap={snap} />
       </div>
       {showOrderBook && <OrderBook snap={snap} />}
@@ -7382,13 +7470,20 @@ function SystemBar({ snapTs }) {
 }
 
 function VolumenBar() {
+  /* COL49 \u2014 rehecho segun las notas de Sebastian (5-ago):
+     \u00b7 SE FUE LA v1. Se mostraban las dos estimaciones (caidas crudas y fills
+       confirmados) una debajo de la otra para poder compararlas mientras la
+       v2 se validaba. Ya validada, tener las dos al lado solo confunde: la
+       buena es la v2 (fills confirmados, con anti-reposicion).
+     \u00b7 VERTICAL en vez de horizontal: las ventanas (hoy/1h/4h/24h) van como
+       FILAS y los exchanges como COLUMNAS. Antes cada exchange era una fila
+       larga con scroll horizontal \u2014 imposible de comparar Binance contra
+       Bybit de un vistazo, que es justo para lo que sirve. */
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
-  const [v, setV] = React.useState(null);
   const [v2, setV2] = React.useState(null);
   React.useEffect(() => {
     let stop = false;
     const load = () => {
-      fetch(B + "/api/volumen").then(r => r.json()).then(d => { if (!stop) setV(d); }).catch(() => {});
       fetch(B + "/api/volumen_v2").then(r => r.json()).then(d => { if (!stop) setV2(d); }).catch(() => {});
     };
     load();
@@ -7396,41 +7491,66 @@ function VolumenBar() {
     return () => { stop = true; clearInterval(id); };
   }, []);
   const fmt = (x) => x == null ? "\u2014" : Number(x).toLocaleString("es-CL");
-  const chgTag = (p) => p == null ? <span style={{ color: "var(--text-3)" }}>\u2014</span> :
-    <b style={{ color: p >= 0 ? "var(--buy)" : "var(--sell)" }}>{p >= 0 ? "\u25b2" : "\u25bc"}{Math.abs(p)}%</b>;
-  if (!v) return null;
+  const chgTag = (p) => p == null ? null :
+    <b style={{ color: p >= 0 ? "var(--buy)" : "var(--sell)", fontSize: 10, marginLeft: 4 }}>
+      {p >= 0 ? "\u25b2" : "\u25bc"}{Math.abs(p)}%</b>;
+  if (!v2) return null;
+  const bn = v2.binance, by = v2.bybit;
+  if (!bn && !by) return null;
 
-  const fila = (nombre, d) => (
-    <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "nowrap", whiteSpace: "nowrap", overflowX: "auto" }}>
-      <span style={{ width: 60, flexShrink: 0, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.06em", fontSize: 10, fontWeight: 600 }}>{nombre}</span>
-      {!d ? <span style={{ color: "var(--text-3)" }}>sin datos a\u00fan</span> : <>
-        <span style={{ flexShrink: 0 }} title="Acumulado desde las 00:00 de hoy (hora Chile). Se pone en CERO a la medianoche.">Hoy: <b style={{ color: "var(--text)" }}>{fmt(d.hoy)}</b></span>
-        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimos 60 min. La flecha compara contra los 60 min anteriores.">1h: <b style={{ color: "var(--text)" }}>{fmt(d.hora)}</b> {chgTag(d.cambio_1h_pct)}</span>
-        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimas 4 horas.">4h: <b style={{ color: "var(--text)" }}>{fmt(d.vol_4h)}</b> {chgTag(d.cambio_4h_pct)}</span>
-        <span style={{ flexShrink: 0 }} title="Ventana movil: ultimas 24 horas.">24h: <b style={{ color: "var(--text)" }}>{fmt(d.vol_24h)}</b> {chgTag(d.cambio_24h_pct)}</span>
-        <span style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
-          Presi\u00f3n:
-          <span style={{ width: 90, height: 7, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block" }}>
-            <span style={{ display: "block", height: "100%", width: d.presion_compra_pct + "%", background: "var(--buy)" }}></span>
-          </span>
-          <b style={{ color: "var(--buy)" }}>{fmt(d.presion_compra_pct)}%</b> <span style={{ color: "var(--text-3)" }}>compran</span>
-        </span>
+  const VENTANAS = [
+    ["hoy",  "hoy",      null,             "Acumulado desde las 00:00 de hoy (hora Chile). Vuelve a CERO a la medianoche."],
+    ["1h",   "hora",     "cambio_1h_pct",  "Ventana m\u00f3vil: \u00faltimos 60 min. La flecha compara contra los 60 min anteriores."],
+    ["4h",   "vol_4h",   "cambio_4h_pct",  "Ventana m\u00f3vil: \u00faltimas 4 horas."],
+    ["24h",  "vol_24h",  "cambio_24h_pct", "Ventana m\u00f3vil: \u00faltimas 24 horas."],
+  ];
+  const celda = (d, campo, campoChg) => (
+    <td className="tnum" style={{ textAlign: "right", padding: "2px 10px", whiteSpace: "nowrap" }}>
+      {!d ? <span style={{ color: "var(--text-3)" }}>\u2014</span> : <>
+        <b style={{ color: "var(--text)" }}>{fmt(d[campo])}</b>
+        {campoChg && chgTag(d[campoChg])}
       </>}
-    </div>
+    </td>
   );
 
   return (
-    <div style={{ margin: "8px 0 0", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", fontSize: 12, color: "var(--text-2)", fontVariantNumeric: "tabular-nums", display: "flex", flexDirection: "column", gap: 6 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+    <div style={{ margin: "8px 0 0", background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: 12, padding: "8px 16px", fontSize: 12, color: "var(--text-2)", fontVariantNumeric: "tabular-nums" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
         <span style={{ color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10 }}>Volumen USDT \u00b7 estimaci\u00f3n</span>
-        <span title="Estimacion propia del tope del libro (no dato oficial). Sirve para la TENDENCIA (sube/baja), no para el USDT exacto. Ya descuenta el ruido de reposicion de avisos." style={{ color: "var(--text-3)", cursor: "help" }}>\u24d8</span>
+        <span title="Estimacion propia del tope del libro (no dato oficial), por fills confirmados. Sirve para la TENDENCIA, no para el USDT exacto. Ya descuenta el ruido de reposicion de avisos." style={{ color: "var(--text-3)", cursor: "help" }}>\u24d8</span>
       </div>
-      {fila("Binance", v.binance)}
-      {v2 && v2.binance && fila("BN v2 \u2713", v2.binance)}
-      {fila("Bybit", v.bybit)}
-      {v2 && v2.bybit && fila("BY v2 \u2713", v2.bybit)}
-      {v2 && v2.binance && <div style={{ fontSize: 10, color: "var(--text-3)" }}>
-        v2 = fills confirmados \u00b7 {fmt(v2.binance.ordenes_hoy)} \u00f3rdenes hoy \u00b7 ticket medio {fmt(v2.binance.ticket_med_hoy)} USDT \u00b7 {fmt(v2.binance.pct_enmascarado_hoy)}% estimado por recarga
+      <table style={{ borderCollapse: "collapse" }}>
+        <thead><tr style={{ color: "var(--text-3)", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          <th style={{ textAlign: "left", padding: "2px 10px 2px 0", fontWeight: 600 }}></th>
+          <th style={{ textAlign: "right", padding: "2px 10px", fontWeight: 600 }}>Binance</th>
+          <th style={{ textAlign: "right", padding: "2px 10px", fontWeight: 600 }}>Bybit</th>
+        </tr></thead>
+        <tbody>{VENTANAS.map(([etq, campo, chg, ayuda]) => (
+          <tr key={etq}>
+            <td title={ayuda} style={{ cursor: "help", color: "var(--text-2)", padding: "2px 10px 2px 0", fontWeight: 600 }}>{etq}</td>
+            {celda(bn, campo, chg)}
+            {celda(by, campo, chg)}
+          </tr>
+        ))}
+        <tr>
+          <td style={{ color: "var(--text-2)", padding: "4px 10px 2px 0", fontWeight: 600 }} title="Qu\u00e9 parte del volumen fue gente COMPRANDO USDT.">presi\u00f3n</td>
+          {[bn, by].map((d, i) => (
+            <td key={i} style={{ padding: "4px 10px 2px", textAlign: "right", whiteSpace: "nowrap" }}>
+              {!d ? <span style={{ color: "var(--text-3)" }}>\u2014</span> : (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ width: 60, height: 6, background: "var(--sell)", borderRadius: 5, overflow: "hidden", display: "inline-block" }}>
+                    <span style={{ display: "block", height: "100%", width: d.presion_compra_pct + "%", background: "var(--buy)" }}></span>
+                  </span>
+                  <b style={{ color: "var(--buy)", fontSize: 11 }}>{fmt(d.presion_compra_pct)}%</b>
+                </span>
+              )}
+            </td>
+          ))}
+        </tr>
+        </tbody>
+      </table>
+      {bn && <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
+        {fmt(bn.ordenes_hoy)} \u00f3rdenes hoy \u00b7 ticket medio {fmt(bn.ticket_med_hoy)} USDT \u00b7 {fmt(bn.pct_enmascarado_hoy)}% estimado por recarga
       </div>}
     </div>
   );
@@ -7454,6 +7574,25 @@ function VelocidadMercado() {
   const W = 760, H = 110, mid = H / 2, padTop = 6;
   const maxV = Math.max(1, ...s.map(p => Math.max(p.buy, p.sell)));
   const bw = W / s.length;
+  /* DELTA ACUMULADO (COL50). Nota de Sebastian (5-ago): "me encantan esas
+     barras verdes y rojas, pero siento que me es poco útil así, no sé si
+     podríamos usar un acumulado o una línea continua".
+     El problema real de las barras solas: cada una dice cuánto pasó en SU
+     bucket, y mirada de a una no dice nada — es ruido. Lo accionable es qué
+     lado viene GANANDO en la sesión, y eso es la suma corrida de
+     (compras − ventas). Si la línea sube, la presión compradora se viene
+     acumulando; si baja, al revés. Es el mismo indicador (CVD) que trae
+     cualquier terminal de trading, aplicado a los fills del P2P.
+     Se dibuja SOBRE las barras, con su propia escala: el acumulado crece
+     mucho más que un bucket suelto y compartir escala lo aplastaría. */
+  let acum = 0;
+  const serieAcum = s.map(p => { acum += (p.buy - p.sell); return acum; });
+  const maxAbsAcum = Math.max(1, ...serieAcum.map(Math.abs));
+  const yAcum = (v) => mid - (v / maxAbsAcum) * (mid - padTop);
+  const pathAcum = serieAcum
+    .map((v, i) => (i ? "L" : "M") + (i * bw + bw / 2).toFixed(1) + " " + yAcum(v).toFixed(1))
+    .join(" ");
+  const acumFinal = serieAcum.length ? serieAcum[serieAcum.length - 1] : 0;
   const ratio = d.vs_promedio;
   const ratioColor = ratio == null ? "var(--text-3)"
     : (ratio >= 1.3 ? "var(--buy)" : (ratio <= 0.7 ? "var(--sell)" : "var(--warn)"));
@@ -7482,9 +7621,20 @@ function VelocidadMercado() {
       </div>
       <div style={{ display: "flex", gap: 26, flexWrap: "wrap", marginBottom: 12, fontVariantNumeric: "tabular-nums" }}>
         {met("Ahora (30m)", fmt(d.usdt_min_30m), <span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT/min</span>)}
-        {met("Fills/h (60m)", fmt(d.fills_h_60m), null)}
+        {/* COL50: "Fills/h" -> "Órdenes/h". "Fill" es jerga; el numero es
+            literalmente cuantas ordenes se completan por hora. */}
+        {met("Órdenes/h (60m)", fmt(d.fills_h_60m), null)}
         {met("Ticket medio 60m", fmt(d.ticket_med_60m), <span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT</span>)}
         {met("Promedio 12h", fmt(d.usdt_min_prom), <span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT/min</span>)}
+        <div style={{ minWidth: 120 }}>
+          <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}
+            title="Suma corrida de (compras − ventas) en las 12h. Positivo = la presión compradora viene acumulando; negativo = vendedora.">Presión acumulada 12h</div>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 19, fontVariantNumeric: "tabular-nums",
+                        color: acumFinal >= 0 ? "var(--buy)" : "var(--sell)" }}>
+            {acumFinal >= 0 ? "+" : ""}{fmt(Math.round(acumFinal))}
+            <span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT</span>
+          </div>
+        </div>
         <div style={{ minWidth: 110 }}>
           <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>vs promedio</div>
           <div style={{ fontFamily: "var(--mono)", fontSize: 19, color: ratioColor }}>
@@ -7506,13 +7656,23 @@ function VelocidadMercado() {
             </g>
           );
         })}
+        {/* delta acumulado: va ENCIMA de las barras, en blanco tenue para que
+            se lea sobre verde y sobre rojo por igual */}
+        <path d={pathAcum} fill="none" stroke="var(--text)" strokeWidth="1.6"
+              opacity="0.75" strokeLinejoin="round" strokeLinecap="round" />
+        <circle cx={(s.length - 1) * bw + bw / 2} cy={yAcum(acumFinal)} r="3"
+                fill={acumFinal >= 0 ? "var(--buy)" : "var(--sell)"}
+                stroke="var(--bg-1)" strokeWidth="1.5" />
         {s.map((p, i) => (i % 8 === 0) ? (
           <text key={"t" + i} x={i * bw + 2} y={H + 12} fontSize="9"
             fill="var(--text-3)" fontFamily="var(--mono)">{p.t}</text>
         ) : null)}
       </svg>
       <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 6 }}>
-        Barras hacia arriba = compras (BUY) \u00b7 hacia abajo = ventas (SELL) \u00b7 pas\u00e1 el cursor sobre una barra para el detalle
+        Barras: arriba = compras \u00b7 abajo = ventas (cu\u00e1nto pas\u00f3 en cada tramo de 15 min).
+        {" "}<b style={{ color: "var(--text-2)" }}>La l\u00ednea es el acumulado</b>: suma corrida de compras menos ventas.
+        Si sube, la presi\u00f3n compradora se viene acumulando; si baja, la vendedora. Tiene escala propia \u2014 lo que importa es
+        hacia d\u00f3nde va, no d\u00f3nde est\u00e1.
       </div>
     </div>
   );
@@ -8022,28 +8182,82 @@ function CarreraMerchant() {
   );
 }
 
-function MiCampania() {
+function CalibracionCard() {
+  /* COL49 — sacada de adentro de "Carrera al verificado" (nota de Sebastian:
+     "individualizar tarjeta de calibracion"). Vivia colgada abajo de un panel
+     que hablaba de otra cosa; es un tema propio — cuanto le podes creer al
+     monitor — y merece su propia tarjeta. */
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
-  const [d, setD] = React.useState(null);
   const [cal, setCal] = React.useState(null);
   React.useEffect(() => {
     let stop = false;
-    const load = () => {
-      fetch(B + "/api/mi_posicion").then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
-      fetch(B + "/api/calibracion").then(r => r.json()).then(j => { if (!stop) setCal(j); }).catch(() => {});
-    };
+    const load = () => fetch(B + "/api/calibracion").then(r => r.json())
+      .then(j => { if (!stop) setCal(j); }).catch(() => {});
+    load();
+    const id = setInterval(load, 60000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  if (!cal || !cal.resumen || !cal.resumen.ordenes_maker_reales) return null;
+  const r = cal.resumen;
+  const fmt = (x) => x == null ? "—" : Number(x).toLocaleString("es-CL");
+  const boxSt = { flex: 1, minWidth: 165, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" };
+  const lbl = { fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" };
+  const val = { fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)", margin: "3px 0 1px", fontVariantNumeric: "tabular-nums" };
+  const sub = { fontSize: 10.5, color: "var(--text-3)" };
+  return (
+    <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderLeft: "4px solid var(--text-3)", borderRadius: 14, padding: "13px 16px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Calibración · realidad vs monitor</span>
+        <span title={cal.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)" }}>últimos {r.dias} días · solo órdenes maker</span>
+      </div>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <div style={boxSt}>
+          <div style={lbl}>Detección</div>
+          <div style={val}>{fmt(r.ordenes_detectadas)}/{fmt(r.ordenes_maker_reales)}</div>
+          <div style={sub}>{r.tasa_deteccion_pct != null ? fmt(r.tasa_deteccion_pct) + "% de tus órdenes vistas" : "—"}</div>
+        </div>
+        <div style={boxSt}>
+          <div style={lbl}>Volumen real vs estimado</div>
+          <div style={val}>{fmt(r.usdt_real)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>vs</span> {fmt(r.usdt_monitor)}</div>
+          <div style={{ ...sub, color: r.error_pct == null ? "var(--text-3)" : Math.abs(r.error_pct) <= 5 ? "var(--buy)" : "var(--warn)" }}>
+            {r.error_pct == null ? "—" : (r.error_pct > 0 ? "+" : "") + fmt(r.error_pct) + "% de error"}
+          </div>
+        </div>
+        <div style={boxSt}>
+          <div style={lbl}>Latencia de detección</div>
+          <div style={val}>{r.latencia_media_min != null ? fmt(r.latencia_media_min) + " min" : "—"}</div>
+          <div style={sub}>demora en confirmarte una orden</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MisAnuncios() {
+  /* COL49 — era "MiCampania"/"Carrera al verificado". Nota de Sebastian:
+     "quitar la tarjeta de carrera al verificado, esta demas vs. el nuevo que
+     pusimos con los datos oficiales".
+     LO QUE SE FUE: las barras de progreso (Ordenes 30d "meta 300" y Volumen
+     30d). Estaban duplicadas contra CarreraMerchant (COL36) y ademas con la
+     meta EQUIVOCADA — 300 ordenes no es un requisito de Binance, ya se habia
+     corregido en /api/merchant pero esta tarjeta seguia mostrando el numero
+     viejo. Dos paneles con metas distintas para lo mismo.
+     LO QUE SE QUEDA: donde estan parados MIS anuncios (posicion, precio,
+     stock, si estoy en el top objetivo). Eso NO lo muestra CarreraMerchant y
+     borrarlo hubiera sido perder lo unico util que tenia la tarjeta. */
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/mi_posicion").then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => {});
     load();
     const id = setInterval(load, 60000);
     return () => { stop = true; clearInterval(id); };
   }, []);
   if (!d || !d.configurado) return null;
   const fmt = (x) => x == null ? "—" : Number(x).toLocaleString("es-CL");
-  const pr = d.progreso || {};
-  const bar = (pct, tone) => (
-    <div className="hbar" style={{ marginTop: 5 }}>
-      <div className="hbar-fill" style={{ width: Math.min(100, pct || 0) + "%", background: tone }} />
-    </div>
-  );
   const boxSt = { flex: 1, minWidth: 170, background: "var(--bg-2)", border: "1px solid var(--line-soft)", borderRadius: 10, padding: "10px 13px" };
   const lbl = { fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" };
   const val = { fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)", margin: "3px 0 1px", fontVariantNumeric: "tabular-nums" };
@@ -8070,54 +8284,13 @@ function MiCampania() {
   return (
     <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderLeft: "4px solid var(--accent)", borderRadius: 14, padding: "13px 16px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
-        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Carrera al verificado</span>
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Mis anuncios en el libro</span>
         <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--accent)", fontWeight: 600 }}>{d.nick}</span>
-        <span title={d.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
         {!d.en_libro && <span style={{ fontSize: 11, color: "var(--text-3)" }}>· no aparecés en el libro ahora</span>}
       </div>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
         {(d.anuncios || []).map(adBox)}
-        <div style={boxSt}>
-          <div style={lbl}>Órdenes 30d (meta 300)</div>
-          <div style={val}>{fmt(pr.ordenes_30d)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>/ 300</span></div>
-          {bar(pr.ordenes_pct, "var(--accent)")}
-          <div style={sub}>{pr.ordenes_ganadas_7d != null ? "+" + fmt(pr.ordenes_ganadas_7d) + " esta semana" : "contador oficial de Binance"}</div>
-        </div>
-        <div style={boxSt}>
-          <div style={lbl}>Volumen 30d estimado</div>
-          <div style={val}>{fmt(pr.vol_30d_estimado)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span></div>
-          {bar(pr.vol_pct_minima, "var(--buy)")}
-          <div style={sub}>{fmt(pr.vol_pct_minima)}% de 0,5 BTC (mínimo) · {fmt(pr.vol_pct_comoda)}% de 1 BTC</div>
-        </div>
       </div>
-      {cal && cal.resumen && cal.resumen.ordenes_maker_reales > 0 && (
-        <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--line-soft)" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
-            <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Calibración · realidad vs monitor</span>
-            <span title={cal.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
-            <span style={{ fontSize: 10.5, color: "var(--text-3)" }}>últimos {cal.resumen.dias} días · solo órdenes maker</span>
-          </div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <div style={boxSt}>
-              <div style={lbl}>Detección</div>
-              <div style={val}>{fmt(cal.resumen.ordenes_detectadas)}/{fmt(cal.resumen.ordenes_maker_reales)}</div>
-              <div style={sub}>{cal.resumen.tasa_deteccion_pct != null ? fmt(cal.resumen.tasa_deteccion_pct) + "% de tus órdenes vistas" : "—"}</div>
-            </div>
-            <div style={boxSt}>
-              <div style={lbl}>Volumen real vs estimado</div>
-              <div style={val}>{fmt(cal.resumen.usdt_real)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>vs</span> {fmt(cal.resumen.usdt_monitor)}</div>
-              <div style={{ ...sub, color: cal.resumen.error_pct == null ? "var(--text-3)" : Math.abs(cal.resumen.error_pct) <= 5 ? "var(--buy)" : "var(--warn)" }}>
-                {cal.resumen.error_pct == null ? "—" : (cal.resumen.error_pct > 0 ? "+" : "") + fmt(cal.resumen.error_pct) + "% de error"}
-              </div>
-            </div>
-            <div style={boxSt}>
-              <div style={lbl}>Latencia de detección</div>
-              <div style={val}>{cal.resumen.latencia_media_min != null ? fmt(cal.resumen.latencia_media_min) + " min" : "—"}</div>
-              <div style={sub}>demora en confirmarte una orden</div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -8316,111 +8489,14 @@ function BarraBalance({ pct, banda }) {
    Hoy) y 'card' (completo, junto al inventario). Si el backend no tiene dato
    todavia o la fuente esta caida, NO renderiza nada en vez de mostrar un
    hueco roto — es contexto, no puede ensuciar la pantalla. */
-function MacroBar({ modo }) {
-  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
-  const [m, setM] = React.useState(null);
-  React.useEffect(() => {
-    const load = () => fetch(B + "/api/macro").then(r => r.json()).then(setM).catch(() => {});
-    load();
-    const id = setInterval(load, 300000);   // 5 min: el dato de fondo cambia cada 15
-    return () => clearInterval(id);
-  }, []);
-  if (!m || !m.disponible) return null;
-
-  const nf = (v, d) => v == null ? "—" : Number(v).toLocaleString("es-CL", { minimumFractionDigits: d, maximumFractionDigits: d });
-  const flecha = (v) => v == null ? "" : v > 0 ? "▲" : v < 0 ? "▼" : "=";
-  const tono = (v, invertido) => {
-    if (v == null) return "var(--text-3)";
-    const bueno = invertido ? v < 0 : v > 0;
-    return Math.abs(v) < 0.05 ? "var(--text-3)" : bueno ? "var(--buy)" : "var(--sell)";
-  };
-  // VIX al reves: que SUBA es senal de miedo/volatilidad, no algo "bueno"
-  const items = [
-    { k: "Dólar forex", v: nf(m.usdclp_forex, 2), var: m.usdclp_forex_var_pct, inv: false,
-      t: "USD/CLP en el mercado formal (Yahoo Finance). El P2P suele seguirlo con retardo." },
-    { k: "VIX", v: nf(m.vix, 2), var: m.vix_var_pct, inv: true,
-      t: "Índice de miedo del mercado. Si sube fuerte, suele venir volatilidad." },
-    { k: "Cobre", v: nf(m.cobre, 3), var: m.cobre_var_pct, inv: false,
-      t: "Futuro del cobre (COMEX), en USD/libra. Chile exporta cobre: si sube, el peso tiende a fortalecerse (dólar baja)." },
-  ];
-
-  if (modo === "chip") {
-    return (
-      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center",
-                    fontSize: 11, color: "var(--text-2)", margin: "6px 0 0" }}>
-        {items.map(it => (
-          <span key={it.k} title={it.t} style={{ cursor: "help" }}>
-            {it.k} <b style={{ fontFamily: "var(--mono)", color: "var(--text)" }}>{it.v}</b>
-            {it.var != null && <span style={{ color: tono(it.var, it.inv) }}> {flecha(it.var)}{Math.abs(it.var)}%</span>}
-          </span>
-        ))}
-        {m.brecha_pct != null && (
-          <span title="Cuánto está el P2P por encima del dólar formal. Es la prima que paga el mercado cripto." style={{ cursor: "help" }}>
-            brecha P2P <b style={{ fontFamily: "var(--mono)", color: "var(--warn)" }}>{nf(m.brecha_pct, 2)}%</b>
-          </span>
-        )}
-        {m.desfase && m.desfase.senal && (
-          <span title={m.desfase.mensaje} style={{ cursor: "help", fontWeight: 600,
-                       color: m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)" }}>
-            {m.desfase.senal === "SUBE" ? "↗" : "↘"} P2P retrasado {Math.abs(m.desfase.pendiente_pct)}%
-          </span>
-        )}
-        {m.viejo && <span style={{ color: "var(--sell)" }} title={"Último dato hace " + m.edad_min + " min: la fuente externa no está respondiendo."}>⚠ dato viejo</span>}
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
-      <div style={{ display: "flex", alignItems: "baseline", marginBottom: 8 }}>
-        <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Contexto de mercado</div>
-        <div style={{ marginLeft: "auto", fontSize: 10, color: m.viejo ? "var(--sell)" : "var(--text-3)" }}>
-          {m.viejo ? "⚠ sin actualizar hace " + m.edad_min + " min" : "hace " + m.edad_min + " min"}
-        </div>
-      </div>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        {items.map(it => (
-          <div key={it.k} title={it.t} style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)",
-                                                borderRadius: 9, padding: "8px 12px", minWidth: 105, cursor: "help" }}>
-            <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase" }}>{it.k}</div>
-            <div style={{ fontFamily: "var(--mono)", fontSize: 16, fontWeight: 600 }}>{it.v}</div>
-            {it.var != null && <div style={{ fontSize: 10.5, color: tono(it.var, it.inv) }}>{flecha(it.var)} {Math.abs(it.var)}% vs cierre previo</div>}
-          </div>
-        ))}
-        {m.brecha_pct != null && (
-          <div title="El P2P contra el dólar formal. Este es el número para anotar como precio de referencia en la bitácora."
-               style={{ background: "var(--warn-soft)", border: "1px solid var(--warn)", borderRadius: 9,
-                        padding: "8px 12px", minWidth: 115, cursor: "help" }}>
-            <div style={{ fontSize: 10, color: "var(--warn)", textTransform: "uppercase" }}>Brecha P2P</div>
-            <div style={{ fontFamily: "var(--mono)", fontSize: 16, fontWeight: 600, color: "var(--warn)" }}>{nf(m.brecha_pct, 2)}%</div>
-            <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>P2P ${nf(m.p2p_ref, 2)} vs forex ${nf(m.usdclp_forex, 2)}</div>
-          </div>
-        )}
-      </div>
-      {m.desfase && m.desfase.senal && (
-        <div style={{ marginTop: 9, padding: "9px 12px", borderRadius: 9,
-                      background: m.desfase.senal === "SUBE" ? "var(--buy-soft)" : "var(--sell-soft)",
-                      border: "1px solid " + (m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)") }}>
-          <div style={{ fontSize: 11.5, fontWeight: 600, marginBottom: 3,
-                        color: m.desfase.senal === "SUBE" ? "var(--buy)" : "var(--sell)" }}>
-            {m.desfase.senal === "SUBE" ? "↗ El P2P viene retrasado hacia arriba" : "↘ El P2P quedó adelantado"}
-          </div>
-          <div style={{ fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.5 }}>{m.desfase.mensaje}</div>
-          <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
-            forex {m.desfase.fx_var_pct > 0 ? "+" : ""}{m.desfase.fx_var_pct}% · P2P {m.desfase.p2p_var_pct > 0 ? "+" : ""}{m.desfase.p2p_var_pct}% · ventana {m.desfase.ventana_min} min
-          </div>
-        </div>
-      )}
-      <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 7, lineHeight: 1.5 }}>
-        El P2P sigue al mercado formal con <b>retardo</b>, y eso está <b>medido</b>: el cambio del dólar forex
-        correlaciona <b>+0,46</b> con el cambio del P2P de la hora siguiente (en la misma hora: +0,06; en el
-        sentido inverso: +0,03 — o sea, el forex va primero). Indica <b>dirección probable, no magnitud garantizada</b>.
-        <br/>El <b>precio de referencia</b> de arriba es el que conviene anotar en la bitácora al anclar saldos.
-        <span style={{ color: "var(--text-3)" }}> Ojo: el cobre resultó mucho más débil (−0,16) que el dólar — probablemente te sirve porque mueve al dólar, no directo.</span>
-      </div>
-    </div>
-  );
-}
+/* MacroBar (la tarjeta "Contexto de mercado") SE BORRO EN COL49.
+   Nota de Sebastian (5-ago): "todavia no me convence ni lo utilizo".
+   OJO — lo que se fue es SOLO la tarjeta. El dato macro se sigue
+   recolectando (ciclo_colector_macro, /api/macro, snapshots_macro con los
+   6 meses que se rellenaron en COL45) y sigue alimentando el aviso de
+   desfase dolar->P2P que el Asistente muestra desde COL41, que es la forma
+   util del mismo dato. Si alguna vez se quiere la tarjeta de vuelta, esta
+   entera en versiones_app/app_p2p_monitor_COL48.py. */
 
 function InventarioCard() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
@@ -8982,7 +9058,7 @@ function CalculadoraCruzar() {
   );
 }
 
-window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, MacroBar, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MiCampania, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
+window.P2PViews = { CarreraMerchant, PreciosCompactos, EstrategiaRapida, TiempoReal, Historico, Heatmap, PrecioChart, Inteligencia, Backup, RotacionCalc, CrossView, Muros, SystemBar, VolumenBar, VelocidadMercado, AsistenteOperativo, EstrategiaPanel, MisAnuncios, CalibracionCard, PlanHoy, InventarioCard, ChipBalance, CalculadoraCruzar, RutinasPanel };
 
 </script>
 <script type="text/babel">
@@ -9079,8 +9155,8 @@ function App() {
               <V.ChipBalance />
               <V.InventarioCard />
             </div>
-            <div className="bc-6"><V.MacroBar modo="card" /></div>
-            <div className="bc-6"><V.MiCampania /></div>
+            <div className="bc-6"><V.MisAnuncios /></div>
+            <div className="bc-6"><V.CalibracionCard /></div>
             <div className="bc-12"><V.VelocidadMercado /></div>
             <div className="bc-12"><V.CalculadoraCruzar /></div>
             <div className="bc-12">
@@ -9090,13 +9166,13 @@ function App() {
           </div>
         )}
         {tab === "tr" && !beta && <V.PlanHoy />}
-        {tab === "tr" && !beta && <V.MacroBar modo="card" />}
         {tab === "tr" && !beta && <V.ChipBalance />}
         {tab === "tr" && !beta && <V.EstrategiaPanel />}
-        {tab === "tr" && !beta && <V.MiCampania />}
+        {tab === "tr" && !beta && <V.MisAnuncios />}
         {tab === "tr" && !beta && <V.CarreraMerchant />}
         {tab === "tr" && !beta && <V.InventarioCard />}
         {tab === "tr" && !beta && <V.AsistenteOperativo />}
+        {tab === "tr" && !beta && <V.CalibracionCard />}
         {tab === "tr" && !beta && <V.CalculadoraCruzar />}
         {tab === "tr" && !beta && <V.VelocidadMercado />}
         {tab === "tr" && !beta && <V.TiempoReal snap={viewSnap} history={history} showOrderBook={t.orderBook} vel={vel}
@@ -12616,6 +12692,179 @@ def api_inventario_movimiento():
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
     return jsonify({"ok": True, "id": nuevo, "tipo": tipo, "lado": lado,
                     "usdt": usdt, "clp": round(clp), "precio": precio})
+
+
+# Tramos de MINIMO DE ORDEN (COL50). No son numeros redondos elegidos a
+# ojo: se midio la distribucion real del libro el 5-ago (58 anuncios con
+# limite) y los minimos se agrupan exactamente ahi — los valores mas
+# repetidos son 10.000 (11 avisos), 20.000 (7), 50.000 (7), 5.000 (6),
+# 100.000 (3) y 150.000 (3). El piso REAL del mercado es 1.860, no 7.000
+# como se creia. Reparto por tramo: <20k 47% · 20-50k 16% · 50-100k 12% ·
+# 100-200k 14% · 200k+ 12%.
+PUNTERO_TRAMOS = [
+    (0,      20000,  "minorista"),
+    (20000,  50000,  "chico"),
+    (50000,  100000, "medio"),
+    (100000, 200000, "grande"),
+    (200000, None,   "mayorista"),
+]
+
+
+@app.route("/api/punteros")
+def api_punteros():
+    """QUIEN ES EL PUNTERO EN CADA NIVEL DE COMPETENCIA (COL50).
+
+    Idea de Sebastian (5-ago), con sus palabras: "poner los que son primeros
+    de primero, pero que estan haciendo precio mayorista... no que esten
+    primeros con poca plata. [...] lo que esta definiendo el filtro para todo
+    es el tamaño minimo del anuncio".
+
+    POR QUE ES LA LECTURA CORRECTA: el precio suelto del tope del libro no
+    dice contra quien competis. Un aviso puede estar primero pidiendo 3.000
+    CLP de minimo y otro estar quinto pidiendo 200.000 — no juegan el mismo
+    partido, porque no los ve el mismo comprador. Agrupando por tramo de
+    MINIMO aparece la estructura real: quien manda entre los minoristas,
+    quien entre los mayoristas, y cuanta distancia hay entre esos mundos.
+    Coincide con lo ya medido en COL36: correlacion +0,80 entre el minimo
+    publicado y el ticket que entra.
+
+    Se barre el libro VIVO (10s) si esta disponible; si no, el del colector.
+    Se aplican los mismos filtros de calidad que el Ciclo — sin eso el
+    'puntero' de un tramo puede ser un aviso muerto o de un anunciante con
+    3 ordenes."""
+    with config_lock:
+        c = dict(config)
+        mi_nick = str(c.get("MI_NICKNAME") or "").strip().lower()
+    # MISMAS claves que usa api_ciclo — no inventar nombres nuevos, si no
+    # el Ciclo y los Punteros filtrarian distinto y mostrarian competidores
+    # que no coinciden entre paneles.
+    min_stock = float(c.get("FILTRO_MIN_USDT", 200) or 0)
+    min_ord = int(c.get("FILTRO_MIN_ORD", 100) or 0)
+    min_tasa = float(c.get("FILTRO_MIN_TASA", 90) or 0)
+
+    salida = {}
+    fuente, edad = "vivo", None
+    for tipo in ("BUY", "SELL"):
+        filas, ed = libro_vivo_como_detalle(tipo)
+        if not filas:
+            fuente = "colector"
+            with data_lock:
+                snap = dict(ultimo_estado)
+            filas = snap.get("detalle_compra" if tipo == "BUY" else "detalle_venta") or []
+        elif ed is not None:
+            edad = ed if edad is None else max(edad, ed)
+
+        # BUY = tab Compra: los anunciantes VENDEN, el mejor para mi es el
+        # mas BARATO. SELL = tab Venta: compran, el mejor es el mas CARO.
+        comprando = (tipo == "BUY")
+        tramos = []
+        for desde, hasta, etiqueta in PUNTERO_TRAMOS:
+            cands = []
+            for a in filas:
+                try:
+                    mn = float(a.get("min_orden") or 0)
+                    precio = float(a.get("precio") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if precio <= 0 or mn <= 0:
+                    continue          # sin limite publicado no se puede clasificar
+                if not (desde <= mn and (hasta is None or mn < hasta)):
+                    continue
+                if float(a.get("disponible") or 0) < min_stock:
+                    continue
+                if int(a.get("completadas") or 0) < min_ord:
+                    continue
+                if float(a.get("tasa_exito") or 0) < min_tasa:
+                    continue
+                cands.append(a)
+            if not cands:
+                tramos.append({"tramo": etiqueta, "desde": desde, "hasta": hasta,
+                               "n": 0, "puntero": None})
+                continue
+            cands.sort(key=lambda x: float(x["precio"]), reverse=not comprando)
+            p = cands[0]
+            # ¿estoy yo en este tramo, y en que puesto?
+            mi_puesto = None
+            if mi_nick:
+                for i, x in enumerate(cands, 1):
+                    if str(x.get("anunciante", "")).strip().lower() == mi_nick:
+                        mi_puesto = i
+                        break
+            tramos.append({
+                "tramo": etiqueta, "desde": desde, "hasta": hasta,
+                "n": len(cands),
+                "puntero": {
+                    "anunciante": p.get("anunciante"),
+                    "precio": round(float(p["precio"]), 2),
+                    "min_orden": int(float(p.get("min_orden") or 0)),
+                    "max_orden": int(float(p.get("max_orden") or 0)) or None,
+                    "disponible": round(float(p.get("disponible") or 0)),
+                    "completadas": int(p.get("completadas") or 0),
+                    "es_merchant": bool(p.get("es_merchant")),
+                    "posicion_libro": p.get("posicion"),
+                    "soy_yo": bool(mi_nick and str(p.get("anunciante", "")).strip().lower() == mi_nick),
+                },
+                "mi_puesto": mi_puesto,
+                # capital total del tramo: cuanta plata hay parada compitiendo ahi
+                "capital_usdt": round(sum(float(x.get("disponible") or 0) for x in cands)),
+            })
+        salida[tipo] = tramos
+
+    # CUAL TRAMO TIENE EL MEJOR PRECIO, y cuanto se gana yendo ahi.
+    # OJO: NO se calcula como "primer tramo vs ultimo". Se probo el 5-ago
+    # contra el libro real y los tramos NO salen ordenados por precio (ese
+    # dia: minorista 921,00 · chico 946,00 · medio 931,00 · grande 918,67 ·
+    # mayorista 919,20). Restar las puntas hubiera dado un numero que parece
+    # "minorista vs mayorista" y en realidad compara dos tramos cualquiera.
+    # Se busca el mejor y el peor DE VERDAD, y se dice cual es cual.
+    def _extremos(tramos, comprando):
+        con = [t for t in tramos if t["puntero"]]
+        if len(con) < 2:
+            return None
+        orden = sorted(con, key=lambda t: t["puntero"]["precio"], reverse=not comprando)
+        mejor, peor = orden[0], orden[-1]
+        pm, pp = mejor["puntero"]["precio"], peor["puntero"]["precio"]
+        if not pp:
+            return None
+        return {"mejor_tramo": mejor["tramo"], "mejor_precio": pm,
+                "peor_tramo": peor["tramo"], "peor_precio": pp,
+                "ventaja_pct": round(abs(pm / pp - 1) * 100, 3)}
+
+    # SPREAD ENTRE PUNTEROS (COL50) — el spread REALMENTE tomable.
+    # El spread ponderado promedia todo el libro, incluida la basura que
+    # nunca vas a poder operar (avisos muertos, sin stock, de cuentas con 3
+    # ordenes). Este mira solo la cabeza de cada lado DESPUES de los filtros:
+    # el vendedor mas barato contra el comprador mas caro. Es el margen que
+    # de verdad hay para un maker que se para en las dos puntas.
+    ex_c, ex_v = _extremos(salida["BUY"], True), _extremos(salida["SELL"], False)
+    spread_punteros = None
+    if ex_c and ex_v and ex_v["mejor_precio"]:
+        bruto = (ex_c["mejor_precio"] / ex_v["mejor_precio"] - 1) * 100
+        com_ver = float(c.get("COMISION_VERIFICADO_RT", 0.32) or 0.32)
+        com_hoy = float(c.get("COMISION_BN", 0.002) or 0.002) * 2 * 100
+        spread_punteros = {
+            "venta": ex_c["mejor_precio"],     # donde me paro a vender (tab Compra)
+            "compra": ex_v["mejor_precio"],    # donde me paro a comprar (tab Venta)
+            "bruto_pct": round(bruto, 3),
+            "neto_verificado_pct": round(bruto - com_ver, 3),
+            "neto_hoy_pct": round(bruto - com_hoy, 3),
+            "comision_verificado_pct": com_ver,
+            "comision_hoy_pct": round(com_hoy, 3),
+        }
+
+    return jsonify({
+        "compra": salida["BUY"], "venta": salida["SELL"],
+        "extremos_compra": ex_c,
+        "extremos_venta": ex_v,
+        "spread_punteros": spread_punteros,
+        "fuente_libro": fuente,
+        "edad_seg": (round(edad, 1) if edad is not None else None),
+        "filtros": {"stock_min": min_stock, "ordenes_min": min_ord, "tasa_min": min_tasa},
+        "nota": ("Puntero = el mejor precio de cada tramo de MINIMO de orden, ya "
+                 "filtrando avisos muertos. Tab Compra: mejor = más barato (ahí comprás). "
+                 "Tab Venta: mejor = más caro (ahí vendés). Los avisos sin límite "
+                 "publicado no se clasifican."),
+    })
 
 
 @app.route("/api/inventario/movimientos")
