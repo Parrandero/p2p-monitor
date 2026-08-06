@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL47"
+VERSION       = "COL54"
 VERSION_FECHA = "2026-08-04"
 
 config = {
@@ -4736,7 +4736,15 @@ function TopTraders({ snap }) {
 
 /* ---------- Panel de filtros del mercado ---------- */
 function FiltersPanel({ cfg, onApply, info }) {
-  const [open, setOpen] = uS(true);
+  /* COL54 — en /beta arranca CERRADO; en la vista principal queda como
+     estaba (abierto). Son 302 px de configuracion ocupando lugar fijo en la
+     pantalla que se mira todo el dia, para algo que se toca una vez cada
+     tanto. Cerrado igual muestra los chips con los filtros vigentes: no se
+     pierde saber COMO esta filtrado, solo deja de ocupar pantalla el COMO
+     SE CAMBIA.
+     Va atado a P2P_BETA porque Sebastian congelo la vista principal hasta
+     que cada cambio este probado en beta. */
+  const [open, setOpen] = uS(!window.P2P_BETA);
   const [draft, setDraft] = uS(cfg);
   const [saved, setSaved] = uS(false);
   uE(() => { setDraft(cfg); }, [cfg]);
@@ -4999,9 +5007,10 @@ function TiempoReal({ snap, history, showOrderBook, filters, vel, sinGrafico }) 
       </div>
       <C.MakerActions snap={snap} />
       <div className="tr-bottom">
-        {/* sinGrafico (COL36, beta): el historico del ponderado se mira, no se
-            decide con el — en la beta vive en la pestaña Precio y libera media
-            pantalla arriba. */}
+        {/* sinGrafico (COL36): /beta NO lo muestra, la vista principal SI.
+            Medido el 6-ago: son 365 px de los 1.895 que ocupa este bloque.
+            NO se toca la vista principal — Sebastian la congelo hasta que
+            los cambios esten probados en beta. */}
         {!sinGrafico && (
         <section className="chart-card">
           <div className="card-head">
@@ -8070,25 +8079,44 @@ function MiCampania() {
   return (
     <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderLeft: "4px solid var(--accent)", borderRadius: 14, padding: "13px 16px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
-        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>Carrera al verificado</span>
+        {/* COL54 — SOLO EN /beta. La vista principal queda intacta.
+            Esta tarjeta ("Carrera al verificado") duplica a CarreraMerchant
+            (COL36), que muestra los MISMOS dos numeros pero con los
+            requisitos REALES de Binance. Peor: aca la meta dice "300
+            ordenes", que NO EXISTE como requisito — ya se corrigio en
+            /api/merchant y esta tarjeta sigue mostrando el numero viejo.
+            En beta se sacan esas dos cajas y queda lo unico que no esta en
+            ningun otro lado: donde estan parados MIS anuncios. Sebastian:
+            "esa me gusta, cuando esta ahi en vivo y te dice en que parte
+            estas del libro".
+            MEDIDO: sacarlas ahorra solo 13 px (267 -> 254). Van en la misma
+            fila que las cajas de anuncios, y esa fila ya mide lo que mide su
+            caja mas alta. Se hace igual porque corrige un dato FALSO, no
+            para ganar espacio — el espacio esta en otro lado. */}
+        <span style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.12em" }}>
+          {window.P2P_BETA ? "Mis anuncios en el libro" : "Carrera al verificado"}</span>
         <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--accent)", fontWeight: 600 }}>{d.nick}</span>
-        <span title={d.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>
+        {!window.P2P_BETA && <span title={d.nota} style={{ color: "var(--text-3)", cursor: "help" }}>ⓘ</span>}
         {!d.en_libro && <span style={{ fontSize: 11, color: "var(--text-3)" }}>· no aparecés en el libro ahora</span>}
       </div>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
         {(d.anuncios || []).map(adBox)}
+        {!window.P2P_BETA && (
         <div style={boxSt}>
           <div style={lbl}>Órdenes 30d (meta 300)</div>
           <div style={val}>{fmt(pr.ordenes_30d)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>/ 300</span></div>
           {bar(pr.ordenes_pct, "var(--accent)")}
           <div style={sub}>{pr.ordenes_ganadas_7d != null ? "+" + fmt(pr.ordenes_ganadas_7d) + " esta semana" : "contador oficial de Binance"}</div>
         </div>
+        )}
+        {!window.P2P_BETA && (
         <div style={boxSt}>
           <div style={lbl}>Volumen 30d estimado</div>
           <div style={val}>{fmt(pr.vol_30d_estimado)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span></div>
           {bar(pr.vol_pct_minima, "var(--buy)")}
           <div style={sub}>{fmt(pr.vol_pct_minima)}% de 0,5 BTC (mínimo) · {fmt(pr.vol_pct_comoda)}% de 1 BTC</div>
         </div>
+        )}
       </div>
       {cal && cal.resumen && cal.resumen.ordenes_maker_reales > 0 && (
         <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--line-soft)" }}>
