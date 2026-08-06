@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL54"
-VERSION_FECHA = "2026-08-04"
+VERSION       = "COL56"
+VERSION_FECHA = "2026-08-06"
 
 config = {
     "MONEDA":               "USDT",
@@ -5991,7 +5991,10 @@ function CicloRecompra() {
   // tanto — no esperar a vender todo para recomprar de una — asi que ofrecer
   // "tu saldo completo" sugeria una operacion que nunca ocurre. Medido sobre
   // sus taker de compra: p25=210 / mediana=235 / p75=320 / max 425.
-  const saldo = d.saldo_real_usdt;
+  // COL56: el tope es cuanto se puede COMPRAR con los pesos disponibles.
+  // Antes miraba el saldo en USDT, que es al reves: los dolares son lo que
+  // se vende, no con lo que se recompra.
+  const saldo = d.puede_recomprar_usdt;
   const t = d.tandas;
   const PRESETS = t
     ? [["chica", t.chica], ["habitual", t.habitual], ["grande", t.grande], ["máxima", t.maxima]]
@@ -6068,8 +6071,8 @@ function CicloRecompra() {
       {saldo != null && nMonto > saldo + 1 && (
         <div style={{ marginBottom: 12, padding: "7px 11px", borderRadius: 8, fontSize: 11.5,
                      background: "rgba(255,145,0,0.1)", border: "1px solid var(--warn)", color: "var(--warn)" }}>
-          ⚠ Estás simulando {fN(nMonto)} USDT pero tu saldo real es {fN(saldo)}. Sirve para ver el escenario,
-          no para operar ahora.
+          ⚠ Estás simulando {fN(nMonto)} USDT, pero con tus {d.clp_disponible ? fN(d.clp_disponible) + " pesos" : "pesos"} alcanza
+          para comprar {fN(saldo)}. Sirve para ver el escenario, no para operar ahora.
         </div>
       )}
       {t && t.maxima && nMonto > t.maxima && (saldo == null || nMonto <= saldo + 1) && (
@@ -7612,10 +7615,16 @@ function ChipCiclo() {
     const load = () => fetch(B + "/api/ciclo").then(r => r.json())
       .then(j => { if (!stop) setD(j); }).catch(() => {});
     load();
-    // COL38: 10s, no 120s. Antes habia DOS capas de 2 min (colector + este
-    // intervalo) = hasta 4 min de dato viejo, inservible para vender y
-    // recomprar rapido. El backend ahora sirve el libro vivo de 10s.
-    const id = setInterval(load, 10000);
+    /* COL55 — 10s -> 30s. Medido el 6-ago: /api/ciclo tarda entre 5 y 7
+       segundos, asi que a 10s el pedido anterior casi no terminaba antes de
+       salir el siguiente. Con el monitor abierto en el celular Y en la compu
+       (que es como Sebastian trabaja) los pedidos se apilaban y todo el
+       servidor se ponia lento.
+       POR QUE 30 Y NO MAS: el dato de fondo sigue siendo el libro vivo de
+       10s (COL38), asi que el precio no envejece por esto — lo unico que
+       cambia es cada cuanto la pantalla lo va a buscar. 30s sigue siendo
+       muchisimo mas fresco que los 2 min que habia antes de COL38. */
+    const id = setInterval(load, 30000);
     return () => { stop = true; clearInterval(id); };
   }, []);
   if (!d || d.error || d.veredicto !== "VERDE") return null;
@@ -11755,13 +11764,71 @@ def _precio_a_las(dt):
     return 0
 
 
+def _ratio_rotacion():
+    """Que tan rapido rota el mercado AHORA contra su promedio de 12h.
+
+    UNA consulta. Existe desde COL55 porque api_ciclo sacaba este mismo
+    numero llamando a api_operativa() completo, y ese a su vez llamaba a
+    api_inventario() — o sea ~6 consultas y un inventario recalculado para
+    devolver un solo float. Devuelve None si no hay datos (no asume "normal":
+    un ratio inventado haria que el semaforo del Ciclo mienta)."""
+    now = datetime.now(SANTIAGO_TZ)
+    f = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT COALESCE(SUM(monto) FILTER (WHERE ts >= %(m30)s), 0) v30,
+                           COALESCE(SUM(monto), 0) v12
+                    FROM fills_estimados
+                    WHERE exchange = 'binance' AND ts >= %(h12)s
+                """, {"m30": f(now - timedelta(minutes=30)),
+                      "h12": f(now - timedelta(hours=12))})
+                r = cur.fetchone()
+        v30, v12 = float(r["v30"] or 0), float(r["v12"] or 0)
+        prom = v12 / (12 * 60)
+        return round((v30 / 30) / prom, 2) if prom else None
+    except Exception as e:
+        print(f"[ratio rotacion] {e}")
+        return None
+
+
+# ── Cache corto del inventario (COL55) ────────────────────────────────
+# El inventario es el calculo mas caro que hay (ancla + movimientos maker +
+# manuales + precios historicos). Se pedia MUCHAS veces de mas:
+#   · api_ciclo lo llamaba para el saldo, y ademas llamaba a api_operativa
+#     que lo volvia a llamar -> DOS veces por pedido del Ciclo
+#   · con el monitor abierto en el celular Y la compu, cada pantalla lo pide
+#     por su cuenta
+# 8 segundos alcanzan para matar toda esa duplicacion sin que se note: el
+# inventario cambia cuando cargas un movimiento o se detecta un fill, no
+# varias veces por segundo. Los POST no leen el cache y ademas lo invalidan.
+_inv_cache = {"ts": 0.0, "data": None}
+_inv_lock = threading.Lock()
+INV_CACHE_SEG = 8.0
+
+
+def _invalidar_inventario():
+    """Se llama despues de cualquier POST que cambie el inventario, para que
+    el proximo GET no devuelva el estado viejo."""
+    with _inv_lock:
+        _inv_cache["ts"] = 0.0
+        _inv_cache["data"] = None
+
+
 @app.route("/api/inventario")
 def api_inventario():
     """INVENTARIO EN VIVO: saldos estimados, patrimonio, %USDT, banda y P&L.
 
     El numero en vivo es ESTIMADO: el monitor no ve el banco ni las ordenes
     taker que no cargues. Es exacto en el momento del ancla y va driftando
-    despues; al re-anclar se mide ese drift."""
+    despues; al re-anclar se mide ese drift.
+
+    COL55: cachea el resultado INV_CACHE_SEG segundos (ver _inv_cache)."""
+    ahora_ts = time.time()
+    with _inv_lock:
+        if _inv_cache["data"] is not None and (ahora_ts - _inv_cache["ts"]) < INV_CACHE_SEG:
+            return jsonify(_inv_cache["data"])
     with config_lock:
         c = dict(config)
     now = datetime.now(SANTIAGO_TZ)
@@ -11875,7 +11942,7 @@ def api_inventario():
         alerta = ("Hace más de 3 días que no anclás: la estimación se desvía con el tiempo. "
                   "Conviene actualizar los saldos reales.")
 
-    return jsonify({
+    salida = {
         "configurado": True,
         "estimado": True,
         "alerta": alerta,
@@ -11917,7 +11984,10 @@ def api_inventario():
         },
         "nota": ("Estimado: el monitor no ve el banco ni las órdenes taker que no cargues. "
                  "Exacto al anclar, aproximado después. Volvé a anclar para medir el drift."),
-    })
+    }
+    with _inv_lock:
+        _inv_cache["ts"], _inv_cache["data"] = time.time(), salida
+    return jsonify(salida)
 
 
 @app.route("/api/ciclo")
@@ -11945,18 +12015,28 @@ def api_ciclo():
     except (TypeError, ValueError):
         margen = float(c.get("CICLO_MARGEN_OBJETIVO", 0.30))
 
-    # ── ACOTAR AL SALDO REAL (COL44) ────────────────────────────────
-    # Guarda-rail, no protagonista: nunca calcular con plata que no existe.
-    # Solo cuando NO se pidio un monto explicito — si se escribe un numero en
-    # el panel es una simulacion deliberada y pisarla seria pelear con el
-    # usuario. En la practica casi nunca ata, porque la tanda tipica de
-    # recompra es MUY menor al saldo total (ver _tandas_recompra).
-    saldo_real = None
+    # ── ACOTAR A LA PLATA CON LA QUE SE RECOMPRA (COL56) ─────────────
+    # ★ FIX de un error conceptual de COL44. Este modulo calcula una
+    # RECOMPRA: se compra USDT pagando CLP. La plata que limita cuanto podes
+    # recomprar es entonces la de PESOS, no la de dolares — los dolares son
+    # justamente lo que se esta vendiendo.
+    # COL44 acotaba contra saldos["usdt"], que es al reves. Sebastian lo vio
+    # en pantalla el 6-ago: el Ciclo le ofrecia 67 USDT (todo su saldo en
+    # dolares, que estaba bajo porque venia de vender) cuando con sus 640.741
+    # CLP podia recomprar ~699. Diez veces menos de lo real.
+    # El tope ahora es cuantos USDT ALCANZAN los pesos disponibles.
+    saldo_clp = None
+    saldo_real = None          # tope expresado en USDT, para la UI
     if not monto_pedido:
         try:
             inv = api_inventario().get_json()
             if inv.get("configurado") and inv.get("saldos"):
-                saldo_real = float(inv["saldos"].get("usdt") or 0)
+                saldo_clp = float(inv["saldos"].get("clp") or 0)
+                # el precio al que compraria: el del libro que se barre mas
+                # abajo todavia no esta, asi que se usa el de referencia.
+                px = float(inv.get("precio_ref_actual") or 0)
+                if saldo_clp > 0 and px > 0:
+                    saldo_real = saldo_clp / px
         except Exception as e:
             print(f"[ciclo saldo] {e}")
         if saldo_real and saldo_real >= 10:
@@ -12138,12 +12218,12 @@ def api_ciclo():
                    f"la venta va a tardar en llenarse.")
 
     # mercado lento: aunque el margen exista, los ciclos no se van a cumplir
-    ratio = None
-    try:
-        op = api_operativa().get_json()
-        ratio = (op.get("mercado") or {}).get("vs_promedio_12h")
-    except Exception:
-        pass
+    # COL55 — antes esto llamaba a api_operativa() ENTERO para sacar UN numero.
+    # Y api_operativa() a su vez llama a api_inventario(), que hace 4 consultas
+    # mas — o sea que para saber "que tan rapido rota el mercado" se recalculaba
+    # todo el inventario, encima por segunda vez en el mismo pedido (api_ciclo
+    # ya lo habia llamado arriba para el saldo). Ahora usa el helper directo.
+    ratio = _ratio_rotacion()
     if ratio is not None and ratio < 0.7 and veredicto == "VERDE":
         avisos.append(f"Mercado lento ({ratio}x vs 12h): los {ciclos} ciclos/día estimados "
                       "probablemente no se cumplan hoy, aunque el margen exista.")
@@ -12163,9 +12243,11 @@ def api_ciclo():
     return jsonify({
         "monto": round(monto),
         "margen_objetivo": margen,
-        # COL44: saldo real (guarda-rail) y las tandas MEDIDAS de recompra,
-        # que son las que de verdad importan para esta estrategia.
-        "saldo_real_usdt": (round(saldo_real, 2) if saldo_real else None),
+        # COL56: cuanto se puede recomprar con los PESOS disponibles (no con
+        # los dolares: los dolares son lo que se vende). Se manda tambien el
+        # CLP crudo para que la UI pueda decir de donde sale el tope.
+        "puede_recomprar_usdt": (round(saldo_real, 2) if saldo_real else None),
+        "clp_disponible": (round(saldo_clp) if saldo_clp else None),
         "acotado_por_saldo": bool(saldo_real and not monto_pedido
                                   and float(c.get("CICLO_MONTO_DEFAULT", 1200)) > saldo_real),
         "tandas": _tandas_recompra(),
@@ -12599,6 +12681,7 @@ def api_inventario_ancla():
     except Exception as e:
         print(f"[ancla] {e}")
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
+    _invalidar_inventario()   # COL55: el cache no puede sobrevivir a un ancla nueva
     return jsonify({"ok": True, "usdt": usdt, "clp": clp,
                     "precio_ref": round(precio, 2), "drift": drift,
                     "aviso_duplicado": aviso_duplicado})
@@ -12642,6 +12725,7 @@ def api_inventario_movimiento():
     except Exception as e:
         print(f"[movimiento] {e}")
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
+    _invalidar_inventario()   # COL55
     return jsonify({"ok": True, "id": nuevo, "tipo": tipo, "lado": lado,
                     "usdt": usdt, "clp": round(clp), "precio": precio})
 
@@ -12711,6 +12795,7 @@ def api_inventario_movimiento_editar(mid):
                 if request.method == "DELETE":
                     cur.execute("DELETE FROM movimientos_inventario WHERE id = %s", [mid])
                     conn.commit()
+                    _invalidar_inventario()   # COL55
                     return jsonify({"ok": True, "borrado": antes})
 
                 data = request.get_json() or {}
@@ -12751,6 +12836,7 @@ def api_inventario_movimiento_editar(mid):
     except Exception as e:
         print(f"[movimiento editar] {e}")
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
+    _invalidar_inventario()   # COL55
     return jsonify({"ok": True, "antes": antes,
                     "ahora": {"id": mid, "tipo": tipo, "lado": lado, "usdt": usdt,
                               "clp": round(clp), "precio": precio}})
