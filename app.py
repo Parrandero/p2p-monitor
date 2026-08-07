@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL58"
-VERSION_FECHA = "2026-08-06"
+VERSION       = "COL59"
+VERSION_FECHA = "2026-08-07"
 
 config = {
     "MONEDA":               "USDT",
@@ -5914,6 +5914,144 @@ function FichaAnunciante({ inicial }) {
 }
 
 /* ============================================================
+   MI MINIMO — que pasa en cada tramo (COL59)
+   El minimo que publicas define contra QUIEN competis y que TICKET te entra.
+   Esta tarjeta pone los dos lados juntos: lo que la historia dice de cada
+   tramo, y como esta el libro ahora mismo. Con tu fila marcada.
+   Lenguaje llano a proposito: "ticket que entra" y no "ticket medio",
+   "se mueve" y no "velocidad de fill".
+   ============================================================ */
+function TramosMinimo() {
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  const [dias, setDias] = React.useState(14);
+  React.useEffect(() => {
+    let stop = false;
+    fetch(B + "/api/minimos?dias=" + dias)
+      .then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
+    return () => { stop = true; };
+  }, [dias]);
+
+  if (!d) return <div className="intel-loading">Midiendo los tramos…</div>;
+  if (d.error) return <div className="intel-loading">No se pudo calcular: {d.error}</div>;
+
+  const yo = d.yo;
+  const fN = (v, n) => v == null ? "—" : Number(v).toLocaleString("es-CL",
+    { minimumFractionDigits: n || 0, maximumFractionDigits: n || 0 });
+  const th = { textAlign: "right", padding: "6px 8px", fontSize: 11,
+               color: "var(--text-3)", fontWeight: 500, whiteSpace: "nowrap" };
+  const td = { textAlign: "right", padding: "7px 8px", fontFamily: "var(--mono)",
+               fontSize: 12.5 };
+
+  return (
+    <section className="chart-card">
+      <div className="card-head">
+        <h3>Mi mínimo</h3>
+        <span className="card-sub">contra quién competís según el mínimo que pedís, y qué tamaño de orden te entra</span>
+      </div>
+
+      {/* donde estoy parado — lo primero, porque es lo que vino a buscar */}
+      {yo && (
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "flex-end",
+                      background: "var(--bg-2)", border: "1px solid var(--line)",
+                      borderRadius: 9, padding: "10px 13px", marginBottom: 14 }}>
+          {!yo.publicado ? (
+            <div style={{ fontSize: 12, color: "var(--text-2)" }}>
+              Ahora no estás publicado en el libro, así que no se puede decir en qué tramo estás.
+            </div>
+          ) : (
+            <>
+              <div title="El mínimo que estás pidiendo en tu anuncio ahora mismo.">
+                <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Tu mínimo</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 17 }}>${fN(yo.min_orden)}</div>
+              </div>
+              <div title="El tramo en el que te deja ese mínimo. Es contra esta gente que competís de verdad.">
+                <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Tu tramo</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 17, color: "var(--accent)" }}>{yo.tramo || "—"}</div>
+              </div>
+              <div title={"Tus USDT vendidos divididos por tus órdenes, según el último dato que anclaste de Binance"
+                          + (yo.ticket_fuente === "csv" ? " (acá salió del CSV, no del ancla)." : ".")}>
+                <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Tu orden promedio</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 17 }}>{fN(yo.ticket)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span></div>
+              </div>
+              <div title="USDT por minuto que se te están vendiendo, medido sobre los últimos 30 minutos.">
+                <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Se te mueve</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 17 }}>{fN(yo.usdt_min, 1)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT/min</span></div>
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-3)", paddingBottom: 4 }}>
+                posición {yo.posicion} · ${fN(yo.precio, 2)}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 11, color: "var(--text-3)" }}>Historia de los últimos</span>
+        {[7, 14, 30].map(n => (
+          <button key={n} className={"pr-btn" + (dias === n ? " on" : "")}
+            onClick={() => setDias(n)}>{n} días</button>
+        ))}
+        {/* Los mínimos se empiezan a guardar el 29-jul, asi que pedir 30 dias
+            puede traer lo mismo que pedir 14. Decirlo evita que el numero
+            parezca tener mas respaldo del que tiene. */}
+        {d.cobertura && !d.cobertura.completo && (
+          <span style={{ fontSize: 11, color: "var(--warn)" }}
+                title={"Los mínimos se empezaron a guardar el " + d.cobertura.desde + ". Antes de esa fecha no hay dato, así que pedir más días no agrega nada todavía."}>
+            ⚠ hay {d.cobertura.dias_con_dato} días de datos, no {dias}
+          </span>
+        )}
+      </div>
+
+      <div style={{ overflowX: "auto" }}>
+        <table className="intel-table" style={{ minWidth: 640 }}>
+          <thead>
+            <tr>
+              <th style={{ ...th, textAlign: "left" }}>Si pedís un mínimo de…</th>
+              <th style={th} title="Cuántos anunciantes distintos operaron en ese tramo en el período elegido.">Compiten</th>
+              <th style={th} title="El tamaño típico de orden que le entra a la gente de ese tramo. Es la mediana, no el promedio: un gigante suelto no la mueve.">Orden que entra</th>
+              <th style={th} title="Cuántos avisos hay en ese tramo en el libro AHORA.">Avisos ahora</th>
+              <th style={th} title="El precio más competitivo dentro del tramo, en este momento.">Mejor precio</th>
+              <th style={th} title="USDT por minuto que se están vendiendo en ese tramo ahora, y qué porcentaje de sus avisos tuvo movimiento.">Se mueve</th>
+            </tr>
+          </thead>
+          <tbody>
+            {d.tramos.map(t => (
+              <tr key={t.clave}
+                  style={t.es_mi_tramo
+                    ? { background: "var(--bg-2)", outline: "1px solid var(--accent)" } : null}>
+                <td style={{ padding: "7px 8px", fontSize: 12.5 }}>
+                  {t.etiqueta}
+                  {t.es_mi_tramo && <span style={{ marginLeft: 7, fontSize: 10.5, color: "var(--accent)" }}>← estás acá</span>}
+                </td>
+                <td style={td}>{fN(t.anunciantes)}</td>
+                <td style={{ ...td, fontSize: 14, color: "var(--text)" }}>{fN(t.ticket)}</td>
+                <td style={td}>{fN(t.avisos_ahora)}</td>
+                <td style={td}>{fN(t.mejor_precio, 2)}</td>
+                <td style={td}>
+                  {fN(t.usdt_min, 1)}
+                  {t.pct_moviendose != null && (
+                    <span style={{ fontSize: 10.5, color: "var(--text-3)" }}> · {t.pct_moviendose}%</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="intel-explain">
+        <b>Antes de sacar conclusiones:</b> {d.aviso_causalidad}
+      </div>
+      <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 6 }}>
+        {d.nota} Libro {d.fuente_libro === "vivo" ? "en vivo" : "del colector"}
+        {d.edad_seg != null ? ", de hace " + fN(d.edad_seg) + "s" : ""}.
+      </div>
+    </section>
+  );
+}
+
+/* ============================================================
    CICLO DE RECOMPRA (COL27)
    Dado un monto, dice a que precio recomprar cruzando (VWAP real del libro)
    y a que precio publicar la venta para que quede el margen objetivo.
@@ -6352,7 +6490,7 @@ function Inteligencia() {
   // Ficha del competidor, que muestra todo eso y más para cualquiera.
   const GRUPOS = [
     ["CUÁNDO",        [["perfilhoras","🕐 Perfil por hora"]]],
-    ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"]]],
+    ["DÓNDE Y CÓMO",  [["curva","📍 Dónde pararme"],["minimos","📏 Mi mínimo"],["cruzar","⚖️ Cruzar o esperar"],["preciofill","💡 Precio vs Fill"],["profundidad","📊 Profundidad"]]],
     ["CONTRA QUIÉN",  [["basecomp","🗂️ Base de competidores"],["ficha","🔍 Ficha del competidor"],["farmers","🌾 Farmers"],["doble","🏷️ Doble precio"]]],
     ["CUÁNTO",        [["volumen","📊 Volumen de mercado"]]],
     ["CÓMO ME FUE",   [["pnl","💰 P&L por ciclo"]]],
@@ -6374,6 +6512,7 @@ function Inteligencia() {
         ))}
       </div>
 
+      {seccion==="minimos" && <TramosMinimo />}
       {seccion==="cruzar" && <div id="ciclo-recompra"><CicloRecompra /><CruzarOEsperar /></div>}
       {seccion==="ficha" && <FichaAnunciante inicial={fichaSel} />}
       {seccion==="perfilhoras" && <PerfilHoras />}
@@ -12032,6 +12171,240 @@ def api_inventario():
     with _inv_lock:
         _inv_cache["ts"], _inv_cache["data"] = time.time(), salida
     return jsonify(salida)
+
+
+# ══════════════════════════════════════════════════════════════
+#  TRAMOS DE MINIMO DE ORDEN (COL59)
+# ══════════════════════════════════════════════════════════════
+# Los cortes NO son numeros redondos elegidos a ojo: salen de la distribucion
+# real de minimos del libro, medida el 5-ago y re-verificada el 7-ago. Los
+# minimos publicados se amontonan en 10.000, 20.000, 50.000, 100.000 y
+# 275.000+, asi que cada tramo agrupa gente que le compite AL MISMO comprador.
+#
+# Cuando se porte el panel de punteros de COL50 (quedo en la rama descartada,
+# ver la nota grande de CAMBIOS.txt arriba de COL53), tiene que usar ESTA
+# lista y no una copia — si no, dos partes de la pantalla van a partir el
+# mercado distinto y van a decir cosas que no cierran entre si.
+TRAMOS_MINIMO = [
+    (0,      20000,  "minorista", "menos de $20.000"),
+    (20000,  50000,  "chico",     "$20.000 a $50.000"),
+    (50000,  100000, "medio",     "$50.000 a $100.000"),
+    (100000, 200000, "grande",    "$100.000 a $200.000"),
+    (200000, None,   "mayorista", "$200.000 o más"),
+]
+
+
+def _tramo_de(minimo):
+    """En que tramo cae un minimo. None si no hay dato (no se inventa)."""
+    if minimo is None:
+        return None
+    for desde, hasta, clave, _ in TRAMOS_MINIMO:
+        if minimo >= desde and (hasta is None or minimo < hasta):
+            return clave
+    return None
+
+
+@app.route("/api/minimos")
+def api_minimos():
+    """QUE PASA EN CADA TRAMO DE MINIMO DE ORDEN (COL59).
+
+    POR QUE EXISTE. El minimo que publicas define contra QUIEN competis: un
+    aviso que pide 5.000 y otro que pide 200.000 no los ve el mismo comprador,
+    aunque esten pegados en la lista. Y define tambien el TICKET que te entra,
+    que es lo que mueve el volumen. Medido el 7-ago sobre 228 anunciantes con
+    14 dias de historia, el ticket mediano sube monotono con el tramo:
+    57 -> 119 -> 167 -> 299 -> 619 USDT.
+
+    ── QUE ES HISTORIA Y QUE ES AHORA ──
+    Se mezclan dos fuentes a proposito, porque contestan preguntas distintas:
+      · de la HISTORIA (agregados_anunciante_dia, ultimos `dias`): el ticket
+        que de verdad entra en ese tramo y cuantas ordenes por dia se hacen.
+        Una foto del libro no puede decir esto.
+      · del LIBRO DE AHORA: cuantos compiten en este momento, a que precio y
+        cuanta plata hay parada. Esto la historia no lo dice.
+
+    ── OJO CON LEERLO COMO CAUSA ──
+    Que el tramo de arriba tenga mas ticket NO prueba que subir tu minimo te
+    suba el ticket. Los que ponen minimos altos suelen ser los que tienen mas
+    capital y mas actividad, asi que hay seleccion de por medio. Lo que el
+    numero dice con seguridad es DONDE ESTA CADA COSA en el mercado, no que
+    pasaria si te movieras. Por eso la respuesta trae 'aviso_causalidad' y la
+    tarjeta lo escribe en pantalla: no queremos que se lea como una promesa.
+
+    Params: ?dias=14&tipo=BUY   (BUY = donde publicas tu VENTA)"""
+    try:
+        dias = max(3, min(90, int(request.args.get("dias") or 14)))
+    except (TypeError, ValueError):
+        dias = 14
+    tipo = "SELL" if (request.args.get("tipo") or "BUY").upper() == "SELL" else "BUY"
+    with config_lock:
+        c = dict(config)
+    mi_nick = str(c.get("MI_NICKNAME") or "").strip()
+
+    # ── 1. la historia: ticket y ordenes por tramo ──────────────────
+    # Se agrupa primero POR ANUNCIANTE y recien despues por tramo. Si se
+    # agrupara directo por tramo, el que aparece 14 dias pesaria 14 veces mas
+    # que el que aparecio 1 — y el promedio contaria dias, no competidores.
+    # La MODA del minimo (no el promedio): si alguien edito el limite un rato,
+    # el promedio se ensucia y la moda sigue mostrando con cual opera.
+    sql = """
+        WITH por_anunciante AS (
+            SELECT anunciante,
+                   mode() WITHIN GROUP (ORDER BY min_orden_moda) AS min_hab,
+                   AVG(ticket_medio) FILTER (WHERE ticket_medio > 0) AS ticket,
+                   AVG(ordenes_dia)  FILTER (WHERE ordenes_dia  > 0) AS ord_dia,
+                   AVG(pos_media)                                    AS pos,
+                   bool_or(es_merchant)                              AS merchant,
+                   COUNT(DISTINCT fecha)                             AS dias
+            FROM agregados_anunciante_dia
+            WHERE exchange = 'binance' AND tipo = %(t)s
+              AND fecha >= CURRENT_DATE - %(d)s
+              AND min_orden_moda IS NOT NULL
+            GROUP BY anunciante
+        ), con_tramo AS (
+            SELECT *, CASE WHEN min_hab <  20000 THEN 0
+                           WHEN min_hab <  50000 THEN 1
+                           WHEN min_hab < 100000 THEN 2
+                           WHEN min_hab < 200000 THEN 3
+                           ELSE 4 END AS ix
+            FROM por_anunciante
+            WHERE dias >= 2      -- un solo dia de dato no describe a nadie
+        )
+        SELECT ix,
+               COUNT(*)                                           AS anunciantes,
+               COUNT(*) FILTER (WHERE ticket IS NOT NULL)         AS con_ticket,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY ticket)  AS ticket_med,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY ord_dia) AS ord_dia_med,
+               SUM(ticket * ord_dia)                              AS usdt_dia,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY pos)     AS pos_med,
+               COUNT(*) FILTER (WHERE merchant)                   AS merchants
+        FROM con_tramo GROUP BY ix ORDER BY ix
+    """
+    hist, cobertura = {}, None
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL statement_timeout = '40s'")
+                cur.execute(sql, {"d": dias, "t": tipo})
+                for r in cur.fetchall():
+                    hist[int(r["ix"])] = dict(r)
+                # ── cuanta historia hay DE VERDAD ──
+                # Los minimos se empezaron a guardar recien con COL32 (29-jul),
+                # asi que pedir 30 dias puede devolver lo mismo que pedir 14 y
+                # dar la impresion de que hay mas respaldo del que hay. La
+                # tarjeta muestra este numero para que no se lea de mas.
+                cur.execute("""SELECT MIN(fecha) AS desde, MAX(fecha) AS hasta,
+                                      COUNT(DISTINCT fecha) AS dias
+                               FROM agregados_anunciante_dia
+                               WHERE exchange = 'binance' AND tipo = %(t)s
+                                 AND fecha >= CURRENT_DATE - %(d)s
+                                 AND min_orden_moda IS NOT NULL""",
+                            {"d": dias, "t": tipo})
+                r = cur.fetchone()
+                if r and r["dias"]:
+                    cobertura = {"desde": str(r["desde"]), "hasta": str(r["hasta"]),
+                                 "dias_con_dato": int(r["dias"]),
+                                 "completo": int(r["dias"]) >= dias - 1}
+    except Exception as e:
+        print(f"[minimos historia] {e}")
+
+    # ── 2. el libro de ahora ────────────────────────────────────────
+    libro, edad_seg = libro_vivo_como_detalle(tipo)
+    fuente = "vivo"
+    if not libro:
+        fuente = "colector"
+        with data_lock:
+            snap = dict(ultimo_estado)
+        libro = snap.get("detalle_compra" if tipo == "BUY" else "detalle_venta") or []
+    libro = [a for a in libro if a.get("min_orden") and float(a.get("precio") or 0) > 0]
+
+    # ── 3. donde estoy yo ───────────────────────────────────────────
+    mio = None
+    if mi_nick:
+        for a in libro:
+            if (a.get("anunciante") or "").strip().lower() == mi_nick.lower():
+                mio = a
+                break
+
+    # mi ticket REAL: volumen sobre ordenes del ancla de Binance. Es la misma
+    # cuenta que usa /api/merchant (ticket_cal), no una paralela — si dieran
+    # distinto tendriamos dos respuestas para la misma pregunta.
+    mi_ticket, mi_ticket_fuente = None, None
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT vol_30d_btc, ordenes_30d FROM merchant_ancla "
+                            "ORDER BY ts DESC LIMIT 1")
+                r = cur.fetchone()
+        btc = _btc_usd()
+        if r and btc and r["vol_30d_btc"] and r["ordenes_30d"]:
+            mi_ticket = (float(r["vol_30d_btc"]) * btc) / float(r["ordenes_30d"])
+            mi_ticket_fuente = "ancla"
+        elif c.get("MI_TICKET_MEDIO"):
+            mi_ticket = float(c["MI_TICKET_MEDIO"])
+            mi_ticket_fuente = "csv"
+    except Exception as e:
+        print(f"[minimos ticket] {e}")
+
+    mi_tramo = _tramo_de(mio.get("min_orden") if mio else None)
+
+    # ── 4. armar la respuesta tramo por tramo ───────────────────────
+    salida = []
+    for ix, (desde, hasta, clave, etiqueta) in enumerate(TRAMOS_MINIMO):
+        g = [a for a in libro
+             if a["min_orden"] >= desde and (hasta is None or a["min_orden"] < hasta)]
+        precios = sorted(float(a["precio"]) for a in g)
+        vels = [float(a.get("velocidad") or 0) for a in g]
+        h = hist.get(ix) or {}
+        fl = lambda v, n=0: (round(float(v), n) if v is not None else None)
+        salida.append({
+            "clave": clave, "etiqueta": etiqueta, "desde": desde, "hasta": hasta,
+            "es_mi_tramo": clave == mi_tramo,
+            # historia
+            "anunciantes": h.get("anunciantes"),
+            "con_ticket": h.get("con_ticket"),
+            "ticket": fl(h.get("ticket_med")),
+            "ordenes_dia": fl(h.get("ord_dia_med"), 1),
+            "usdt_dia": fl(h.get("usdt_dia")),
+            "posicion_media": fl(h.get("pos_med")),
+            "merchants": h.get("merchants"),
+            # ahora
+            "avisos_ahora": len(g),
+            "mejor_precio": (precios[0] if precios else None),
+            "precio_medio": (precios[len(precios) // 2] if precios else None),
+            "usdt_publicados": round(sum(float(a.get("disponible") or 0) for a in g)),
+            "usdt_min": round(sum(vels), 1),
+            "pct_moviendose": (round(sum(1 for v in vels if v > 0) / len(g) * 100)
+                               if g else None),
+        })
+
+    return jsonify({
+        "dias": dias, "tipo": tipo,
+        "cobertura": cobertura,
+        "fuente_libro": fuente,
+        "edad_seg": (round(edad_seg, 1) if edad_seg is not None else None),
+        "tramos": salida,
+        "yo": ({
+            "publicado": bool(mio),
+            "min_orden": (mio.get("min_orden") if mio else None),
+            "max_orden": (mio.get("max_orden") if mio else None),
+            "tramo": mi_tramo,
+            "precio": (mio.get("precio") if mio else None),
+            "posicion": (mio.get("posicion") if mio else None),
+            "usdt_min": (mio.get("velocidad") if mio else None),
+            "ticket": (round(mi_ticket, 1) if mi_ticket else None),
+            "ticket_fuente": mi_ticket_fuente,
+        } if mi_nick else None),
+        "aviso_causalidad":
+            ("El ticket sube con el tramo, pero eso no prueba que mover tu mínimo "
+             "te suba el ticket a vos: los que piden mínimos altos suelen ser los "
+             "que tienen más capital y más actividad. Esto te muestra dónde está "
+             "cada cosa en el mercado, no qué pasaría si te movieras."),
+        "nota": (f"Ticket y órdenes/día salen de los últimos {dias} días "
+                 f"(un dato por anunciante, no por día, para que el que aparece "
+                 f"todos los días no pese más que el que aparece dos veces). "
+                 f"Avisos, precio y movimiento salen del libro de ahora."),
+    })
 
 
 @app.route("/api/ciclo")
