@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL56"
+VERSION       = "COL57"
 VERSION_FECHA = "2026-08-06"
 
 config = {
@@ -5995,6 +5995,7 @@ function CicloRecompra() {
   // Antes miraba el saldo en USDT, que es al reves: los dolares son lo que
   // se vende, no con lo que se recompra.
   const saldo = d.puede_recomprar_usdt;
+  const cap = d.capacidad;      // COL57: cuánto podés recomprar ya / cuando vendas todo
   const t = d.tandas;
   const PRESETS = t
     ? [["chica", t.chica], ["habitual", t.habitual], ["grande", t.grande], ["máxima", t.maxima]]
@@ -6033,6 +6034,34 @@ function CicloRecompra() {
                        borderRadius: 7, color: "var(--text)", fontFamily: "var(--mono)",
                        fontSize: 13, padding: "6px 9px" }} />
           </div>
+          {/* COL57 — CUANTO PODES RECOMPRAR, en dos tiempos.
+              Pedido de Sebastian: "puedo comprar solo 220 ahora, pero en
+              cuanto me salgan unas ordenes voy a poder recomprar mas —
+              no estoy viendo el precio que realmente podria recomprar".
+              El de la izquierda es lo que puede hacer YA; el de la derecha
+              es el techo de la jornada si le entran todas las ventas. */}
+          {cap && (cap.ahora_usdt != null || cap.total_usdt != null) && (
+            <div style={{ display: "flex", gap: 14, marginTop: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+              <div title={"Con los " + fN(cap.clp_disponible) + " pesos que tenés ahora, al precio de barrer el libro ($" + fN(cap.precio_usado, 2) + ")."}>
+                <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Podés recomprar ya</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)" }}>
+                  {fN(cap.ahora_usdt, 0)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span>
+                </div>
+              </div>
+              <div style={{ color: "var(--text-3)", paddingBottom: 3 }}>→</div>
+              <div title={"Si además se te venden los " + fN(cap.usdt_por_vender, 0) + " USDT que tenés publicados, vas a poder recomprar hasta acá. Es el techo de la jornada, no algo que puedas hacer ahora mismo."}>
+                <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Cuando vendas todo</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 17, color: "var(--accent)" }}>
+                  {fN(cap.total_usdt, 0)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span>
+                </div>
+              </div>
+              {cap.usdt_por_vender ? (
+                <div style={{ fontSize: 10.5, color: "var(--text-3)", paddingBottom: 4 }}>
+                  te quedan {fN(cap.usdt_por_vender, 0)} USDT por vender
+                </div>
+              ) : null}
+            </div>
+          )}
         </div>
         <div>
           <div style={{ fontSize: 10.5, color: "var(--text-3)", marginBottom: 4 }}>Margen objetivo (%)</div>
@@ -12026,23 +12055,25 @@ def api_ciclo():
     # CLP podia recomprar ~699. Diez veces menos de lo real.
     # El tope ahora es cuantos USDT ALCANZAN los pesos disponibles.
     saldo_clp = None
+    saldo_usdt = None
+    patrimonio_clp = None
     saldo_real = None          # tope expresado en USDT, para la UI
-    if not monto_pedido:
-        try:
-            inv = api_inventario().get_json()
-            if inv.get("configurado") and inv.get("saldos"):
-                saldo_clp = float(inv["saldos"].get("clp") or 0)
-                # el precio al que compraria: el del libro que se barre mas
-                # abajo todavia no esta, asi que se usa el de referencia.
-                px = float(inv.get("precio_ref_actual") or 0)
-                if saldo_clp > 0 and px > 0:
-                    saldo_real = saldo_clp / px
-        except Exception as e:
-            print(f"[ciclo saldo] {e}")
-        if saldo_real and saldo_real >= 10:
-            monto = min(monto, saldo_real)
+    # el inventario se pide SIEMPRE (no solo sin monto_pedido) porque los dos
+    # numeros de capacidad se muestran igual aunque estes simulando un monto.
+    # Sale del cache de 8s (COL55), asi que no cuesta.
+    try:
+        inv = api_inventario().get_json()
+        if inv.get("configurado") and inv.get("saldos"):
+            saldo_clp = float(inv["saldos"].get("clp") or 0)
+            saldo_usdt = float(inv["saldos"].get("usdt") or 0)
+            patrimonio_clp = float(inv.get("patrimonio_clp") or 0)
+    except Exception as e:
+        print(f"[ciclo saldo] {e}")
+    # el tope se aplica MAS ABAJO, recien cuando se conoce el precio del libro
+    # (ver "acotar el monto"): con el precio de referencia del inventario daba
+    # un numero distinto al de la capacidad y quedaban dos respuestas para la
+    # misma pregunta en la misma tarjeta.
 
-    monto = max(10.0, min(100000.0, monto))
     margen = max(0.0, min(10.0, margen))
 
     # ── de donde sale el libro (COL38) ──────────────────────────────
@@ -12106,6 +12137,18 @@ def api_ciclo():
     reales.sort(key=lambda a: float(a["precio"]))
     if not reales:
         return jsonify({"error": "no hay anuncios reales en el libro"}), 503
+
+    # ── acotar el monto a los PESOS disponibles (COL56, reubicado en COL57) ──
+    # Se hace aca y no arriba porque recien ahora existe el precio del libro.
+    # Antes se usaba el precio de referencia del inventario, que esta 0,3% por
+    # debajo del libro: el tope daba 219 USDT y la capacidad (calculada con el
+    # VWAP del barrido) daba 218. Dos numeros para lo mismo en la misma
+    # tarjeta. Ahora ambos salen del libro y coinciden.
+    if saldo_clp and saldo_clp > 0:
+        saldo_real = saldo_clp / float(reales[0]["precio"])
+        if not monto_pedido and saldo_real >= 10:
+            monto = min(monto, saldo_real)
+    monto = max(10.0, min(100000.0, monto))
 
     # ── 1. barrer el libro RESPETANDO LOS LIMITES DE CADA ANUNCIO (COL32) ──
     # Antes se barria solo por 'disponible', asi que el VWAP podia salir de
@@ -12243,10 +12286,33 @@ def api_ciclo():
     return jsonify({
         "monto": round(monto),
         "margen_objetivo": margen,
-        # COL56: cuanto se puede recomprar con los PESOS disponibles (no con
-        # los dolares: los dolares son lo que se vende). Se manda tambien el
-        # CLP crudo para que la UI pueda decir de donde sale el tope.
-        "puede_recomprar_usdt": (round(saldo_real, 2) if saldo_real else None),
+        # ── CAPACIDAD DE RECOMPRA (COL57) ────────────────────────────
+        # DOS numeros, porque responden preguntas distintas y Sebastian
+        # necesita las dos:
+        #   ahora  = con los pesos que YA tengo (lo que puedo hacer ya)
+        #   total  = si ademas vendo todo el USDT que tengo parado
+        # El segundo es el que faltaba: "puedo comprar solo 220 ahora, pero
+        # en cuanto me salgan unas ordenes voy a poder recomprar mas" — sin
+        # ese numero no se ve el techo real de la jornada.
+        # Se dividen por el VWAP (el precio REAL de barrer el libro por este
+        # monto), no por el precio de referencia: es lo que de verdad va a
+        # pagar. Por eso se calcula aca abajo y no arriba.
+        # El VWAP del barrido chico y el del grande casi no se diferencian
+        # (medido 6-ago: 919,34 barriendo 219 vs 919,24 barriendo 763 — un
+        # 0,01%), asi que usar uno solo para los dos numeros no distorsiona.
+        # Nota: el grande sale un pelo MAS BARATO, porque al comprar mas se
+        # habilitan anuncios con minimo de 400.000 CLP que quedan afuera en
+        # una tanda chica.
+        "capacidad": ({
+            "ahora_usdt": round(saldo_clp / vwap, 1) if (saldo_clp and vwap) else None,
+            "total_usdt": round(patrimonio_clp / vwap, 1) if (patrimonio_clp and vwap) else None,
+            "clp_disponible": round(saldo_clp) if saldo_clp else None,
+            "usdt_por_vender": round(saldo_usdt, 2) if saldo_usdt else None,
+            "precio_usado": round(vwap, 2) if vwap else None,
+        } if (saldo_clp is not None or patrimonio_clp) else None),
+        # misma pregunta que capacidad.ahora_usdt -> tiene que dar lo mismo,
+        # asi que sale del mismo calculo y no de una cuenta paralela.
+        "puede_recomprar_usdt": (round(saldo_clp / vwap, 2) if (saldo_clp and vwap) else None),
         "clp_disponible": (round(saldo_clp) if saldo_clp else None),
         "acotado_por_saldo": bool(saldo_real and not monto_pedido
                                   and float(c.get("CICLO_MONTO_DEFAULT", 1200)) > saldo_real),
