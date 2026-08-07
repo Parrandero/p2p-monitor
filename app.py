@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL59"
+VERSION       = "COL61"
 VERSION_FECHA = "2026-08-07"
 
 config = {
@@ -6044,8 +6044,10 @@ function TramosMinimo() {
         <b>Antes de sacar conclusiones:</b> {d.aviso_causalidad}
       </div>
       <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 6 }}>
-        {d.nota} Libro {d.fuente_libro === "vivo" ? "en vivo" : "del colector"}
-        {d.edad_seg != null ? ", de hace " + fN(d.edad_seg) + "s" : ""}.
+        {d.nota}{" "}
+        <span title="Acá se usa la foto del libro completo (los 80 avisos) y no el libro de 10 segundos, porque ese trae solo los 20 primeros y no mide movimiento. Para saber cuántos compiten y cuánto se mueve hace falta el libro entero.">
+          Libro completo de hace {d.edad_seg != null ? fN(d.edad_seg) + "s" : "un rato"}.
+        </span>
       </div>
     </section>
   );
@@ -6150,13 +6152,46 @@ function CicloRecompra() {
       </div>
 
       {/* controles */}
+      {/* COL61 — LA CAPACIDAD VA ARRIBA, EL TICKET ABAJO.
+          Pedido de Sebastian: "arriba me diga cuanto puedo comprar con lo
+          que tengo y cuanto si vendo todo, y abajo el ticket". Arriba es
+          contexto (con cuanta plata cuento); abajo es la decision (que
+          tamaño voy a operar), que es la que manda el calculo de precios. */}
+      {/* COL57 — CUANTO PODES RECOMPRAR, en dos tiempos.
+          Pedido de Sebastian: "puedo comprar solo 220 ahora, pero en
+          cuanto me salgan unas ordenes voy a poder recomprar mas —
+          no estoy viendo el precio que realmente podria recomprar".
+          El de la izquierda es lo que puede hacer YA; el de la derecha
+          es el techo de la jornada si le entran todas las ventas. */}
+      {cap && (cap.ahora_usdt != null || cap.total_usdt != null) && (
+        <div style={{ display: "flex", gap: 14, marginTop: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+          <div title={"Con los " + fN(cap.clp_disponible) + " pesos que tenés ahora, al precio de barrer el libro ($" + fN(cap.precio_usado, 2) + ")."}>
+            <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Podés recomprar ya</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)" }}>
+              {fN(cap.ahora_usdt, 0)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span>
+            </div>
+          </div>
+          <div style={{ color: "var(--text-3)", paddingBottom: 3 }}>→</div>
+          <div title={"Si además se te venden los " + fN(cap.usdt_por_vender, 0) + " USDT que tenés publicados, vas a poder recomprar hasta acá. Es el techo de la jornada, no algo que puedas hacer ahora mismo."}>
+            <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Cuando vendas todo</div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 17, color: "var(--accent)" }}>
+              {fN(cap.total_usdt, 0)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span>
+            </div>
+          </div>
+          {cap.usdt_por_vender ? (
+            <div style={{ fontSize: 10.5, color: "var(--text-3)", paddingBottom: 4 }}>
+              te quedan {fN(cap.usdt_por_vender, 0)} USDT por vender
+            </div>
+          ) : null}
+        </div>
+      )}
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
         <div>
           <div style={{ fontSize: 10.5, color: "var(--text-3)", marginBottom: 4 }}>
-            Tanda a recomprar (USDT)
+            Tu ticket: con cuánto vas a operar (USDT)
             {t && <span style={{ marginLeft: 6, color: "var(--text-3)" }}
-                    title={"Salen de tus " + t.n + " recompras taker reales, no de números redondos."}>
-              · según tus {t.n} recompras reales</span>}
+                    title={"Los botones salen de tus " + t.n + " recompras taker reales, no de números redondos."}>
+              · los botones salen de tus {t.n} recompras reales</span>}
           </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
             {PRESETS.map(([etq, p]) => (
@@ -6172,34 +6207,6 @@ function CicloRecompra() {
                        borderRadius: 7, color: "var(--text)", fontFamily: "var(--mono)",
                        fontSize: 13, padding: "6px 9px" }} />
           </div>
-          {/* COL57 — CUANTO PODES RECOMPRAR, en dos tiempos.
-              Pedido de Sebastian: "puedo comprar solo 220 ahora, pero en
-              cuanto me salgan unas ordenes voy a poder recomprar mas —
-              no estoy viendo el precio que realmente podria recomprar".
-              El de la izquierda es lo que puede hacer YA; el de la derecha
-              es el techo de la jornada si le entran todas las ventas. */}
-          {cap && (cap.ahora_usdt != null || cap.total_usdt != null) && (
-            <div style={{ display: "flex", gap: 14, marginTop: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
-              <div title={"Con los " + fN(cap.clp_disponible) + " pesos que tenés ahora, al precio de barrer el libro ($" + fN(cap.precio_usado, 2) + ")."}>
-                <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Podés recomprar ya</div>
-                <div style={{ fontFamily: "var(--mono)", fontSize: 17, color: "var(--text)" }}>
-                  {fN(cap.ahora_usdt, 0)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span>
-                </div>
-              </div>
-              <div style={{ color: "var(--text-3)", paddingBottom: 3 }}>→</div>
-              <div title={"Si además se te venden los " + fN(cap.usdt_por_vender, 0) + " USDT que tenés publicados, vas a poder recomprar hasta acá. Es el techo de la jornada, no algo que puedas hacer ahora mismo."}>
-                <div style={{ fontSize: 11, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Cuando vendas todo</div>
-                <div style={{ fontFamily: "var(--mono)", fontSize: 17, color: "var(--accent)" }}>
-                  {fN(cap.total_usdt, 0)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span>
-                </div>
-              </div>
-              {cap.usdt_por_vender ? (
-                <div style={{ fontSize: 10.5, color: "var(--text-3)", paddingBottom: 4 }}>
-                  te quedan {fN(cap.usdt_por_vender, 0)} USDT por vender
-                </div>
-              ) : null}
-            </div>
-          )}
         </div>
         <div>
           <div style={{ fontSize: 10.5, color: "var(--text-3)", marginBottom: 4 }}>Margen objetivo (%)</div>
@@ -6238,8 +6245,9 @@ function CicloRecompra() {
       {saldo != null && nMonto > saldo + 1 && (
         <div style={{ marginBottom: 12, padding: "7px 11px", borderRadius: 8, fontSize: 11.5,
                      background: "rgba(255,145,0,0.1)", border: "1px solid var(--warn)", color: "var(--warn)" }}>
-          ⚠ Estás simulando {fN(nMonto)} USDT, pero con tus {d.clp_disponible ? fN(d.clp_disponible) + " pesos" : "pesos"} alcanza
-          para comprar {fN(saldo)}. Sirve para ver el escenario, no para operar ahora.
+          ⚠ Los precios de abajo son para una tanda de {fN(nMonto)} USDT, pero con tus{" "}
+          {d.clp_disponible ? fN(d.clp_disponible) + " pesos" : "pesos"} de ahora te alcanza para {fN(saldo)}.
+          El cálculo no se toca: te avisa, no te cambia el número.
         </div>
       )}
       {t && t.maxima && nMonto > t.maxima && (saldo == null || nMonto <= saldo + 1) && (
@@ -8082,6 +8090,15 @@ function CarreraMerchant() {
               {r.actual == null ? "—" : nf(r.actual, r.unidad === "BTC" ? 4 : (r.unidad === "%" ? 1 : 0))}
               <span style={{ fontSize: 10.5, color: "var(--text-3)", fontWeight: 400 }}> / {nf(r.meta, r.unidad === "BTC" ? 1 : 0)}</span>
             </div>
+            {/* COL60 — el mismo requisito en dolares. Binance lo pide en BTC
+                pero Sebastian opera en USDT: "0,219 BTC" no dice nada,
+                "14.200 USDT" si. */}
+            {r.en_usdt && r.en_usdt.actual != null && (
+              <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--text-3)" }}
+                   title={"El mismo número en dólares, al precio del BTC de hoy ($" + nf(p.btc_usd) + "). Se mueve solo cuando se mueve el BTC."}>
+                {nf(r.en_usdt.actual)} / {nf(r.en_usdt.meta)} USDT
+              </div>
+            )}
             {r.pct != null && (
               <div className="hbar" style={{ marginTop: 4 }}>
                 <div className="hbar-fill" style={{ width: Math.min(100, r.pct) + "%", background: r.cumple ? "var(--buy)" : "var(--warn)" }} />
@@ -8090,7 +8107,8 @@ function CarreraMerchant() {
             <div style={{ fontSize: 10, color: r.cumple ? "var(--buy)" : "var(--text-3)", marginTop: 3 }}>
               {r.actual == null ? "cargá los datos de Binance"
                 : r.cumple ? "✓ cumplido"
-                : "faltan " + nf(r.falta, r.unidad === "BTC" ? 4 : 0) + " " + r.unidad}
+                : "faltan " + nf(r.falta, r.unidad === "BTC" ? 4 : 0) + " " + r.unidad
+                  + (r.en_usdt && r.en_usdt.falta ? " · " + nf(r.en_usdt.falta) + " USDT" : "")}
             </div>
           </div>
         ))}
@@ -8113,6 +8131,38 @@ function CarreraMerchant() {
               </div>
             ))}
           </div>
+          {/* COL61 — el ticket se fija en el CICLO, aca solo se LEE.
+              Antes habia un campo propio en esta tarjeta: dos lugares para
+              fijar la misma cosa. Ahora se pone una sola vez, en el Ciclo,
+              y esta tarjeta contesta que significa ese numero para la meta. */}
+          {p.ticket_plan ? (
+            <div style={{ display: "flex", gap: 14, alignItems: "flex-end", flexWrap: "wrap",
+                          background: "var(--bg-1)", border: "1px solid var(--line-soft)",
+                          borderRadius: 9, padding: "9px 11px", marginBottom: 8 }}>
+              <div title="Es el tamaño de recompra que fijaste en la tarjeta Ciclo, en Inteligencia. Se cambia allá.">
+                <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                  Con recompras de
+                </div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 17 }}>
+                  {nf(p.ticket_plan)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>USDT</span>
+                </div>
+              </div>
+              <div style={{ color: "var(--text-3)", paddingBottom: 6 }}>→</div>
+              <div title="Cuántas órdenes por día harían falta, con ese tamaño, para sostener la meta de volumen.">
+                <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Necesitás</div>
+                <div style={{ fontFamily: "var(--mono)", fontSize: 17, color: "var(--accent)" }}>
+                  {nf(p.ordenes_dia_con_ticket_plan, 1)} <span style={{ fontSize: 11, color: "var(--text-3)" }}>órdenes/día</span>
+                </div>
+              </div>
+              {p.ordenes_dia_con_ticket_actual && (
+                <div style={{ fontSize: 10.5, color: "var(--text-3)", paddingBottom: 5 }}
+                     title="Cuántas órdenes por día harían falta si seguís con el tamaño que venís haciendo de verdad.">
+                  con tu tamaño de hoy serían {nf(p.ordenes_dia_con_ticket_actual, 1)}
+                </div>
+              )}
+            </div>
+          ) : null}
+
           {/* días parados: la ventana móvil drena igual (COL37) */}
           {p.dias_parado != null && p.dias_parado >= 1 && (
             <div style={{ background: "var(--sell-soft)", border: "1px solid var(--sell)",
@@ -12309,13 +12359,32 @@ def api_minimos():
         print(f"[minimos historia] {e}")
 
     # ── 2. el libro de ahora ────────────────────────────────────────
-    libro, edad_seg = libro_vivo_como_detalle(tipo)
-    fuente = "vivo"
-    if not libro:
-        fuente = "colector"
-        with data_lock:
-            snap = dict(ultimo_estado)
-        libro = snap.get("detalle_compra" if tipo == "BUY" else "detalle_venta") or []
+    # ★ ACA VA LA FOTO DEL COLECTOR, NO EL LIBRO VIVO (arreglado el 7-ago,
+    # ver COL59b en CAMBIOS.txt). El libro vivo trae solo los 20 primeros de
+    # un lado y no calcula velocidad, porque existe para otra cosa: que el
+    # Ciclo barra el precio de recompra con datos de 10 segundos, y para eso
+    # el top-20 alcanza y sobra.
+    # Esta tarjeta pregunta lo opuesto: CUANTOS compiten en cada tramo y
+    # CUANTO se mueve. Con el top-20 los tramos de abajo daban cero avisos
+    # (los 20 mejores precios son casi todos de minimo alto) y el movimiento
+    # daba cero siempre. La foto del colector trae los 80 y sí trae velocidad;
+    # que tenga 2 minutos no molesta para una pregunta de estructura.
+    fuente, edad_seg = "colector", None
+    with data_lock:
+        snap = dict(ultimo_estado)
+    libro = snap.get("detalle_compra" if tipo == "BUY" else "detalle_venta") or []
+    try:
+        ts_snap = snap.get("timestamp")
+        if ts_snap:
+            edad_seg = (datetime.now(SANTIAGO_TZ)
+                        - datetime.strptime(str(ts_snap)[:19], "%Y-%m-%d %H:%M:%S")
+                        .replace(tzinfo=SANTIAGO_TZ)).total_seconds()
+    except Exception:
+        pass
+    if not libro:                       # recien arrancado: mejor 20 que nada
+        libro, edad_seg = libro_vivo_como_detalle(tipo)
+        libro = libro or []
+        fuente = "vivo (solo top-20, el colector todavía no tiene foto)"
     libro = [a for a in libro if a.get("min_orden") and float(a.get("precio") or 0) > 0]
 
     # ── 3. donde estoy yo ───────────────────────────────────────────
@@ -12526,16 +12595,33 @@ def api_ciclo():
     if not reales:
         return jsonify({"error": "no hay anuncios reales en el libro"}), 503
 
-    # ── acotar el monto a los PESOS disponibles (COL56, reubicado en COL57) ──
-    # Se hace aca y no arriba porque recien ahora existe el precio del libro.
-    # Antes se usaba el precio de referencia del inventario, que esta 0,3% por
-    # debajo del libro: el tope daba 219 USDT y la capacidad (calculada con el
-    # VWAP del barrido) daba 218. Dos numeros para lo mismo en la misma
-    # tarjeta. Ahora ambos salen del libro y coinciden.
+    # ── EL MONTO ES TU TICKET FIJO, NO TU SALDO (COL61) ─────────────
+    # ★ Se DESHACE el acotado automatico que metieron COL56/COL57.
+    #
+    # Aquellos arreglaban un bug real (acotaba con los dolares en vez de los
+    # pesos), pero el arreglo se paso de largo: ato el monto al saldo. Y con
+    # eso el modulo dejo de contestar lo que vino a contestar.
+    #
+    # Sebastian, 7-ago: "antes era algo simple: habia anuncios a ese precio
+    # que se podian tomar, y a ese precio tenia que vender para tener la
+    # ganancia que yo queria. Ahora quedo muy engorroso, porque esta linkeado
+    # directamente a lo que tengo disponible de pesos".
+    #
+    # Tiene razon y es un error de modelo, no de codigo: el Ciclo contesta
+    # "¿a que precio compro cruzando y a cuanto publico la venta?". Eso
+    # depende del TAMAÑO QUE VAS A OPERAR —porque la comision taker es fija y
+    # su peso en % depende del monto, y porque el VWAP sale de barrer ese
+    # monto— y no de cuanta plata tenes parada hoy. Atarlo al saldo hacia que
+    # el precio de referencia se moviera solo cada vez que entraba o salia
+    # una orden, justo cuando lo que se necesita es un numero estable para
+    # copiar y pegar en Binance.
+    #
+    # El saldo NO se pierde de vista: sigue arriba, como capacidad ("podes
+    # recomprar ya" / "cuando vendas todo"), y si el ticket fijado no alcanza
+    # con los pesos de hoy la tarjeta lo AVISA. Informar, no pisar el numero
+    # en silencio.
     if saldo_clp and saldo_clp > 0:
-        saldo_real = saldo_clp / float(reales[0]["precio"])
-        if not monto_pedido and saldo_real >= 10:
-            monto = min(monto, saldo_real)
+        saldo_real = saldo_clp / float(reales[0]["precio"])   # solo para avisar
     monto = max(10.0, min(100000.0, monto))
 
     # ── 1. barrer el libro RESPETANDO LOS LIMITES DE CADA ANUNCIO (COL32) ──
@@ -12702,8 +12788,13 @@ def api_ciclo():
         # asi que sale del mismo calculo y no de una cuenta paralela.
         "puede_recomprar_usdt": (round(saldo_clp / vwap, 2) if (saldo_clp and vwap) else None),
         "clp_disponible": (round(saldo_clp) if saldo_clp else None),
-        "acotado_por_saldo": bool(saldo_real and not monto_pedido
-                                  and float(c.get("CICLO_MONTO_DEFAULT", 1200)) > saldo_real),
+        # COL61: ya NO se acota nada. La bandera pasa a significar "el ticket
+        # que fijaste no te alcanza con los pesos de hoy" — es un aviso, no
+        # una correccion. El nombre se deja igual para no romper nada que ya
+        # lo lea, pero el sentido cambio: antes avisaba de un recorte, ahora
+        # avisa de una diferencia.
+        "acotado_por_saldo": bool(saldo_real and monto > saldo_real),
+        "alcanza_con_saldo": (None if not saldo_real else bool(monto <= saldo_real)),
         "tandas": _tandas_recompra(),
         # COL38: de donde salio el libro y hace cuanto. Sin esto no se puede
         # saber si el precio que se esta mirando sigue existiendo.
@@ -13486,10 +13577,22 @@ def api_merchant():
 
     def req(nombre, actual, meta, unidad):
         falta = None if actual is None else max(0, meta - actual)
-        return {"clave": nombre, "actual": actual, "meta": meta, "unidad": unidad,
-                "cumple": bool(actual is not None and actual >= meta),
-                "falta": falta,
-                "pct": (round(min(100, actual / meta * 100), 1) if actual is not None and meta else None)}
+        r = {"clave": nombre, "actual": actual, "meta": meta, "unidad": unidad,
+             "cumple": bool(actual is not None and actual >= meta),
+             "falta": falta,
+             "pct": (round(min(100, actual / meta * 100), 1) if actual is not None and meta else None)}
+        # ── el mismo requisito, en dolares (COL60) ──────────────────
+        # Binance pone las metas de volumen en BTC, pero Sebastian opera en
+        # USDT: "0,219 BTC" no le dice nada y "14.200 USDT" si. Se agrega al
+        # lado, no en reemplazo — la meta oficial sigue siendo la de BTC y el
+        # equivalente se mueve con el precio del BTC todos los dias.
+        if unidad == "BTC" and btc:
+            r["en_usdt"] = {
+                "actual": (round(actual * btc) if actual is not None else None),
+                "meta": round(meta * btc),
+                "falta": (round(falta * btc) if falta is not None else None),
+            }
+        return r
 
     reqs = [
         req("dias_verificado", (ancla or {}).get("dias_verificado"), MERCHANT_REQ["dias_verificado"], "días"),
@@ -13514,6 +13617,16 @@ def api_merchant():
             pass
 
     # ── lo que hace falta por dia, con la ventana movil ──
+    # ── el ticket que PIENSA hacer (COL60, unificado en COL61) ──────
+    # Sale de CICLO_MONTO_DEFAULT: el mismo numero que fija en la tarjeta del
+    # Ciclo. Tenia clave propia (MERCHANT_TICKET_PLAN) y eran dos campos para
+    # la misma decision en dos pantallas distintas — el error que ya cometimos
+    # en COL57 con los dos precios. Se fija en un solo lado y se lee en los dos.
+    try:
+        ticket_plan = float(c.get("CICLO_MONTO_DEFAULT") or 0) or None
+    except (TypeError, ValueError):
+        ticket_plan = None
+
     plan = None
     if btc:
         vol_meta_usdt = MERCHANT_REQ["vol_30d_btc"] * btc
@@ -13545,6 +13658,18 @@ def api_merchant():
             # si el ticket no sube, cuantas ordenes/dia harian falta
             "ordenes_dia_con_ticket_actual": (round(usdt_dia / ticket_cal, 1)
                                               if ticket_cal else None),
+            # ── TICKET PLANEADO (COL60) ────────────────────────────
+            # Sebastian fija a mano el tamaño de recompra que PIENSA hacer y
+            # el plan le contesta cuantas ordenes por dia le harian falta con
+            # ese tamaño. Es un "que pasaria si", no una medicion: por eso va
+            # aparte y NUNCA reemplaza a ticket_actual_usdt, que es lo que de
+            # verdad viene haciendo. Mezclarlos convertiria una intencion en
+            # un dato, que es justo lo que este monitor evita.
+            "ticket_plan": (round(ticket_plan, 1) if ticket_plan else None),
+            "ordenes_dia_con_ticket_plan": (round(usdt_dia / ticket_plan, 1)
+                                            if ticket_plan else None),
+            "usdt_dia_con_ticket_plan": (round(ord_dia_real * ticket_plan)
+                                         if (ord_dia_real and ticket_plan) else None),
             # OJO: solo vale si viene operando. Con dias parados el ritmo
             # medido es de otro momento y no dice nada de como va HOY.
             "alcanza_con_ritmo_actual": bool(usdt_dia_real and usdt_dia_real >= usdt_dia
