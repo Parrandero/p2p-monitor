@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL57"
+VERSION       = "COL58"
 VERSION_FECHA = "2026-08-06"
 
 config = {
@@ -7677,7 +7677,22 @@ function ChipCiclo() {
         {fN(d.recompra.vwap, 2)} <span style={{ color: "var(--buy)" }}>→</span> {fN(d.venta.precio, 2)}
       </span>
       <span style={{ fontSize: 11, color: "var(--text-2)" }}>
-        con {fN(d.monto)} USDT · {fN(d.ganancia.por_vuelta_usdt, 2)}/vuelta
+        con {fN(d.monto)} USDT
+        {/* COL58 — el techo, tambien en la pantalla principal.
+            El detalle en dos tiempos esta en la tarjeta del Ciclo, pero esa
+            vive en Inteligencia y Sebastian no la ve: "en donde esta?".
+            Esta es la pantalla donde de verdad mira, asi que el segundo
+            numero tiene que estar aca. El dato ya viene en esta misma
+            respuesta, no cuesta una consulta mas. */}
+        {d.capacidad && d.capacidad.total_usdt != null
+          && Math.round(d.capacidad.total_usdt) > Math.round(d.monto) && (
+          <span style={{ color: "var(--accent)" }}
+                title={"Si además se te venden los " + fN(d.capacidad.usdt_por_vender) +
+                       " USDT que tenés publicados, vas a poder recomprar hasta acá. Es el techo del día, no algo que puedas hacer ahora."}>
+            {" ("}{fN(d.capacidad.total_usdt)} si vendés todo{")"}
+          </span>
+        )}
+        {" · "}{fN(d.ganancia.por_vuelta_usdt, 2)}/vuelta
       </span>
       {/* profundidad: "voy a poder recomprar rápido?" es lo que se mira acá */}
       {d.recompra.profundidad_libro != null && (
