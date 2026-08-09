@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL61"
+VERSION       = "COL62"
 VERSION_FECHA = "2026-08-07"
 
 config = {
@@ -4661,38 +4661,132 @@ function BrechaSpine({ snap }) {
 
 /* ---------- Maker actions ---------- */
 function MakerActions({ snap }) {
-  const cards = [
-    {
-      tone: "buy", side: "Tab Compra",
-      title: "Para VENDER USDT", price: snap.precio_maker_vender,
-      note: <>Un centavo menos que <b>{snap.lider_tab_compra}</b> (pide {fP(snap.mejor_vendedor_tab_compra)})</>,
-      tip: "Aparecés primero entre los vendedores",
-    },
-    {
-      tone: "sell", side: "Tab Venta",
-      title: "Para COMPRAR USDT", price: snap.precio_maker_comprar,
-      note: <>Un centavo más que <b>{snap.lider_tab_venta}</b> (paga {fP(snap.mejor_comprador_tab_venta)})</>,
-      tip: "Aparecés primero entre los compradores",
-    },
-  ];
+  /* COL62 — era "Acción maker": UN precio para ponerse primero de todo el
+     libro. Nota de Sebastián (5-ago): "cambiar la tarjeta acción maker por
+     punteros de caja y ordenarlos por límite mínimo de orden".
+     POR QUÉ: el precio del tope del libro no dice contra quién competís. Un
+     aviso puede estar primero pidiendo 3.000 CLP de mínimo y otro quinto
+     pidiendo 200.000 — no juegan el mismo partido porque no los ve el mismo
+     comprador. Lo que define la competencia real es el MÍNIMO.
+     Se conserva el nombre del componente a propósito: así no hay que tocar
+     el registro ni el lugar donde se monta. Cambia lo que muestra, no dónde
+     vive — cambio de contenido, no de layout. */
+  const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
+  const [d, setD] = React.useState(null);
+  const [lado, setLado] = React.useState("compra");
+  React.useEffect(() => {
+    let stop = false;
+    const load = () => fetch(B + "/api/punteros").then(r => r.json())
+      .then(j => { if (!stop) setD(j); }).catch(() => {});
+    load();
+    const id = setInterval(load, 20000);
+    return () => { stop = true; clearInterval(id); };
+  }, []);
+  if (!d || !d.compra) return null;
+  const fN = (x, n) => x == null ? "—" : Number(x).toLocaleString("es-CL",
+    { minimumFractionDigits: n || 0, maximumFractionDigits: n || 0 });
+  const tramos = lado === "compra" ? d.compra : d.venta;
+  const ext = lado === "compra" ? d.extremos_compra : d.extremos_venta;
+  const sp = d.spread_punteros;
+  const viejo = d.edad_seg != null && d.edad_seg > 300;
+
   return (
-    <section className="maker">
-      <div className="maker-head">
-        <span className="maker-kicker">Acción maker</span>
-        <span className="maker-hint">Postealo un centavo mejor que el líder para encabezar la lista</span>
+    <section className="chart-card" style={{ marginBottom: 12 }}>
+      <div className="card-head">
+        <h3>Quién va primero en cada tramo</h3>
+        <span className="card-sub">
+          el mínimo que pide cada aviso es lo que decide contra quién competís de verdad
+          {d.edad_seg != null && <span style={{ color: viejo ? "var(--warn)" : "var(--text-3)" }}>
+            {" · hace "}{Math.round(d.edad_seg)}s</span>}
+        </span>
       </div>
-      <div className="maker-grid">
-        {cards.map((c, i) => (
-          <div key={i} className={"maker-card tone-" + c.tone}>
-            <div className="mc-top">
-              <span className="mc-title">{c.title}</span>
-              <span className="mc-side">postear en {c.side}</span>
-            </div>
-            <div className="mc-price tnum">{fP(c.price)}</div>
-            <div className="mc-note">{c.note}</div>
-            <div className="mc-tip">→ {c.tip}</div>
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, alignItems: "center", flexWrap: "wrap" }}>
+        <button className={"intel-tab" + (lado === "compra" ? " active" : "")} onClick={() => setLado("compra")}
+          title="El tab Compra del libro: ahí están los que VENDEN. Es donde vos recomprás, y también donde aparece tu anuncio de venta.">
+          Donde vendés</button>
+        <button className={"intel-tab" + (lado === "venta" ? " active" : "")} onClick={() => setLado("venta")}
+          title="El tab Venta del libro: ahí están los que COMPRAN.">
+          Donde comprás</button>
+        {ext && (
+          <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-2)" }}>
+            mejor precio en <b style={{ color: "var(--accent)" }}>{ext.mejor_tramo}</b>
+            {" · "}<b>{ext.ventaja_pct}%</b> mejor que {ext.peor_tramo}
+          </span>
+        )}
+      </div>
+
+      <div className="intel-scroll">
+        <table className="intel-table">
+          <thead><tr>
+            <th title="Tramo de mínimo de orden. Los cortes salen de medir la distribución real del libro, no de números redondos.">Si pedís un mínimo de…</th>
+            <th>Va primero</th>
+            <th>Su precio</th>
+            <th title="El mínimo que pide ESE anunciante.">Su mínimo</th>
+            <th title="USDT que tiene publicados.">Lo que tiene</th>
+            <th title="Cuántos avisos compiten en ese tramo, ya sacando los muertos.">Compiten</th>
+            <th title="USDT totales parados en ese tramo: cuánta plata hay peleando ahí.">Plata en el tramo</th>
+          </tr></thead>
+          <tbody>{tramos.map(t => {
+            const p = t.puntero;
+            const mejor = ext && t.etiqueta === ext.mejor_tramo;
+            return (
+              <tr key={t.tramo} style={mejor ? { background: "var(--bg-2)" } : undefined}>
+                <td>
+                  <b style={{ color: mejor ? "var(--accent)" : "var(--text)" }}>{t.etiqueta}</b>
+                </td>
+                {!p ? <td colSpan={6} style={{ color: "var(--text-3)" }}>nadie pasa el filtro acá</td> : <>
+                  <td>
+                    {p.soy_yo ? <b style={{ color: "var(--accent)" }}>VOS</b> : p.anunciante}
+                    {p.es_merchant && <span title="Es Merchant verificado" style={{ color: "var(--warn)" }}> ★</span>}
+                    {!p.soy_yo && t.mi_puesto && <div style={{ fontSize: 10, color: "var(--accent)" }}>vos vas #{t.mi_puesto}</div>}
+                  </td>
+                  <td className="tnum" style={{ fontWeight: 600 }}>${fN(p.precio, 2)}</td>
+                  <td className="tnum" style={{ color: "var(--text-3)" }}>{fN(p.min_orden)}</td>
+                  <td className="tnum">{fN(p.disponible)}</td>
+                  <td className="tnum" style={{ color: "var(--text-3)" }}>{t.n}</td>
+                  <td className="tnum" style={{ color: "var(--text-3)" }}>{fN(t.capital_usdt)}</td>
+                </>}
+              </tr>
+            );
+          })}</tbody>
+        </table>
+      </div>
+
+      {/* El spread entre punteros: lo que quedaria si quisieras ser primero
+          en los DOS lados a la vez. Suele dar poco o negativo, y eso es
+          justamente el dato: pelear la punta de las dos puntas no paga. */}
+      {sp && (
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-end",
+                      marginTop: 10, padding: "9px 11px", borderRadius: 9,
+                      background: "var(--bg-2)", border: "1px solid var(--line-soft)" }}>
+          <div style={{ fontSize: 11, color: "var(--text-3)", maxWidth: 250 }}>
+            Si quisieras ser <b>primero en los dos lados a la vez</b>, comprando a{" "}
+            <b className="tnum">${fN(sp.compra, 2)}</b> y vendiendo a{" "}
+            <b className="tnum">${fN(sp.venta, 2)}</b>, te quedaría:
           </div>
-        ))}
+          <div title="Antes de comisiones.">
+            <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Bruto</div>
+            <div className="tnum" style={{ fontSize: 16 }}>{fN(sp.bruto_pct, 3)}%</div>
+          </div>
+          <div title={"Descontando la comisión de hoy (" + fN(sp.comision_hoy_pct, 2) + "% ida y vuelta)."}>
+            <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Neto hoy</div>
+            <div className="tnum" style={{ fontSize: 16, color: sp.neto_hoy_pct >= 0 ? "var(--buy)" : "var(--sell)" }}>
+              {fN(sp.neto_hoy_pct, 3)}%
+            </div>
+          </div>
+          <div title={"Descontando la comisión que vas a pagar como Merchant (" + fN(sp.comision_verificado_pct, 2) + "% ida y vuelta)."}>
+            <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Neto verificado</div>
+            <div className="tnum" style={{ fontSize: 16, color: sp.neto_verificado_pct >= 0 ? "var(--buy)" : "var(--sell)" }}>
+              {fN(sp.neto_verificado_pct, 3)}%
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="intel-explain">
+        Cada fila es <b>quién va primero</b> entre los que piden un mínimo parecido al tuyo.
+        Mucha plata compitiendo en tu tramo = llenás más lento, aunque tu precio sea bueno.
       </div>
     </section>
   );
@@ -12252,6 +12346,175 @@ def _tramo_de(minimo):
         if minimo >= desde and (hasta is None or minimo < hasta):
             return clave
     return None
+
+
+@app.route("/api/punteros")
+def api_punteros():
+    """QUIEN ENCABEZA CADA TRAMO DE MINIMO (COL50, traido en COL62).
+
+    Idea de Sebastian (5-ago), con sus palabras: "poner los que son primeros
+    de primero, pero que estan haciendo precio mayorista... no que esten
+    primeros con poca plata. Lo que esta definiendo el filtro para todo es el
+    tamaño minimo del anuncio".
+
+    POR QUE ES LA LECTURA CORRECTA: el precio suelto del tope del libro no
+    dice contra quien competis. Un aviso puede estar primero pidiendo 3.000
+    CLP de minimo y otro quinto pidiendo 200.000 — no juegan el mismo partido
+    porque no los ve el mismo comprador. Agrupando por tramo de MINIMO
+    aparece la estructura real: quien manda entre los minoristas, quien entre
+    los mayoristas, y cuanta distancia hay entre esos mundos. Coincide con lo
+    medido en COL36 (+0,80 entre minimo publicado y ticket) y con lo medido
+    en COL59 (el ticket sube monotono con el tramo: 57 -> 619).
+
+    ── DE DONDE SALE EL LIBRO ──
+    ★ De la foto del COLECTOR (los 80 avisos), no del libro vivo de 10s.
+    La version original de COL50 usaba el vivo, y ahi habria repetido el
+    error que COL59b vino a arreglar: el vivo trae solo los 20 primeros, que
+    son casi todos de minimo alto, asi que los tramos de abajo se quedarian
+    sin puntero. Ver Manual §4.15 — la fuente sale de la pregunta, y esta
+    pregunta necesita cobertura, no frescura de 10 segundos.
+
+    Se aplican los MISMOS filtros de calidad que el Ciclo: sin eso el
+    'puntero' de un tramo puede ser un aviso muerto o de una cuenta con 3
+    ordenes."""
+    with config_lock:
+        c = dict(config)
+    mi_nick = str(c.get("MI_NICKNAME") or "").strip().lower()
+    # mismas claves que api_ciclo — si filtraran distinto, el Ciclo y los
+    # Punteros mostrarian competidores que no coinciden entre paneles
+    min_stock = float(c.get("FILTRO_MIN_USDT", 200) or 0)
+    min_ord = int(c.get("FILTRO_MIN_ORD", 100) or 0)
+    min_tasa = float(c.get("FILTRO_MIN_TASA", 90) or 0)
+
+    with data_lock:
+        snap = dict(ultimo_estado)
+    edad = None
+    try:
+        ts_snap = snap.get("timestamp")
+        if ts_snap:
+            edad = (datetime.now(SANTIAGO_TZ)
+                    - datetime.strptime(str(ts_snap)[:19], "%Y-%m-%d %H:%M:%S")
+                    .replace(tzinfo=SANTIAGO_TZ)).total_seconds()
+    except Exception:
+        pass
+
+    salida = {}
+    for tipo in ("BUY", "SELL"):
+        filas = snap.get("detalle_compra" if tipo == "BUY" else "detalle_venta") or []
+        if not filas:                      # recien arrancado: mejor 20 que nada
+            filas, edad = libro_vivo_como_detalle(tipo)
+            filas = filas or []
+        # BUY = tab Compra: los anunciantes VENDEN, el mejor para mi es el mas
+        # BARATO. SELL = tab Venta: compran, el mejor es el mas CARO.
+        comprando = (tipo == "BUY")
+        tramos = []
+        for desde, hasta, clave, etiqueta in TRAMOS_MINIMO:
+            cands = []
+            for a in filas:
+                try:
+                    mn = float(a.get("min_orden") or 0)
+                    precio = float(a.get("precio") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if precio <= 0 or mn <= 0:
+                    continue           # sin limite publicado no se puede clasificar
+                if not (desde <= mn and (hasta is None or mn < hasta)):
+                    continue
+                if float(a.get("disponible") or 0) < min_stock:
+                    continue
+                if int(a.get("completadas") or 0) < min_ord:
+                    continue
+                if float(a.get("tasa_exito") or 0) < min_tasa:
+                    continue
+                cands.append(a)
+            if not cands:
+                tramos.append({"tramo": clave, "etiqueta": etiqueta,
+                               "desde": desde, "hasta": hasta,
+                               "n": 0, "puntero": None, "capital_usdt": 0})
+                continue
+            cands.sort(key=lambda x: float(x["precio"]), reverse=not comprando)
+            p = cands[0]
+            mi_puesto = None
+            if mi_nick:
+                for i, x in enumerate(cands, 1):
+                    if str(x.get("anunciante", "")).strip().lower() == mi_nick:
+                        mi_puesto = i
+                        break
+            tramos.append({
+                "tramo": clave, "etiqueta": etiqueta, "desde": desde, "hasta": hasta,
+                "n": len(cands),
+                "puntero": {
+                    "anunciante": p.get("anunciante"),
+                    "precio": round(float(p["precio"]), 2),
+                    "min_orden": int(float(p.get("min_orden") or 0)),
+                    "max_orden": int(float(p.get("max_orden") or 0)) or None,
+                    "disponible": round(float(p.get("disponible") or 0)),
+                    "completadas": int(p.get("completadas") or 0),
+                    "es_merchant": bool(p.get("es_merchant")),
+                    "posicion_libro": p.get("posicion"),
+                    "soy_yo": bool(mi_nick and str(p.get("anunciante", "")).strip().lower() == mi_nick),
+                },
+                "mi_puesto": mi_puesto,
+                # cuanta plata hay parada compitiendo en ese tramo
+                "capital_usdt": round(sum(float(x.get("disponible") or 0) for x in cands)),
+            })
+        salida[tipo] = tramos
+
+    # CUAL TRAMO TIENE EL MEJOR PRECIO.
+    # NO se calcula como "primer tramo contra ultimo". Se probo el 5-ago
+    # contra el libro real y los tramos NO salen ordenados por precio (ese
+    # dia: minorista 921,00 · chico 946,00 · medio 931,00 · grande 918,67 ·
+    # mayorista 919,20). Restar las puntas habria dado un numero que parece
+    # "minorista contra mayorista" y en realidad compara dos tramos
+    # cualquiera. Se busca el mejor y el peor DE VERDAD, y se dice cual es.
+    def _extremos(tramos, comprando):
+        con = [t for t in tramos if t["puntero"]]
+        if len(con) < 2:
+            return None
+        orden = sorted(con, key=lambda t: t["puntero"]["precio"], reverse=not comprando)
+        mejor, peor = orden[0], orden[-1]
+        pm, pp = mejor["puntero"]["precio"], peor["puntero"]["precio"]
+        if not pp:
+            return None
+        return {"mejor_tramo": mejor["etiqueta"], "mejor_precio": pm,
+                "peor_tramo": peor["etiqueta"], "peor_precio": pp,
+                "ventaja_pct": round(abs(pm / pp - 1) * 100, 3)}
+
+    # SPREAD ENTRE PUNTEROS — el spread REALMENTE tomable.
+    # El spread ponderado promedia todo el libro, incluida la basura que
+    # nunca vas a poder operar. Este mira solo la cabeza de cada lado DESPUES
+    # de los filtros: el vendedor mas barato contra el comprador mas caro. Es
+    # el margen que de verdad hay para un maker parado en las dos puntas.
+    ex_c, ex_v = _extremos(salida["BUY"], True), _extremos(salida["SELL"], False)
+    spread_punteros = None
+    if ex_c and ex_v and ex_v["mejor_precio"]:
+        bruto = (ex_c["mejor_precio"] / ex_v["mejor_precio"] - 1) * 100
+        # las dos comisiones salen de las MISMAS claves que usa el resto del
+        # archivo (ver api_rotacion), no de una clave propia de este endpoint
+        com_hoy = float(c.get("COMISION_BN", 0.002) or 0.002) * 2 * 100
+        com_ver = float(c.get("COMISION_BN_VERIF", 0.0016) or 0.0016) * 2 * 100
+        spread_punteros = {
+            "venta": ex_c["mejor_precio"],     # donde me paro a vender (tab Compra)
+            "compra": ex_v["mejor_precio"],    # donde me paro a comprar (tab Venta)
+            "bruto_pct": round(bruto, 3),
+            "neto_hoy_pct": round(bruto - com_hoy, 3),
+            "neto_verificado_pct": round(bruto - com_ver, 3),
+            "comision_hoy_pct": round(com_hoy, 3),
+            "comision_verificado_pct": round(com_ver, 3),
+        }
+
+    return jsonify({
+        "compra": salida["BUY"], "venta": salida["SELL"],
+        "extremos_compra": ex_c, "extremos_venta": ex_v,
+        "spread_punteros": spread_punteros,
+        "fuente_libro": "colector",
+        "edad_seg": (round(edad, 1) if edad is not None else None),
+        "filtros": {"stock_min": min_stock, "ordenes_min": min_ord, "tasa_min": min_tasa},
+        "nota": ("Puntero = el mejor precio de cada tramo de mínimo, ya sacando "
+                 "los avisos muertos. Tab Compra: mejor = más barato (ahí comprás). "
+                 "Tab Venta: mejor = más caro (ahí vendés). Los avisos sin límite "
+                 "publicado no se clasifican."),
+    })
 
 
 @app.route("/api/minimos")
