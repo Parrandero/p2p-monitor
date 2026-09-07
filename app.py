@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL62"
-VERSION_FECHA = "2026-08-07"
+VERSION       = "COL65"
+VERSION_FECHA = "2026-09-07"
 
 config = {
     "MONEDA":               "USDT",
@@ -350,10 +350,22 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_detalle_anunciante
                 ON snapshots_detalle(anunciante, tipo)
             """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_detalle_posicion
-                ON snapshots_detalle(posicion, tipo, snapshot_timestamp)
-            """)
+            # COL65 - INDICES QUE NADIE PODIA USAR (medido 7-sep, disco lleno)
+            # idx_detalle_posicion pesaba 52,5 MB (30% de snapshots_detalle) y
+            # ninguna consulta filtra por posicion: siempre aparece en el SELECT,
+            # como MIN(posicion) o en ORDER BY, nunca en un WHERE. Un btree que
+            # arranca por 'posicion' solo sirve para WHERE posicion = X.
+            # idx_fills_anun pesaba 22,6 MB y era peor todavia: las dos consultas
+            # que buscan por anunciante usan LOWER(anunciante) = LOWER(%s), y un
+            # indice sobre la columna cruda NO se puede usar con LOWER() encima.
+            # Se DROPEAN aca, no en un script aparte, por dos razones:
+            #   - init_db corre en cada arranque; si solo se borraran a mano,
+            #     el CREATE INDEX IF NOT EXISTS de la version vieja los recreaba
+            #     y el arreglo se deshacia justo en el reinicio que hacia falta.
+            #   - DROP INDEX libera los archivos al instante y funciona con el
+            #     disco al 100% (a diferencia de TRUNCATE, que necesita escribir
+            #     un archivo nuevo). O sea: el deploy mismo recupera los 75 MB.
+            cur.execute("DROP INDEX IF EXISTS idx_detalle_posicion")
             # ── Tablas Bybit (colector paralelo) ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS snapshots_bybit (
@@ -408,7 +420,7 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills_estimados(exchange, ts)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_fills_anun ON fills_estimados(anunciante, tipo, ts)")
+            cur.execute("DROP INDEX IF EXISTS idx_fills_anun")   # COL65: ver nota arriba
             # ── Historial de decisiones del asistente (para ver ventanas por hora) ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS operativa_historial (
@@ -7722,21 +7734,41 @@ function VelocidadMercado() {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [ex, setEx] = React.useState("binance");
   const [d, setD] = React.useState(null);
+  // COL64 — poder mirar la misma serie contando ORDENES (exacto) o USDT
+  // (estimado), y a 12 o 24 horas. Pedido de Sebastian: "ver 24 horas atras
+  // como estuvieron las ordenes, separado por hora o cada quince minutos".
+  // Arranca en ordenes porque es el numero firme.
+  const [unidad, setUnidad] = React.useState(() => {
+    try { return localStorage.getItem("p2p_vel_unidad") || "ordenes"; } catch (e) { return "ordenes"; }
+  });
+  const [rango, setRango] = React.useState(() => {
+    try { return localStorage.getItem("p2p_vel_rango") || "12"; } catch (e) { return "12"; }
+  });
+  const recordar = (k, v, set) => {
+    set(v);
+    try { localStorage.setItem(k, v); } catch (e) {}
+  };
+  // 12h se mira de a 15 min (el detalle del rato); 24h de a 1 hora (la forma del dia)
+  const bucket = rango === "24" ? 60 : 15;
   React.useEffect(() => {
     let stop = false;
-    const load = () => fetch(B + "/api/velocidad_mercado?horas=12&bucket=15&exchange=" + ex)
+    const load = () => fetch(B + "/api/velocidad_mercado?horas=" + rango + "&bucket=" + bucket + "&exchange=" + ex)
       .then(r => r.json()).then(j => { if (!stop) setD(j); }).catch(() => {});
     load();
     const id = setInterval(load, 60000);
     return () => { stop = true; clearInterval(id); };
-  }, [ex]);
+  }, [ex, rango]);
   const fmt = (x) => x == null ? "\u2014" : Number(x).toLocaleString("es-CL");
   if (!d || !d.serie) return null;
   const s = d.serie;
   const W = 760, H = 110, mid = H / 2, padTop = 6;
-  const maxV = Math.max(1, ...s.map(p => Math.max(p.buy, p.sell)));
+  const enOrdenes = unidad === "ordenes";
+  const vB = (p) => enOrdenes ? (p.ord_buy  || 0) : p.buy;
+  const vS = (p) => enOrdenes ? (p.ord_sell || 0) : p.sell;
+  const maxV = Math.max(1, ...s.map(p => Math.max(vB(p), vS(p))));
   const bw = W / s.length;
-  const ratio = d.vs_promedio;
+  // COL63: el ratio se mide por ORDENES (exacto), no por USDT (estimado)
+  const ratio = d.vs_promedio_ord != null ? d.vs_promedio_ord : d.vs_promedio;
   const ratioColor = ratio == null ? "var(--text-3)"
     : (ratio >= 1.3 ? "var(--buy)" : (ratio <= 0.7 ? "var(--sell)" : "var(--warn)"));
   const met = (label, val, extra) => (
@@ -7749,9 +7781,35 @@ function VelocidadMercado() {
     <div style={{ margin: "10px 0 0", background: "var(--bg-1)", border: "1px solid var(--line)", borderRadius: 14, padding: "14px 16px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
         <h3 style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text)" }}>Velocidad del mercado</h3>
-        <span style={{ fontSize: 11, color: "var(--text-3)" }}>fills confirmados \u00b7 \u00faltimas 12h \u00b7 buckets 15 min</span>
-        <span title="Rotacion medida desde fills CONFIRMADOS (caida de stock validada con el contador de ordenes completadas). No cuenta ediciones ni cancelaciones; los fills tapados por recargas se estiman con el ticket del anunciante." style={{ color: "var(--text-3)", cursor: "help" }}>\u24d8</span>
-        <span style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+        <span style={{ fontSize: 11, color: "var(--text-3)" }}>{enOrdenes ? "órdenes del contador de Binance" : "USDT estimados"}{" · últimas " + rango + "h · de a " + (bucket === 60 ? "1 hora" : bucket + " min")}</span>
+        <span title="Las ORDENES salen del contador oficial de Binance: son exactas. Los USDT son estimados, porque cuando no se ve bajar el stock hay que multiplicar por un ticket supuesto. Por eso el numero grande ahora son ordenes." style={{ color: "var(--text-3)", cursor: "help" }}>\u24d8</span>
+        {/* COL64 — elegir en que se mide y cuanto se mira.
+            Ordenes primero porque es lo exacto; USDT queda como alternativa
+            para el que quiera el orden de magnitud. */}
+        <span style={{ marginLeft: "auto", display: "flex", gap: 4, flexWrap: "wrap" }}>
+          {[["ordenes", "órdenes"], ["usdt", "USDT"]].map(([k, t]) => (
+            <button key={k} onClick={() => recordar("p2p_vel_unidad", k, setUnidad)}
+              title={k === "ordenes"
+                ? "Cuenta OPERACIONES. Sale del contador oficial de Binance: es exacto."
+                : "Cuenta USDT. Es estimado: cuando no se ve bajar el stock se multiplica por un ticket supuesto."}
+              style={{
+                fontSize: 11, padding: "4px 11px", borderRadius: 7, cursor: "pointer",
+                border: "1px solid " + (unidad === k ? "var(--accent)" : "var(--line)"),
+                background: unidad === k ? "var(--accent-soft)" : "var(--bg-2)",
+                color: unidad === k ? "var(--accent)" : "var(--text-2)",
+              }}>{t}</button>
+          ))}
+          {[["12", "12h · cada 15 min"], ["24", "24h · por hora"]].map(([k, t]) => (
+            <button key={k} onClick={() => recordar("p2p_vel_rango", k, setRango)}
+              title={k === "24" ? "El día completo, hora por hora: sirve para ver la forma del día."
+                                : "Las últimas 12 horas en detalle fino."}
+              style={{
+                fontSize: 11, padding: "4px 11px", borderRadius: 7, cursor: "pointer",
+                border: "1px solid " + (rango === k ? "var(--accent)" : "var(--line)"),
+                background: rango === k ? "var(--accent-soft)" : "var(--bg-2)",
+                color: rango === k ? "var(--accent)" : "var(--text-2)",
+              }}>{t}</button>
+          ))}
           {["binance", "bybit"].map(x => (
             <button key={x} onClick={() => setEx(x)} style={{
               fontSize: 11, padding: "4px 11px", borderRadius: 7, cursor: "pointer",
@@ -7763,10 +7821,34 @@ function VelocidadMercado() {
         </span>
       </div>
       <div style={{ display: "flex", gap: 26, flexWrap: "wrap", marginBottom: 12, fontVariantNumeric: "tabular-nums" }}>
-        {met("Ahora (30m)", fmt(d.usdt_min_30m), <span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT/min</span>)}
-        {met("Fills/h (60m)", fmt(d.fills_h_60m), null)}
-        {met("Ticket medio 60m", fmt(d.ticket_med_60m), <span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT</span>)}
-        {met("Promedio 12h", fmt(d.usdt_min_prom), <span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT/min</span>)}
+        {/* COL63 — el numero grande pasa a ser ORDENES/HORA.
+            Antes era USDT/min, que sale de SUM(monto) e incluye el 30% que
+            se estima multiplicando por un ticket supuesto. Las ordenes salen
+            del contador oficial de Binance y son exactas. Los USDT quedan
+            abajo como contexto, marcados como estimados. */}
+        <div style={{ minWidth: 150 }}
+             title={"Ordenes por hora, medidas sobre los ultimos 30 minutos. Salen del contador oficial de Binance: es un numero exacto, no una estimacion."
+                    + (d.ordenes_h_firme_30m != null ? " El numero chico es la parte confirmada viendo bajar el stock; el resto pudo contarse dos veces si el que cruzo tambien publica." : "")}>
+          <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Ahora (30m)</div>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 19, color: "var(--text)", fontVariantNumeric: "tabular-nums" }}>
+            {fmt(d.ordenes_h_30m)}<span style={{ fontSize: 11, color: "var(--text-3)" }}> órdenes/h</span>
+          </div>
+          {d.ordenes_h_firme_30m != null && (
+            <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>
+              {fmt(d.ordenes_h_firme_30m)} confirmadas viendo el stock
+            </div>
+          )}
+        </div>
+        {met("Promedio " + rango + "h", fmt(d.ordenes_h_prom), <span style={{ fontSize: 11, color: "var(--text-3)" }}> órdenes/h</span>)}
+        {met("Tamaño medio 60m", fmt(d.ticket_med_60m), <span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT ≈</span>)}
+        <div style={{ minWidth: 110 }}
+             title="Cuánto se está moviendo en USDT. Es ESTIMADO: para las detecciones sin caída de stock visible se multiplica por un ticket supuesto. Miralo como orden de magnitud.">
+          <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Volumen ≈</div>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 19, color: "var(--text-2)" }}>
+            {fmt(d.usdt_min_30m)}<span style={{ fontSize: 11, color: "var(--text-3)" }}> USDT/min</span>
+          </div>
+          <div style={{ fontSize: 10.5, color: "var(--text-3)" }}>estimado</div>
+        </div>
         <div style={{ minWidth: 110 }}>
           <div style={{ fontSize: 10, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>vs promedio</div>
           <div style={{ fontFamily: "var(--mono)", fontSize: 19, color: ratioColor }}>
@@ -7778,11 +7860,13 @@ function VelocidadMercado() {
       <svg viewBox={"0 0 " + W + " " + (H + 16)} style={{ width: "100%", display: "block" }}>
         <line x1="0" y1={mid} x2={W} y2={mid} stroke="var(--line-soft)" strokeWidth="1" />
         {s.map((p, i) => {
-          const hb = (p.buy  / maxV) * (mid - padTop);
-          const hs = (p.sell / maxV) * (mid - padTop);
+          const hb = (vB(p) / maxV) * (mid - padTop);
+          const hs = (vS(p) / maxV) * (mid - padTop);
           return (
             <g key={i}>
-              <title>{p.t + "  \u00b7  BUY " + fmt(p.buy) + "  \u00b7  SELL " + fmt(p.sell) + " USDT  \u00b7  " + fmt(p.ordenes) + " \u00f3rdenes"}</title>
+              <title>{p.t + "  \u00b7  " + fmt(p.ordenes) + " \u00f3rdenes (" + fmt(p.ord_buy) + " compra / " + fmt(p.ord_sell) + " venta)"
+                       + "  \u00b7  " + fmt(p.ordenes_dir) + " confirmadas"
+                       + "  \u00b7  \u2248 " + fmt(p.buy + p.sell) + " USDT"}</title>
               <rect x={i * bw + 1} y={mid - hb} width={Math.max(1, bw - 2)} height={hb} fill="var(--buy)" opacity="0.85" rx="1" />
               <rect x={i * bw + 1} y={mid} width={Math.max(1, bw - 2)} height={hs} fill="var(--sell)" opacity="0.85" rx="1" />
             </g>
@@ -8683,6 +8767,19 @@ function BarraBalance({ pct, banda }) {
 function MacroBar({ modo }) {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [m, setM] = React.useState(null);
+  // COL63 — plegada por defecto. Sebastian: "la de contexto de mercado me
+  // gustaria que la minimices solamente". No se borra: el dato macro alimenta
+  // el aviso de desfase dolar->P2P del Asistente, que si usa. Lo que sobra es
+  // que ocupe media pantalla algo que mira de vez en cuando.
+  // El estado se recuerda para que no haya que plegarla en cada recarga.
+  const [abierta, setAbierta] = React.useState(() => {
+    try { return localStorage.getItem("p2p_macro_abierta") === "1"; } catch (e) { return false; }
+  });
+  const alternar = () => {
+    const v = !abierta;
+    setAbierta(v);
+    try { localStorage.setItem("p2p_macro_abierta", v ? "1" : "0"); } catch (e) {}
+  };
   React.useEffect(() => {
     const load = () => fetch(B + "/api/macro").then(r => r.json()).then(setM).catch(() => {});
     load();
@@ -8736,12 +8833,23 @@ function MacroBar({ modo }) {
 
   return (
     <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--bg-2)", borderRadius: 10, border: "1px solid var(--line-soft)" }}>
-      <div style={{ display: "flex", alignItems: "baseline", marginBottom: 8 }}>
+      <div onClick={alternar} title={abierta ? "Plegar" : "Abrir el contexto de mercado (dólar forex, VIX, cobre y la brecha)"}
+           style={{ display: "flex", alignItems: "baseline", gap: 7, cursor: "pointer",
+                    marginBottom: abierta ? 8 : 0 }}>
+        <span style={{ fontSize: 11, color: "var(--text-3)" }}>{abierta ? "▾" : "▸"}</span>
         <div style={{ fontSize: 10.5, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Contexto de mercado</div>
+        {/* plegada, se muestra solo la brecha: es lo unico de esta tarjeta
+            que se mira de reojo. El resto se abre cuando hace falta. */}
+        {!abierta && m.brecha_pct != null && (
+          <span style={{ fontSize: 11, color: "var(--text-2)", fontFamily: "var(--mono)" }}>
+            brecha {nf(m.brecha_pct, 2)}%
+          </span>
+        )}
         <div style={{ marginLeft: "auto", fontSize: 10, color: m.viejo ? "var(--sell)" : "var(--text-3)" }}>
           {m.viejo ? "⚠ sin actualizar hace " + m.edad_min + " min" : "hace " + m.edad_min + " min"}
         </div>
       </div>
+      {abierta && (<>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         {items.map(it => (
           <div key={it.k} title={it.t} style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)",
@@ -8782,6 +8890,7 @@ function MacroBar({ modo }) {
         <br/>El <b>precio de referencia</b> de arriba es el que conviene anotar en la bitácora al anclar saldos.
         <span style={{ color: "var(--text-3)" }}> Ojo: el cobre resultó mucho más débil (−0,16) que el dólar — probablemente te sirve porque mueve al dólar, no directo.</span>
       </div>
+      </>)}
     </div>
   );
 }
@@ -11612,7 +11721,13 @@ def api_velocidad_mercado():
                 SELECT FLOOR(EXTRACT(EPOCH FROM (ts - %(desde)s)) / (%(bucket)s * 60))::int AS b,
                        COALESCE(SUM(monto)   FILTER (WHERE tipo = 'BUY'),  0) AS buy,
                        COALESCE(SUM(monto)   FILTER (WHERE tipo = 'SELL'), 0) AS sell,
-                       COALESCE(SUM(ordenes), 0) AS ordenes
+                       COALESCE(SUM(ordenes), 0) AS ordenes,
+                       COALESCE(SUM(ordenes) FILTER (WHERE metodo = 'directo'), 0) AS ordenes_dir,
+                       -- COL64: las ordenes tambien separadas por lado, para
+                       -- poder dibujar el mismo grafico contando operaciones
+                       -- en vez de USDT (que es la parte estimada).
+                       COALESCE(SUM(ordenes) FILTER (WHERE tipo = 'BUY'),  0) AS ord_buy,
+                       COALESCE(SUM(ordenes) FILTER (WHERE tipo = 'SELL'), 0) AS ord_sell
                 FROM fills_estimados
                 WHERE exchange = %(ex)s AND ts >= %(desde)s
                 GROUP BY b ORDER BY b
@@ -11623,6 +11738,10 @@ def api_velocidad_mercado():
                     COALESCE(SUM(monto)   FILTER (WHERE ts >= %(m30)s), 0) AS vol_30m,
                     COALESCE(SUM(monto)   FILTER (WHERE ts >= %(m60)s), 0) AS vol_60m,
                     COALESCE(SUM(ordenes) FILTER (WHERE ts >= %(m60)s), 0) AS ord_60m,
+                    COALESCE(SUM(ordenes) FILTER (WHERE ts >= %(m30)s), 0) AS ord_30m,
+                    COALESCE(SUM(ordenes) FILTER (WHERE ts >= %(m30)s
+                                                   AND metodo = 'directo'), 0) AS ord_dir_30m,
+                    COALESCE(SUM(ordenes) FILTER (WHERE metodo = 'directo'), 0) AS ord_dir_total,
                     COALESCE(SUM(monto), 0)   AS vol_total,
                     COALESCE(SUM(ordenes), 0) AS ord_total
                 FROM fills_estimados
@@ -11640,22 +11759,54 @@ def api_velocidad_mercado():
             "buy":     round(float(r["buy"]))  if r else 0,
             "sell":    round(float(r["sell"])) if r else 0,
             "ordenes": int(r["ordenes"])       if r else 0,
+            "ordenes_dir": int(r["ordenes_dir"]) if r else 0,
+            "ord_buy":  int(r["ord_buy"])      if r else 0,
+            "ord_sell": int(r["ord_sell"])     if r else 0,
         })
     vol_30m, vol_60m = float(tot["vol_30m"]), float(tot["vol_60m"])
     ord_60m          = float(tot["ord_60m"])
     vol_total        = float(tot["vol_total"])
     usdt_min_30m  = round(vol_30m / 30, 1)
     usdt_min_prom = round(vol_total / (horas * 60), 1)
+
+    # ── ORDENES/HORA: el mismo dato, pero del lado firme (COL63) ──────
+    # El numero grande de esta tarjeta era USDT/min, que sale de SUM(monto):
+    # incluye el 30% de volumen que es "ordenes x ticket supuesto". Las
+    # ORDENES en cambio salen del contador oficial de Binance y son exactas
+    # (auditoria del 11-ago).
+    # Se separa ademas 'directo' —el stock bajo de verdad, una deteccion por
+    # operacion— de 'enmascarado', donde vive el posible doble conteo: si a
+    # alguien le sube el contador sin que baje su stock, o repuso rapido o
+    # fue el taker en la operacion de otro, y en ese caso ya se conto del
+    # lado del que publico. Por eso el firme es piso y el total es techo.
+    ord_30m      = float(tot["ord_30m"])
+    ord_dir_30m  = float(tot["ord_dir_30m"])
+    ord_dir_tot  = float(tot["ord_dir_total"])
+    ord_total    = float(tot["ord_total"])
+    ord_h_30m      = round(ord_30m * 2)              # 30 min -> por hora
+    ord_h_dir_30m  = round(ord_dir_30m * 2)
+    ord_h_prom     = round(ord_total / horas)
+    ord_h_dir_prom = round(ord_dir_tot / horas)
     return jsonify({
         "exchange": ex, "horas": horas, "bucket_min": bucket,
         "serie": serie,
+        # ── lo firme: sale del contador, es exacto ──
+        "ordenes_h_30m":      ord_h_30m,
+        "ordenes_h_firme_30m": ord_h_dir_30m,
+        "ordenes_h_prom":     ord_h_prom,
+        "ordenes_h_firme_prom": ord_h_dir_prom,
+        "pct_firme": (round(ord_dir_tot / ord_total * 100) if ord_total else None),
+        "vs_promedio_ord": (round(ord_h_30m / ord_h_prom, 2) if ord_h_prom else None),
+        # ── lo estimado: se deja porque sirve de contexto, pero ya no manda ──
         "usdt_min_30m":    usdt_min_30m,
         "fills_h_60m":     int(ord_60m),
         "ticket_med_60m":  round(vol_60m / ord_60m) if ord_60m else None,
         "usdt_min_prom":   usdt_min_prom,
         "vs_promedio":     round(usdt_min_30m / usdt_min_prom, 2) if usdt_min_prom else None,
         "vol_total_ventana": round(vol_total),
-        "descripcion": "Velocidad de rotacion desde fills confirmados. vs_promedio > 1 = el mercado rota mas rapido que su promedio de la ventana.",
+        "descripcion": ("Las ORDENES salen del contador oficial de Binance y son exactas. "
+                        "Los USDT son estimados: para las detecciones sin caida de stock "
+                        "visible se multiplica por un ticket supuesto."),
     })
 
 
