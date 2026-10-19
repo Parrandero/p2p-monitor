@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL65"
-VERSION_FECHA = "2026-09-07"
+VERSION       = "COL67"
+VERSION_FECHA = "2026-10-19"
 
 config = {
     "MONEDA":               "USDT",
@@ -156,11 +156,14 @@ config = {
     # La hoja "Plan" de la bitacora ya distingue dias "Libre / oro" de
     # "Trabajo": esto es la version simple de ese mismo concepto.
     "DIAS_OPERABLES_SEMANA": 4,
-    # ── Libro en vivo (COL38) ────────────────────────────────────────
-    # Cada cuantos SEGUNDOS se refresca la cabeza del libro. NO escribe en
-    # la base: solo memoria. Medido 2-ago: la API tarda ~590 ms y aguanta
-    # consultas seguidas; a 10s son ~17.000 req/dia (0,2 por segundo).
-    "LIBRO_VIVO_SEG":       10,
+    # ── Libro en vivo (COL38, libro entero desde COL67) ───────────────
+    # Cada cuantos SEGUNDOS se refresca el libro. NO escribe en la base:
+    # solo memoria. COL67: trae el libro ENTERO (antes los 20 primeros) y
+    # pasa de 10 a 15 s, que es lo que pidio Sebastian ("4 veces por
+    # minuto"). Medido 19-oct: el libro entero son ~146 anuncios entre las
+    # dos puntas, sale en 3 consultas por lado y tarda ~3,3 s; 20 consultas
+    # seguidas sin ningun bloqueo. A 15 s son ~12 consultas por minuto.
+    "LIBRO_VIVO_SEG":       15,
     # Metodos de pago que PODES usar, por 'identifier' de Binance.
     # VACIO = no filtra nada. Sirve para no calcular el ciclo contra un
     # precio de alguien con quien no podes operar.
@@ -1350,6 +1353,79 @@ def _limites_adv(adv):
             _n("maxSingleTransAmount", "maxAmount"))
 
 
+# ══════════════════════════════════════════════════════════════
+#  ANUNCIOS OPERABLES (COL66)
+#  ------------------------------------------------------------
+#  EL PROBLEMA: el 14-sep Sebastian miro uno por uno los 10 mejores
+#  compradores del tab Venta (961,00 -> 955,82, mayorista ~960,5).
+#  5 pagaban desde cuenta de terceros, 4 tenian monto fijo, 2 salian
+#  "Restringido", 1 pedia escaneo facial. El primero limpio estaba 4-5
+#  pesos abajo. Todo lo que el monitor calcula sobre "el mejor precio del
+#  otro lado" (libro cruzado, spread, cruzar/esperar) era optimista.
+#  Ver BASE_CONOCIMIENTO §2.6c y trampa §6 #12.
+#
+#  QUE TRAE LA API PUBLICA (medido 14-sep 12:31, 80 anuncios tab Venta):
+#    - remarks / autoReplyMsg ...... SIEMPRE null. Los terminos ("pago
+#      desde cuenta de terceros") NO se pueden leer. Los endpoints de
+#      detalle (selectDetail) dan 404 sin login.
+#    - buyerKycLimit, buyerRegDaysLimit, userTradeCount*Min ... null:
+#      las condiciones que producen "Restringido" tampoco vienen.
+#    - takerAdditionalKycRequired ... 1 en 3 de 80  -> SE USA (kyc_extra)
+#    - min / dynamicMaxSingleTransAmount -> SE USA (rango_fijo). El
+#      'dynamic' es el maximo ya recortado al stock: salui spa declaraba
+#      100.000-250.000 pero su dinamico era 100.275 = monto fijo de hecho.
+#    - isTradable ................... true en los 80 (no discrimina)
+#
+#  O sea: esto saca UNA PARTE de la basura (montos fijos y verificacion
+#  extra), no toda. Pagos de terceros y restringidos siguen adentro. Todo
+#  numero "operable" sigue siendo una cota optimista, menos inflada.
+#
+#  Monto fijo NO es "inoperable" en sentido absoluto: si tu orden es justo
+#  de ese monto, se puede. Por eso las cuentas que no conocen el monto
+#  (cabecera del libro) los excluyen, y las que si lo conocen
+#  (/api/taker_maker con ?usdt=) filtran por "acepta mi monto".
+# ══════════════════════════════════════════════════════════════
+OPERABLE_RATIO_FIJO = 1.05   # max efectivo / min por debajo de esto = monto fijo
+
+
+def _operabilidad_adv(adv):
+    """Senales de operabilidad de un anuncio CRUDO de Binance. Devuelve
+    {"rango_fijo": bool|None, "kyc_extra": bool, "max_efectivo": int|None}.
+    rango_fijo None = sin dato de limites (no se excluye: falta de dato no
+    es prueba de nada, mismo criterio que COL32)."""
+    if not adv:
+        return {"rango_fijo": None, "kyc_extra": False, "max_efectivo": None}
+    mino, maxo = _limites_adv(adv)
+    try:
+        dyn = int(float(adv.get("dynamicMaxSingleTransAmount") or 0)) or None
+    except (TypeError, ValueError):
+        dyn = None
+    max_ef = dyn or maxo
+    rango_fijo = None
+    if mino and max_ef:
+        rango_fijo = (max_ef / mino) < OPERABLE_RATIO_FIJO
+    try:
+        kyc = int(adv.get("takerAdditionalKycRequired") or 0) == 1
+    except (TypeError, ValueError):
+        kyc = False
+    return {"rango_fijo": rango_fijo, "kyc_extra": kyc, "max_efectivo": max_ef}
+
+
+def _es_operable(a):
+    """Sobre una fila ya normalizada. Sin las claves (Bybit, fallback del
+    frontend) cuenta como operable."""
+    return not a.get("rango_fijo") and not a.get("kyc_extra")
+
+
+def _motivo_no_operable(a):
+    m = []
+    if a.get("rango_fijo"):
+        m.append("monto fijo")
+    if a.get("kyc_extra"):
+        m.append("pide verificacion extra")
+    return ", ".join(m)
+
+
 def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
     """Guarda los top 80 anunciantes de cada lado SIN filtros de mínimos"""
     with config_lock:
@@ -1506,46 +1582,137 @@ libro_vivo_lock = threading.Lock()
 
 
 def obtener_libro_vivo(tipo):
-    """Solo la primera pagina (top-20) del lado pedido. Devuelve la lista
-    cruda de Binance o None si falla — nunca levanta excepcion."""
+    """COL67: el libro ENTERO del lado pedido (antes solo la primera pagina,
+    los 20 primeros). Devuelve la lista cruda de Binance o None si falla.
+    Nunca levanta excepcion.
+
+    POR QUE None SI FALLA UNA PAGINA DEL MEDIO, y no lo que alcanzo a traer:
+    un libro cortado pierde la cola, que es justo donde viven los anuncios
+    de minimo bajo. Los punteros de esos tramos desaparecerian sin aviso.
+    Con None queda la foto anterior completa y su edad dice la verdad.
+
+    CUANDO PARA: cuando junta TOP_ANUNCIOS, cuando una pagina viene vacia o
+    con menos de 20 (esa es seguro la ultima). NO alcanza con "vino corta
+    contra lo pedido": medido 19-oct, pidiendo 50 Binance devuelve 46 en la
+    primera pagina y la segunda trae mas. Por eso el corte es < 20, no < 50.
+
+    REPETIDOS: Binance a veces repite el ultimo anuncio de una pagina como
+    primero de la siguiente (COL66: 2,4% de las fotos del 3 al 13-sep). Eso
+    corre un puesto y duplica el stock. Se saca por advNo."""
     with config_lock:
         c = dict(config)
-    try:
-        r = requests.post(URL, json={
-            "asset": c["MONEDA"], "fiat": c["FIAT"], "merchantCheck": False,
-            "page": 1, "publisherType": None, "rows": 20, "tradeType": tipo,
-        }, headers=HEADERS, timeout=8)
-        r.raise_for_status()
-        return r.json().get("data", []) or []
-    except Exception as e:
-        print(f"[LIBRO VIVO {tipo}] {e}")
-        return None
+    top = int(c.get("TOP_ANUNCIOS", 80) or 80)
+    resultados, vistos = [], set()
+    for page in range(1, (top + 19) // 20 + 2):      # tope de seguridad
+        try:
+            r = requests.post(URL, json={
+                "asset": c["MONEDA"], "fiat": c["FIAT"], "merchantCheck": False,
+                "page": page, "publisherType": None, "rows": 50, "tradeType": tipo,
+            }, headers=HEADERS, timeout=8)
+            r.raise_for_status()
+            data = r.json().get("data", []) or []
+        except Exception as e:
+            print(f"[LIBRO VIVO {tipo} p{page}] {e}")
+            return None
+        for item in data:
+            adv_no = (item.get("adv") or {}).get("advNo")
+            if adv_no and adv_no in vistos:
+                continue
+            if adv_no:
+                vistos.add(adv_no)
+            resultados.append(item)
+        if len(data) < 20 or len(resultados) >= top:
+            break
+        time.sleep(0.3)               # mismo respiro que el colector
+    return resultados[:top]
 
 
 def ciclo_libro_vivo():
     """Hilo propio. Igual que el macro: aislado, con try/except en todo,
-    para que si la fuente falla no arrastre al colector ni a la app."""
+    para que si la fuente falla no arrastre al colector ni a la app.
+
+    COL67 — SI BINANCE CORTA, ESTE HILO SE CORRE: cada falla seguida duplica
+    la espera (15 -> 30 -> 60 -> 120 s, no mas). Usa la misma API y la misma
+    IP que el colector; si insistiera cada 15 s contra un bloqueo, el que
+    pagaria es el colector, que es el que guarda la historia. Con la primera
+    vuelta buena vuelve solo al ritmo normal.
+
+    La hora ('ts') SOLO se mueve si llegaron las DOS puntas. Antes se movia
+    con una sola, y la otra quedaba vieja con cara de nueva."""
     print("[LIBRO VIVO] Iniciando thread...")
     time.sleep(12)          # deja arrancar primero al colector principal
+    fallas = 0
     while True:
+        ok = False
         try:
             b = obtener_libro_vivo("BUY")
             s = obtener_libro_vivo("SELL")
-            if b is not None or s is not None:
+            if b is not None and s is not None:
                 with libro_vivo_lock:
-                    if b is not None:
-                        ultimo_libro_vivo["BUY"] = b
-                    if s is not None:
-                        ultimo_libro_vivo["SELL"] = s
+                    ultimo_libro_vivo["BUY"] = b
+                    ultimo_libro_vivo["SELL"] = s
                     ultimo_libro_vivo["ts"] = datetime.now(SANTIAGO_TZ)
+                ok = True
         except Exception as e:
             print(f"[LIBRO VIVO ciclo] {e}")
+        fallas = 0 if ok else min(fallas + 1, 3)
         try:
             with config_lock:
-                seg = int(config.get("LIBRO_VIVO_SEG", 10) or 10)
+                seg = int(config.get("LIBRO_VIVO_SEG", 15) or 15)
         except Exception:
-            seg = 10
-        time.sleep(max(5, seg))
+            seg = 15
+        espera = max(5, seg) * (2 ** fallas)
+        if fallas:
+            print(f"[LIBRO VIVO] falla {fallas} seguida, espero {min(espera, 120)} s")
+        time.sleep(min(espera, 120))
+
+
+# Mas viejo que esto, el libro vivo no se usa: se cae al del colector.
+LIBRO_VIVO_MAX_EDAD = 60
+
+
+def _libro_mas_fresco():
+    """COL67 — EL LIBRO MAS NUEVO QUE ESTE COMPLETO. Lo usan /api/libro_vivo
+    (el bot) y /api/punteros (la tarjeta), asi los dos ven la misma foto.
+
+    Devuelve (compra, venta, edad_seg, fuente). compra = tab Compra (BUY,
+    los que venden); venta = tab Venta (SELL). Mismo formato que
+    detalle_compra/detalle_venta de /api/estado: mismas columnas, mismo
+    'posicion' (puesto en el libro crudo, sin filtros), misma punta.
+    La unica columna que el vivo NO tiene es 'velocidad' (Manual §4.15):
+    para velocidad hay que ir al colector.
+
+    CUANDO SE USA EL VIVO: si tiene menos de LIBRO_VIVO_MAX_EDAD segundos Y
+    trae al menos el 80% de los anuncios que trae el colector. Lo segundo
+    es la guarda de la trampa de COL59: un libro corto con cara de completo
+    deja los tramos de abajo sin puntero y nadie se entera."""
+    viv_c, edad_v = libro_vivo_como_detalle("BUY")
+    viv_v, _ = libro_vivo_como_detalle("SELL")
+    with data_lock:
+        snap = dict(ultimo_estado)
+    col_c = snap.get("detalle_compra") or []
+    col_v = snap.get("detalle_venta") or []
+    edad_c = None
+    try:
+        ts_snap = snap.get("timestamp")
+        if ts_snap:
+            edad_c = (datetime.now(SANTIAGO_TZ)
+                      - datetime.strptime(str(ts_snap)[:19], "%Y-%m-%d %H:%M:%S")
+                      .replace(tzinfo=SANTIAGO_TZ)).total_seconds()
+    except Exception:
+        pass
+    n_viv = len(viv_c or []) + len(viv_v or [])
+    n_col = len(col_c) + len(col_v)
+    vivo_ok = (viv_c and viv_v and edad_v is not None
+               and edad_v <= LIBRO_VIVO_MAX_EDAD
+               and (n_col == 0 or n_viv >= 0.8 * n_col))
+    if vivo_ok:
+        return viv_c, viv_v, edad_v, "vivo"
+    if col_c:
+        return col_c, col_v, edad_c, "colector"
+    if viv_c:                         # recien arrancado: lo que haya
+        return viv_c, viv_v or [], edad_v, "vivo"
+    return [], [], None, None
 
 
 def libro_vivo_como_detalle(tipo):
@@ -1564,6 +1731,7 @@ def libro_vivo_como_detalle(tipo):
         adv = item.get("adv", {})
         tr = item.get("advertiser", {})
         mino, maxo = _limites_adv(adv)
+        op = _operabilidad_adv(adv)
         filas.append({
             "posicion": pos, "anunciante": tr.get("nickName", ""),
             "precio": float(adv.get("price", 0) or 0),
@@ -1572,6 +1740,9 @@ def libro_vivo_como_detalle(tipo):
             "tasa_exito": round(float(tr.get("monthFinishRate", 0) or 0) * 100, 1),
             "es_merchant": tr.get("userType") == "merchant",
             "min_orden": mino, "max_orden": maxo,
+            # COL66: solo memoria, no va a la base
+            "max_efectivo": op["max_efectivo"], "rango_fijo": op["rango_fijo"],
+            "kyc_extra": op["kyc_extra"], "operable": _es_operable(op),
             # metodos de pago: solo existe en el libro vivo, el detalle
             # guardado no los persiste (no valdria la pena el peso)
             "pagos": [m.get("identifier") for m in (adv.get("tradeMethods") or [])
@@ -1594,6 +1765,7 @@ def parsear_y_filtrar(anuncios, tipo):
         tasa_exito = float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100
         if tasa_exito < c["FILTRO_MIN_TASA"]:  continue
         mino, maxo = _limites_adv(adv)
+        op = _operabilidad_adv(adv)
         resultado.append({
             "tipo":       tipo,
             "precio":     float(adv.get("price", 0)),
@@ -1601,6 +1773,8 @@ def parsear_y_filtrar(anuncios, tipo):
             "anunciante": trade.get("nickName", ""),
             "min_orden":  mino,
             "max_orden":  maxo,
+            "rango_fijo": op["rango_fijo"],
+            "kyc_extra":  op["kyc_extra"],
         })
     return resultado
 
@@ -1630,6 +1804,37 @@ def analizar(tab_compra, tab_venta, comision_lado=None):
     tab_venta  = _sanos(tab_venta)
     lider_tc    = min(tab_compra, key=lambda x: x["precio"])
     lider_tv    = max(tab_venta,  key=lambda x: x["precio"])
+    # COL66: la misma cabecera, pero SOLO con anuncios operables (sin monto
+    # fijo ni verificacion extra). Va AL LADO de la vieja, no la reemplaza:
+    # la columna guardada en 'snapshots' sigue midiendo lo mismo que desde
+    # marzo (cambiarla partiria la serie, trampa §6 #3).
+    op_tc = [a for a in tab_compra if _es_operable(a)]
+    op_tv = [a for a in tab_venta  if _es_operable(a)]
+    op_lider_tc = min(op_tc, key=lambda x: x["precio"]) if op_tc else None
+    op_lider_tv = max(op_tv, key=lambda x: x["precio"]) if op_tv else None
+    op_spread_abs = (op_lider_tc["precio"] - op_lider_tv["precio"]
+                     if op_lider_tc and op_lider_tv else None)
+    operable = {
+        "mejor_vendedor_tab_compra": op_lider_tc["precio"] if op_lider_tc else None,
+        "lider_tab_compra":          op_lider_tc["anunciante"] if op_lider_tc else None,
+        "mejor_comprador_tab_venta": op_lider_tv["precio"] if op_lider_tv else None,
+        "lider_tab_venta":           op_lider_tv["anunciante"] if op_lider_tv else None,
+        "spread_abs": round(op_spread_abs, 2) if op_spread_abs is not None else None,
+        "spread_pct": (round(op_spread_abs / op_lider_tv["precio"] * 100, 4)
+                       if op_spread_abs is not None and op_lider_tv["precio"] > 0 else None),
+        # cruzado = el que compra paga MAS que lo que pide el que vende
+        "cruzado_visible":  (lider_tc["precio"] - lider_tv["precio"]) < 0,
+        "cruzado_operable": op_spread_abs < 0 if op_spread_abs is not None else None,
+        "descartados_tab_compra": [{"anunciante": a["anunciante"], "precio": a["precio"],
+                                    "motivo": _motivo_no_operable(a)}
+                                   for a in tab_compra if not _es_operable(a)],
+        "descartados_tab_venta":  [{"anunciante": a["anunciante"], "precio": a["precio"],
+                                    "motivo": _motivo_no_operable(a)}
+                                   for a in tab_venta if not _es_operable(a)],
+        "nota": ("Saca montos fijos y verificacion extra. NO puede sacar pagos de "
+                 "terceros ni restringidos: Binance no manda esos terminos en la API "
+                 "publica. Sigue siendo optimista, menos que el precio visible."),
+    }
     spread_abs = lider_tc["precio"] - lider_tv["precio"]
     spread_pct = round((spread_abs / lider_tv["precio"]) * 100, 4) if lider_tv["precio"] > 0 else 0
     # Banda anti-outliers: para ponderado/liquidez solo contamos anuncios cerca
@@ -1690,6 +1895,9 @@ def analizar(tab_compra, tab_venta, comision_lado=None):
         "brecha_ok":                  brecha_ok,
         "estado":                     estado,
         "color":                      color,
+        # COL66: no se guarda (guardar_snapshot nombra sus columnas); vive en
+        # ultimo_estado y /api/estado lo agrega desde memoria
+        "operable":                   operable,
     }
 
 def build_detalle_memory(raw_anuncios, tipo, now_dt):
@@ -1711,6 +1919,7 @@ def build_detalle_memory(raw_anuncios, tipo, now_dt):
         velocidad = fill_tracker.velocidad(nombre, tipo, now_dt)
         nuevo_prev[nombre] = (disp, now_dt)
         mino, maxo = _limites_adv(adv)
+        op = _operabilidad_adv(adv)
         rows.append({
             "posicion":    pos,
             "anunciante":  nombre,
@@ -1722,6 +1931,14 @@ def build_detalle_memory(raw_anuncios, tipo, now_dt):
             "velocidad":   velocidad,
             "min_orden":   mino,
             "max_orden":   maxo,
+            # COL66: solo memoria. 'pagos' permite filtrar por banco tambien
+            # con el libro del colector (antes solo el vivo los traia).
+            "max_efectivo": op["max_efectivo"],
+            "rango_fijo":  op["rango_fijo"],
+            "kyc_extra":   op["kyc_extra"],
+            "operable":    _es_operable(op),
+            "pagos":       [m.get("identifier") for m in (adv.get("tradeMethods") or [])
+                            if m.get("identifier")],
         })
     prev_detalle_raw[tipo] = nuevo_prev
     return rows
@@ -4686,14 +4903,24 @@ function MakerActions({ snap }) {
   const B = (window.P2P_CONFIG && window.P2P_CONFIG.baseUrl) || "";
   const [d, setD] = React.useState(null);
   const [lado, setLado] = React.useState("compra");
+  /* COL67 — solo verificados. Arranca PRENDIDO: "ya es momento de pasar a
+     solo verificados, no compito contra los que no tienen el verificado"
+     (Sebastián, 19-oct). Se recuerda en este navegador. */
+  const [soloVerif, setSoloVerif] = React.useState(() => {
+    try { return localStorage.getItem("p2p_punteros_verif") !== "0"; } catch (e) { return true; }
+  });
+  const cambiarVerif = (v) => {
+    setSoloVerif(v);
+    try { localStorage.setItem("p2p_punteros_verif", v ? "1" : "0"); } catch (e) {}
+  };
   React.useEffect(() => {
     let stop = false;
-    const load = () => fetch(B + "/api/punteros").then(r => r.json())
+    const load = () => fetch(B + "/api/punteros" + (soloVerif ? "?verificados=1" : "")).then(r => r.json())
       .then(j => { if (!stop) setD(j); }).catch(() => {});
     load();
     const id = setInterval(load, 20000);
     return () => { stop = true; clearInterval(id); };
-  }, []);
+  }, [soloVerif]);
   if (!d || !d.compra) return null;
   const fN = (x, n) => x == null ? "—" : Number(x).toLocaleString("es-CL",
     { minimumFractionDigits: n || 0, maximumFractionDigits: n || 0 });
@@ -4720,6 +4947,13 @@ function MakerActions({ snap }) {
         <button className={"intel-tab" + (lado === "venta" ? " active" : "")} onClick={() => setLado("venta")}
           title="El tab Venta del libro: ahí están los que COMPRAN.">
           Donde comprás</button>
+        <span style={{ width: 1, height: 18, background: "var(--line-soft)", margin: "0 4px" }} />
+        <button className={"intel-tab" + (!soloVerif ? " active" : "")} onClick={() => cambiarVerif(false)}
+          title="Todos los anuncios del tramo, tengan o no la insignia.">
+          Todos</button>
+        <button className={"intel-tab" + (soloVerif ? " active" : "")} onClick={() => cambiarVerif(true)}
+          title="Sólo los que tienen la insignia de verificado. Con badge competís contra ellos: los que no la tienen no te sacan órdenes.">
+          ★ Solo verificados</button>
         {ext && (
           <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-2)" }}>
             mejor precio en <b style={{ color: "var(--accent)" }}>{ext.mejor_tramo}</b>
@@ -4747,7 +4981,7 @@ function MakerActions({ snap }) {
                 <td>
                   <b style={{ color: mejor ? "var(--accent)" : "var(--text)" }}>{t.etiqueta}</b>
                 </td>
-                {!p ? <td colSpan={6} style={{ color: "var(--text-3)" }}>nadie pasa el filtro acá</td> : <>
+                {!p ? <td colSpan={6} style={{ color: "var(--text-3)" }}>{soloVerif ? "ningún verificado en este tramo" : "nadie pasa el filtro acá"}</td> : <>
                   <td>
                     {p.soy_yo ? <b style={{ color: "var(--accent)" }}>VOS</b> : p.anunciante}
                     {p.es_merchant && <span title="Es Merchant verificado" style={{ color: "var(--warn)" }}> ★</span>}
@@ -9693,6 +9927,7 @@ def api_estado():
     with data_lock:
         snap["detalle_compra"] = ultimo_estado.get("detalle_compra", [])
         snap["detalle_venta"]  = ultimo_estado.get("detalle_venta",  [])
+        snap["operable"]       = ultimo_estado.get("operable")   # COL66
     # EDAD calculada por el SERVIDOR (COL23): cuantos segundos hace que se guardo
     # el snapshot, segun el reloj del server. Asi la frescura NO depende del reloj
     # del dispositivo del usuario. Antes el cliente hacia now - timestamp con su
@@ -10825,6 +11060,54 @@ def api_anunciante():
     })
 
 
+def _mejor_para_monto(filas, tipo, usdt, c):
+    """COL66. El mejor precio del libro que DE VERDAD te toma una orden de
+    'usdt': operable, min <= monto <= max efectivo (en CLP, con el precio de
+    cada anuncio), banco compartido y los mismos pisos de ordenes/exito de la
+    cabecera. Es la pregunta del FILTRO de Binance (trampa §6 #11), no la del
+    tope visible. tipo BUY = tab Compra (el mas barato), SELL = tab Venta
+    (el mas caro). Devuelve el mejor y cuantos quedaron afuera por motivo."""
+    mi_nick = str(c.get("MI_NICKNAME") or "").strip().lower()
+    min_ord = int(c.get("FILTRO_MIN_ORD", 100) or 0)
+    min_tasa = float(c.get("FILTRO_MIN_TASA", 90) or 0)
+    mis_pagos = {x.strip() for x in str(c.get("MIS_METODOS_PAGO", "") or "").split(",") if x.strip()}
+    afuera = {"monto fijo o verificacion": 0, "no acepta tu monto": 0,
+              "otro banco": 0, "pocas ordenes o exito": 0}
+    cands = []
+    for a in filas or []:
+        precio = float(a.get("precio") or 0)
+        if precio <= 0 or (a.get("anunciante") or "").strip().lower() == mi_nick:
+            continue
+        if int(a.get("completadas") or 0) < min_ord or float(a.get("tasa_exito") or 0) < min_tasa:
+            afuera["pocas ordenes o exito"] += 1
+            continue
+        # el monto fijo se evalua abajo contra TU monto: si coincide, sirve
+        if a.get("kyc_extra"):
+            afuera["monto fijo o verificacion"] += 1
+            continue
+        clp = usdt * precio
+        mino = a.get("min_orden")
+        maxe = a.get("max_efectivo") or a.get("max_orden")
+        if maxe is None:
+            maxe = float(a.get("disponible") or 0) * precio
+        if (mino and clp < float(mino)) or clp > float(maxe):
+            if a.get("rango_fijo"):
+                afuera["monto fijo o verificacion"] += 1
+            else:
+                afuera["no acepta tu monto"] += 1
+            continue
+        p = a.get("pagos")
+        if mis_pagos and p and not (set(p) & mis_pagos):
+            afuera["otro banco"] += 1
+            continue
+        cands.append(a)
+    if not cands:
+        return {"precio": None, "anunciante": None, "puesto_visible": None, "afuera": afuera}
+    mejor = (min if tipo == "BUY" else max)(cands, key=lambda x: float(x["precio"]))
+    return {"precio": round(float(mejor["precio"]), 2), "anunciante": mejor.get("anunciante"),
+            "puesto_visible": mejor.get("posicion"), "afuera": afuera}
+
+
 @app.route("/api/taker_maker")
 def api_taker_maker():
     """CRUZAR o ESPERAR: compara, pierna por pierna, si conviene tomar el
@@ -10925,7 +11208,49 @@ def api_taker_maker():
     caminos.sort(key=lambda x: x["costo_vuelta_pct"])
     barato = caminos[0]
 
+    # ── COL66: el mismo libro sin la basura detectable ──────────────
+    # Lo de arriba queda IGUAL (lo usa la pantalla). Esto va al lado para
+    # comparar: cuanto cambia el spread y el tamano de equilibrio cuando se
+    # sacan los anuncios que no se pueden tomar, y a que precio te toman
+    # una orden de ESTE tamano.
+    def _equilibrio(a_, b_):
+        if not a_ or not b_:
+            return None, None
+        m_ = (a_ + b_) / 2
+        sp_ = (a_ - b_) / m_ * 100
+        te_ = round(fija * 100 / (mak_pct - sp_)) if sp_ < mak_pct else None
+        return round(sp_, 4), te_
+    op = snap.get("operable") or {}
+    op_ask = float(op.get("mejor_vendedor_tab_compra") or 0) or None
+    op_bid = float(op.get("mejor_comprador_tab_venta") or 0) or None
+    op_sp, op_te = _equilibrio(op_ask, op_bid)
+    pm_compra = _mejor_para_monto(snap.get("detalle_compra"), "BUY", usdt, c)
+    pm_venta  = _mejor_para_monto(snap.get("detalle_venta"),  "SELL", usdt, c)
+    pm_sp, pm_te = _equilibrio(pm_compra["precio"], pm_venta["precio"])
+    libro_operable = {
+        "cabecera_operable": {
+            "ask": op_ask, "bid": op_bid, "spread_pct": op_sp,
+            "tamano_equilibrio_usdt": op_te,
+            "descartados_tab_compra": op.get("descartados_tab_compra") or [],
+            "descartados_tab_venta": op.get("descartados_tab_venta") or [],
+        },
+        "para_tu_monto": {
+            "usdt": round(usdt),
+            "comprar_cruzando": pm_compra,
+            "vender_cruzando": pm_venta,
+            "spread_pct": pm_sp,
+            "tamano_equilibrio_usdt": pm_te,
+            "cruzado": (pm_venta["precio"] > pm_compra["precio"]
+                        if pm_compra["precio"] and pm_venta["precio"] else None),
+        },
+        "nota": ("Saca montos fijos, verificacion extra, bancos que no compartis y anuncios "
+                 "que no aceptan tu monto. NO saca pagos de terceros ni restringidos (Binance "
+                 "no manda esos terminos): el precio real puede ser peor todavia. Libro del "
+                 "colector, hasta 2 minutos de atraso."),
+    }
+
     return jsonify({
+        "libro_operable": libro_operable,
         "usdt_evaluado": round(usdt),
         "libro": {"ask": round(ask, 2), "bid": round(bid, 2), "mid": round(mid, 2),
                   "spread_pct": round(spread_pct, 4)},
@@ -12499,6 +12824,40 @@ def _tramo_de(minimo):
     return None
 
 
+@app.route("/api/libro_vivo")
+def api_libro_vivo():
+    """COL67 — EL LIBRO PARA EL BOT, lo mas fresco posible.
+
+    Pedido de Sebastian (19-oct): "tener el libro lo mas en vivo posible" y
+    "una buena api para el bot". Hasta COL66 el bot leia /api/estado, que es
+    la foto del colector: hasta 2 minutos de atraso. Esta trae el libro
+    entero de hace menos de 15-20 s.
+
+    REEMPLAZA a /api/estado PARA EL LIBRO, con las MISMAS claves
+    (detalle_compra, detalle_venta) y las mismas columnas que el bot lee:
+    precio, disponible, anunciante, min_orden, max_orden, posicion,
+    tasa_exito, completadas, es_merchant. El bot cambia la direccion y nada
+    mas. /api/estado NO se toca: la usa la pantalla y trae la velocidad.
+
+    'edad_seg' dice cuantos segundos tiene la foto y 'fuente' de donde
+    salio. Si el vivo se cae, contesta igual con la del colector y lo dice:
+    nunca devuelve un libro viejo haciendose pasar por nuevo."""
+    compra, venta, edad, fuente = _libro_mas_fresco()
+    if not compra and not venta:
+        return jsonify({"error": "sin datos del libro aun", "fuente": None}), 503
+    return jsonify({
+        "fuente": fuente,
+        "edad_seg": (round(edad, 1) if edad is not None else None),
+        "n_compra": len(compra), "n_venta": len(venta),
+        "detalle_compra": compra,
+        "detalle_venta": venta,
+        "nota": ("detalle_compra = tab Compra (los que VENDEN USDT). "
+                 "detalle_venta = tab Venta (los que COMPRAN). Mismo formato "
+                 "que /api/estado. 'posicion' = puesto en el libro sin filtrar. "
+                 "No trae 'velocidad': para eso, /api/estado."),
+    })
+
+
 @app.route("/api/punteros")
 def api_punteros():
     """QUIEN ENCABEZA CADA TRAMO DE MINIMO (COL50, traido en COL62).
@@ -12518,7 +12877,11 @@ def api_punteros():
     en COL59 (el ticket sube monotono con el tramo: 57 -> 619).
 
     ── DE DONDE SALE EL LIBRO ──
-    ★ De la foto del COLECTOR (los 80 avisos), no del libro vivo de 10s.
+    COL67: del libro MAS FRESCO QUE ESTE COMPLETO (_libro_mas_fresco). Desde
+    COL67 el vivo trae el libro entero, asi que la razon de abajo para no
+    usarlo dejo de valer. Se conserva el razonamiento porque la guarda de
+    _libro_mas_fresco (80% de los anuncios del colector) existe por eso:
+    ★ (hasta COL66) De la foto del COLECTOR (los 80 avisos), no del libro vivo de 10s.
     La version original de COL50 usaba el vivo, y ahi habria repetido el
     error que COL59b vino a arreglar: el vivo trae solo los 20 primeros, que
     son casi todos de minimo alto, asi que los tramos de abajo se quedarian
@@ -12537,24 +12900,19 @@ def api_punteros():
     min_ord = int(c.get("FILTRO_MIN_ORD", 100) or 0)
     min_tasa = float(c.get("FILTRO_MIN_TASA", 90) or 0)
 
-    with data_lock:
-        snap = dict(ultimo_estado)
-    edad = None
-    try:
-        ts_snap = snap.get("timestamp")
-        if ts_snap:
-            edad = (datetime.now(SANTIAGO_TZ)
-                    - datetime.strptime(str(ts_snap)[:19], "%Y-%m-%d %H:%M:%S")
-                    .replace(tzinfo=SANTIAGO_TZ)).total_seconds()
-    except Exception:
-        pass
+    # COL67 — SOLO VERIFICADOS. Pedido de Sebastian (19-oct): "ya es momento
+    # de pasar a solo verificados, no compito contra los que no tienen el
+    # verificado". Coincide con REGLAS_VIGENTES §1: "el puesto que cuenta es
+    # entre verificados de tu tramo". Con esto el puntero, 'mi_puesto',
+    # 'Compiten', la plata del tramo y el spread de abajo se calculan SOLO
+    # entre verificados. es_merchant = userType "merchant" en Binance.
+    solo_verif = str(request.args.get("verificados", "")).strip().lower() in ("1", "true", "si", "sí")
+
+    libro_c, libro_v, edad, fuente = _libro_mas_fresco()
 
     salida = {}
     for tipo in ("BUY", "SELL"):
-        filas = snap.get("detalle_compra" if tipo == "BUY" else "detalle_venta") or []
-        if not filas:                      # recien arrancado: mejor 20 que nada
-            filas, edad = libro_vivo_como_detalle(tipo)
-            filas = filas or []
+        filas = libro_c if tipo == "BUY" else libro_v
         # BUY = tab Compra: los anunciantes VENDEN, el mejor para mi es el mas
         # BARATO. SELL = tab Venta: compran, el mejor es el mas CARO.
         comprando = (tipo == "BUY")
@@ -12576,6 +12934,8 @@ def api_punteros():
                 if int(a.get("completadas") or 0) < min_ord:
                     continue
                 if float(a.get("tasa_exito") or 0) < min_tasa:
+                    continue
+                if solo_verif and not a.get("es_merchant"):
                     continue
                 cands.append(a)
             if not cands:
@@ -12658,7 +13018,8 @@ def api_punteros():
         "compra": salida["BUY"], "venta": salida["SELL"],
         "extremos_compra": ex_c, "extremos_venta": ex_v,
         "spread_punteros": spread_punteros,
-        "fuente_libro": "colector",
+        "fuente_libro": fuente,
+        "solo_verificados": solo_verif,
         "edad_seg": (round(edad, 1) if edad is not None else None),
         "filtros": {"stock_min": min_stock, "ordenes_min": min_ord, "tasa_min": min_tasa},
         "nota": ("Puntero = el mejor precio de cada tramo de mínimo, ya sacando "
@@ -12980,7 +13341,8 @@ def api_ciclo():
     # Un anuncio con el que no compartis banco NO es un precio disponible
     # para vos. Medido 2-ago: 15 de 70 anuncios que pasaban los filtros
     # normales no compartian metodo. Si la lista esta vacia no filtra nada
-    # (y si el libro viene del colector, que no guarda 'pagos', tampoco).
+    # (desde COL66 el libro del colector tambien trae 'pagos', asi que el
+    # respaldo filtra igual que el vivo; antes el respaldo no filtraba).
     mis_pagos = {x.strip() for x in str(c.get("MIS_METODOS_PAGO", "") or "").split(",") if x.strip()}
     sin_pago = []
 
