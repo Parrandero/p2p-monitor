@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL67"
-VERSION_FECHA = "2026-10-19"
+VERSION       = "COL69"
+VERSION_FECHA = "2026-10-22"
 
 config = {
     "MONEDA":               "USDT",
@@ -12135,6 +12135,186 @@ def api_velocidad_mercado():
     })
 
 
+
+# ══════════════════════════════════════════════════════════════
+#  FLUJO POR FILTRO (COL69)
+# ══════════════════════════════════════════════════════════════
+_flujo_cache = {}
+_flujo_cache_lock = threading.Lock()
+FLUJO_MONTOS_DEFAULT = [20000, 50000, 100000, 200000]
+
+
+@app.route("/api/flujo_por_filtro")
+def api_flujo_por_filtro():
+    """ORDENES DEL MERCADO POR FILTRO DE MONTO, ultimos 15 y 60 minutos.
+
+    Pedido de la sesion de n8n (documentos/Pedido_sesion_codigo_flujo_por_
+    filtro.md, 22-oct): que el bot muestre DONDE HAY LIQUIDEZ para elegir en
+    que tramo pararse. El monto que el comprador escribe en Binance define
+    contra quien competis (memoria "El filtro del minimo ES el mercado").
+    /api/velocidad_mercado da el total; esto lo separa por filtro.
+
+    ?montos=20000,50000,100000,200000   (CLP, hasta 10)
+    ?solo_verificados=1                  (default 1; 0 = todos)
+
+    LA REGLA: una orden de fills_estimados (anunciante A, tipo T, hora ts)
+    cuenta en el filtro M si el anuncio de A en T, en la foto de ese mismo
+    momento, cumple min_orden <= M <= max_orden.
+      - "la foto de ese momento" es EXACTA, no la mas cercana: el FillTracker
+        corre adentro del colector y graba la orden con la hora de la foto
+        en que la vio. Medido 22-oct sobre 24 h: 0 horas de orden que no sean
+        hora de una foto, y 4 ordenes de 10.239 (0,04%) cuyo anunciante no
+        estaba en esa foto -> se devuelven en 'sin_anuncio'.
+      - max_orden vacio = sin techo. min_orden vacio = no se puede ubicar ->
+        'sin_rango' (medido: 0 en 24 h; queda por las filas viejas).
+
+    MISMA POBLACION QUE /api/velocidad_mercado: exchange binance, suma de
+    'ordenes' (el contador oficial), ventana contra la hora de Chile. Asi
+    'todos_los_montos' tiene que dar lo mismo que velocidad_mercado (con
+    solo_verificados=0) y ninguna fila de filtro puede superarlo.
+
+    TRAMPA DE LOS ANUNCIOS MULTIPLES (§6 de la base): si A tiene 2+ anuncios
+    del mismo tipo en esa foto, fills_estimados no dice de cual fue la orden.
+    Se cuenta en M si ALGUNO lo cubre, y si los anuncios de A NO coinciden
+    sobre M (uno lo cubre y otro no), la orden se suma ademas a 'ambiguas'
+    de ese filtro: es la parte del numero que podria estar en otro filtro.
+    Medido 22-oct: el anunciante con 2+ anuncios es el 12,6% de las ordenes
+    de la ultima hora y el 19,6% de las de 24 h. Las que tienen todos sus
+    anuncios de acuerdo NO son ambiguas aunque sean varios.
+
+    venta  = tipo BUY  = pestaña Comprar de Binance: los que VENDEN USDT, la
+             competencia de su venta.
+    compra = tipo SELL = pestaña Vender: la competencia de su compra.
+    _firme = solo metodo 'directo' (el stock bajo de verdad): el piso.
+
+    Se cachea 60 s por combinacion de parametros: el bot lo pide cuando el
+    toca el boton, no en un loop. Medido: la consulta de 1 hora tarda 0,6 s."""
+    # ── parametros ──────────────────────────────────────────────────
+    crudo = str(request.args.get("montos", "") or "").strip()
+    try:
+        montos = [int(float(x)) for x in crudo.split(",") if x.strip()] if crudo else list(FLUJO_MONTOS_DEFAULT)
+    except (TypeError, ValueError):
+        return jsonify({"error": "montos tiene que ser una lista de numeros, ej: 20000,50000"}), 400
+    montos = sorted({m for m in montos if 1000 <= m <= 50_000_000})[:10]
+    if not montos:
+        return jsonify({"error": "ningun monto valido (entre 1.000 y 50.000.000 CLP)"}), 400
+    sv = str(request.args.get("solo_verificados", "1")).strip().lower()
+    solo_verif = sv not in ("0", "false", "no")
+
+    clave = (tuple(montos), solo_verif)
+    ahora_t = time.time()
+    with _flujo_cache_lock:
+        hit = _flujo_cache.get(clave)
+        if hit and ahora_t - hit[0] < 60:
+            return jsonify(hit[1])
+
+    now = datetime.now(SANTIAGO_TZ)
+    f = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
+    m15, m60 = f(now - timedelta(minutes=15)), f(now - timedelta(minutes=60))
+
+    # ── una fila por (orden, anuncio de ese anunciante en esa foto) ────
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SET LOCAL statement_timeout = '40s'")
+                cur.execute("""
+                    SELECT fe.id, fe.ts, fe.tipo, fe.ordenes, fe.metodo,
+                           sd.min_orden, sd.max_orden, sd.es_merchant,
+                           (sd.anunciante IS NOT NULL) AS hay_anuncio
+                    FROM fills_estimados fe
+                    LEFT JOIN snapshots_detalle sd
+                      ON sd.snapshot_timestamp = fe.ts
+                     AND sd.tipo = fe.tipo
+                     AND sd.anunciante = fe.anunciante
+                    WHERE fe.exchange = 'binance' AND fe.ts >= %(m60)s AND fe.ts <= %(hasta)s
+                """, {"m60": m60, "hasta": f(now)})
+                filas = cur.fetchall()
+            conn.commit()
+    except Exception as e:
+        print(f"[FLUJO POR FILTRO] {e}")
+        return jsonify({"error": "no se pudo leer la base", "detalle": str(e)[:200]}), 503
+
+    # ── juntar los anuncios de cada orden ──────────────────────────
+    eventos = {}
+    for r in filas:
+        ev = eventos.setdefault(r["id"], {
+            "ts": f(r["ts"]) if hasattr(r["ts"], "strftime") else str(r["ts"])[:19],
+            "lado": "venta" if r["tipo"] == "BUY" else "compra",
+            "ordenes": int(r["ordenes"] or 0),
+            "firme": r["metodo"] == "directo",
+            "anuncios": [], "merchant": False})
+        if r["hay_anuncio"]:
+            ev["anuncios"].append((r["min_orden"], r["max_orden"]))
+            ev["merchant"] = ev["merchant"] or bool(r["es_merchant"])
+
+    def vacio():
+        return {"venta": 0, "venta_firme": 0, "compra": 0, "compra_firme": 0,
+                "ambiguas": {"venta": 0, "compra": 0}}
+
+    por_filtro = {m: {"m15": vacio(), "m60": vacio()} for m in montos}
+    todos = {"m15": vacio(), "m60": vacio()}
+    for w in todos.values():
+        del w["ambiguas"]
+    sin_anuncio = {"m15": 0, "m60": 0}
+    sin_rango = {"m15": 0, "m60": 0}
+
+    for ev in eventos.values():
+        n = ev["ordenes"]
+        if n <= 0:
+            continue
+        ventanas = ["m60"] + (["m15"] if ev["ts"] >= m15 else [])
+        if not ev["anuncios"]:
+            for w in ventanas:
+                sin_anuncio[w] += n
+            continue
+        if solo_verif and not ev["merchant"]:
+            continue
+        lado = ev["lado"]
+        for w in ventanas:
+            todos[w][lado] += n
+            if ev["firme"]:
+                todos[w][lado + "_firme"] += n
+        rangos = [(float(a), float(b) if b is not None else None)
+                  for a, b in ev["anuncios"] if a is not None]
+        if not rangos:
+            for w in ventanas:
+                sin_rango[w] += n
+            continue
+        for m in montos:
+            cubre = [a <= m and (b is None or m <= b) for a, b in rangos]
+            if not any(cubre):
+                continue
+            for w in ventanas:
+                d = por_filtro[m][w]
+                d[lado] += n
+                if ev["firme"]:
+                    d[lado + "_firme"] += n
+                if not all(cubre):
+                    d["ambiguas"][lado] += n
+
+    out = {
+        "ts": now.isoformat(timespec="seconds"),
+        "solo_verificados": solo_verif,
+        "filtros": [{"monto": m, "m15": por_filtro[m]["m15"], "m60": por_filtro[m]["m60"]}
+                    for m in montos],
+        "todos_los_montos": todos,
+        "sin_anuncio": sin_anuncio,
+        "sin_rango": sin_rango,
+        "nota": ("Un anuncio que cubre varios montos cuenta en todos: las filas NO se suman. "
+                 "venta = pestaña Comprar de Binance (los que venden USDT, tu competencia "
+                 "al vender); compra = pestaña Vender. _firme = el stock bajó de verdad (piso). "
+                 "ambiguas = órdenes de anunciantes con 2+ anuncios que no coinciden sobre ese "
+                 "monto: están contadas, pero podrían ser de otro filtro. Sólo se ven los 80 "
+                 "primeros anuncios de cada lado: lo que pasa más abajo no entra, igual que en "
+                 "velocidad_mercado. todos_los_montos = mismo total que velocidad_mercado."),
+    }
+    with _flujo_cache_lock:
+        _flujo_cache[clave] = (ahora_t, out)
+        if len(_flujo_cache) > 50:            # que no crezca sin fin
+            _flujo_cache.clear()
+            _flujo_cache[clave] = (ahora_t, out)
+    return jsonify(out)
+
 @app.route("/api/operativa")
 def api_operativa():
     """ASISTENTE OPERATIVO — convierte las senales en una recomendacion:
@@ -12845,8 +13025,16 @@ def api_libro_vivo():
     compra, venta, edad, fuente = _libro_mas_fresco()
     if not compra and not venta:
         return jsonify({"error": "sin datos del libro aun", "fuente": None}), 503
+    # COL68 — 'timestamp' con el MISMO formato que /api/estado (hora de Chile,
+    # "AAAA-MM-DD HH:MM:SS"): el bot lo usa en 13 lugares (la cabecera
+    # "📊 14:32", los avisos, "Son las..."). Sin esto, cambiar la direccion
+    # del bot no alcanzaba. Es la hora de la FOTO, no la de la consulta.
+    ts_foto = None
+    if edad is not None:
+        ts_foto = (datetime.now(SANTIAGO_TZ) - timedelta(seconds=edad)).strftime("%Y-%m-%d %H:%M:%S")
     return jsonify({
         "fuente": fuente,
+        "timestamp": ts_foto,
         "edad_seg": (round(edad, 1) if edad is not None else None),
         "n_compra": len(compra), "n_venta": len(venta),
         "detalle_compra": compra,
