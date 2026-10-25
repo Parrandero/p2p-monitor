@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL69"
-VERSION_FECHA = "2026-10-22"
+VERSION       = "COL70"
+VERSION_FECHA = "2026-10-25"
 
 config = {
     "MONEDA":               "USDT",
@@ -408,6 +408,20 @@ def init_db():
             for _t in ("snapshots_detalle", "snapshots_detalle_bybit"):
                 cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS min_orden INTEGER")
                 cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS max_orden INTEGER")
+            # ── NIVEL DEL VERIFICADO (COL70) ─────────────────────────────
+            # Pedido de la sesion de estrategia (25-oct, BASE_CONOCIMIENTO
+            # §2.56). Binance ya los manda en item["advertiser"]: vipLevel
+            # (1/2/3 = Bronce/Plata/Oro), badges (["Ordinary"], [...,"Pro"],
+            # ["Block"]) y userIdentity. Hasta COL69 solo se guardaba
+            # es_merchant. NULL = NO MEDIDO (filas viejas, Bybit, campo que
+            # falto): nunca leerlo como "nivel 1" ni como false.
+            # Van en las DOS tablas aunque Bybit no los traiga: la consulta de
+            # guardar_agregados_dia lee las dos con el mismo SQL, y sin la
+            # columna la de Bybit fallaria. En Bybit quedan siempre NULL.
+            for _t in ("snapshots_detalle", "snapshots_detalle_bybit"):
+                cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS nivel SMALLINT")
+                cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS es_pro BOOLEAN")
+                cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS es_block BOOLEAN")
             # ── Fills v2: un registro por evento de fill confirmado/estimado ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS fills_estimados (
@@ -487,6 +501,12 @@ def init_db():
             cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS min_orden_med INTEGER")
             cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS max_orden_med INTEGER")
             cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS min_orden_moda INTEGER")
+            # COL70: nivel del verificado. Esta es la tabla que sobrevive a la
+            # purga del detalle: si no va aca, la historia se pierde a los
+            # DETALLE_DIAS. nivel = MAX del dia; es_pro / es_block = BOOL_OR.
+            cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS nivel SMALLINT")
+            cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS es_pro BOOLEAN")
+            cur.execute("ALTER TABLE agregados_anunciante_dia ADD COLUMN IF NOT EXISTS es_block BOOLEAN")
             # \u2500\u2500 MIS ORDENES REALES (verdad de terreno para calibrar) \u2500\u2500
             # Se importan del CSV de Binance. Es el unico caso donde sabemos que
             # paso de verdad: comparar contra lo que el monitor infirio desde
@@ -1093,7 +1113,8 @@ def guardar_agregados_dia(fecha=None):
                             (fecha, exchange, anunciante, tipo, apariciones, pos_media,
                              pos_min, precio_medio, disp_medio, comp_min, comp_max,
                              ordenes_dia, es_merchant,
-                             min_orden_med, max_orden_med, min_orden_moda)
+                             min_orden_med, max_orden_med, min_orden_moda,
+                             nivel, es_pro, es_block)
                         SELECT snapshot_timestamp::date, %(ex)s, anunciante, tipo,
                                COUNT(*), ROUND(AVG(posicion)::numeric, 1),
                                MIN(posicion), ROUND(AVG(precio)::numeric, 2),
@@ -1107,7 +1128,12 @@ def guardar_agregados_dia(fecha=None):
                                -- de en 0 (verificado contra la DB antes de usarlo).
                                ROUND(AVG(min_orden)::numeric)::int,
                                ROUND(AVG(max_orden)::numeric)::int,
-                               mode() WITHIN GROUP (ORDER BY min_orden)
+                               mode() WITHIN GROUP (ORDER BY min_orden),
+                               -- COL70: MAX y BOOL_OR ignoran los NULL y dan
+                               -- NULL si TODO el dia es NULL: los dias sin la
+                               -- columna (y Bybit) quedan "no medido", no 0/false.
+                               -- El dia del deploy queda medido en una parte.
+                               MAX(nivel), BOOL_OR(es_pro), BOOL_OR(es_block)
                         FROM {tabla}
                         WHERE snapshot_timestamp::date = %(f)s
                           AND anunciante IS NOT NULL AND anunciante <> ''
@@ -1120,7 +1146,9 @@ def guardar_agregados_dia(fecha=None):
                             es_merchant = EXCLUDED.es_merchant,
                             min_orden_med = EXCLUDED.min_orden_med,
                             max_orden_med = EXCLUDED.max_orden_med,
-                            min_orden_moda = EXCLUDED.min_orden_moda
+                            min_orden_moda = EXCLUDED.min_orden_moda,
+                            nivel = EXCLUDED.nivel, es_pro = EXCLUDED.es_pro,
+                            es_block = EXCLUDED.es_block
                     """, {"ex": ex, "f": fecha or (datetime.now(SANTIAGO_TZ).date() - timedelta(days=1))})
                     total += cur.rowcount
 
@@ -1426,6 +1454,54 @@ def _motivo_no_operable(a):
     return ", ".join(m)
 
 
+def _nivel_verificado(trade):
+    """COL70 — (nivel, es_pro, es_block) desde item["advertiser"].
+
+    UN try POR CAMPO, no por fila: si uno falta o viene con otro formato,
+    ESE queda en None (= no medido) y los otros dos, y la fila, siguen.
+    Formatos medidos el 25-oct sobre 200 anuncios del libro CLP:
+      vipLevel     int 1/2/3; None en los no verificados
+      badges       ["Ordinary"] / ["Ordinary","Pro"] / ["Block"]; None en
+                   los no verificados
+      userIdentity "MASS_MERCHANT" / "BLOCK_MERCHANT" / "" (no verificados)
+    Consecuencia para los NO verificados: nivel NULL y es_pro NULL (no hay
+    badges que mirar), pero es_block = false, porque userIdentity "" SI es
+    una medicion: dice que no es Block."""
+    t = trade or {}
+    nivel = es_pro = es_block = None
+    try:
+        v = t.get("vipLevel")
+        if isinstance(v, bool):
+            v = None                     # True/False no es un nivel
+        elif isinstance(v, float) and v.is_integer():
+            v = int(v)
+        elif isinstance(v, str) and v.strip().isdigit():
+            v = int(v.strip())
+        if isinstance(v, int) and 0 <= v <= 99:
+            nivel = v
+    except Exception:
+        nivel = None
+    try:
+        b = t.get("badges")
+        if isinstance(b, (list, tuple)):
+            es_pro = any(str(x).strip().lower() == "pro" for x in b)
+    except Exception:
+        es_pro = None
+    try:
+        senales = []
+        u = t.get("userIdentity")
+        if isinstance(u, str):
+            senales.append(u.strip().upper() == "BLOCK_MERCHANT")
+        b = t.get("badges")
+        if isinstance(b, (list, tuple)):
+            senales.append(any(str(x).strip().lower() == "block" for x in b))
+        if senales:
+            es_block = any(senales)
+    except Exception:
+        es_block = None
+    return nivel, es_pro, es_block
+
+
 def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
     """Guarda los top 80 anunciantes de cada lado SIN filtros de mínimos"""
     with config_lock:
@@ -1440,6 +1516,7 @@ def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
             adv   = item.get("adv", {})
             trade = item.get("advertiser", {})
             mino, maxo = _limites_adv(adv)
+            nivel, es_pro, es_block = _nivel_verificado(trade)   # COL70
             rows.append((
                 timestamp, hora, lado, pos,
                 trade.get("nickName", ""),
@@ -1449,6 +1526,7 @@ def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
                 float(trade.get("monthFinishRate", trade.get("finishRate", 0)) or 0) * 100,
                 bool(trade.get("userType") == "merchant"),
                 mino, maxo,
+                nivel, es_pro, es_block,
             ))
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -1456,8 +1534,8 @@ def guardar_detalle(timestamp, hora, anuncios_raw_compra, anuncios_raw_venta):
                 INSERT INTO snapshots_detalle
                 (snapshot_timestamp, hora, tipo, posicion, anunciante, precio,
                  disponible, completadas, tasa_exito, es_merchant,
-                 min_orden, max_orden)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 min_orden, max_orden, nivel, es_pro, es_block)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, rows)
         conn.commit()
 
