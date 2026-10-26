@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL70"
-VERSION_FECHA = "2026-10-25"
+VERSION       = "COL71"
+VERSION_FECHA = "2026-10-26"
 
 config = {
     "MONEDA":               "USDT",
@@ -13293,6 +13293,367 @@ def api_punteros():
                  "Tab Venta: mejor = más caro (ahí vendés). Los avisos sin límite "
                  "publicado no se clasifican."),
     })
+
+
+# ══════════════════════════════════════════════════════════════
+#  BRECHA POR FILTRO (COL71) — la pagina /brecha y su /api/brecha
+# ══════════════════════════════════════════════════════════════
+# Pedido de Sebastian (26-oct): "un indicador visual... que pueda ver
+# rapidamente desde el cel o desde la compu, y me muestre visualmente la
+# brecha entre los distintos filtros", con los colores de Binance, y poder
+# combinar: "comprar en el filtro de 50.000 pero venderlo en el de 20.000".
+#
+# FILTRO = el monto que el cliente escribe en Binance. Un anuncio aparece en
+# el filtro M si min_orden <= M <= su maximo efectivo (el dinamico de
+# Binance, ya recortado al stock) y su stock alcanza para M. Es la lectura
+# de la memoria "El filtro del minimo ES el mercado", no la de /api/punteros
+# (que agrupa por TRAMO del minimo del anuncio: otra pregunta).
+#
+# Para cada filtro se dan las dos puntas QUE EL VE COMO COMPETENCIA:
+#   compra = donde compra el: el mejor de la pestaña VENDER de Binance
+#            (anuncios SELL, los que compran USDT) = el MAS CARO.
+#   venta  = donde vende el:  el mejor de la pestaña COMPRAR (anuncios BUY,
+#            los que venden USDT) = el MAS BARATO.
+# Sus propios anuncios NO cuentan como punta (si el es el mejor, la brecha
+# saldria contra si mismo): van aparte en mio_compra / mio_venta.
+# Las combinaciones (comprar en un filtro, vender en otro) las arma la
+# pagina con estas mismas dos puntas: no hace falta otra consulta.
+#
+# Mismos filtros de calidad que /api/punteros y el Ciclo (stock, ordenes,
+# tasa) y, por defecto, SOLO VERIFICADOS (REGLAS_VIGENTES §1).
+BRECHA_MONTOS_DEFAULT = [10000, 20000, 30000, 50000, 100000, 200000, 500000]
+# La vuelta completa (comprar + vender, las dos maker) con badge: 0,1463% por
+# pierna medido -> 0,29% (REGLAS_VIGENTES §2). NO se usa COMISION_BN_VERIF
+# (0,152 por pierna, vieja): esa sigue en la tarjeta de punteros, pendiente.
+BRECHA_COMISION_VUELTA_PCT = 0.29
+
+
+def _aparece_en_filtro(a, monto):
+    """El anuncio a (fila de _libro_mas_fresco) se le muestra a quien escribe
+    'monto' CLP? Sin minimo publicado no se puede saber -> no."""
+    try:
+        precio = float(a.get("precio") or 0)
+        mn = float(a.get("min_orden") or 0)
+        if precio <= 0 or mn <= 0 or monto < mn:
+            return False
+        tope = a.get("max_efectivo") or a.get("max_orden")
+        if tope and monto > float(tope):
+            return False
+        return float(a.get("disponible") or 0) * precio >= monto
+    except (TypeError, ValueError):
+        return False
+
+
+@app.route("/api/brecha")
+def api_brecha():
+    """Las dos puntas de cada filtro de monto, del libro mas fresco (15 s).
+
+    ?montos=10000,20000,...   CLP, hasta 12 (default BRECHA_MONTOS_DEFAULT)
+    ?verificados=1            default 1; 0 = todos
+    Sin cache: es un recorrido de ~160 anuncios en memoria."""
+    crudo = str(request.args.get("montos", "") or "").strip()
+    try:
+        montos = [int(float(x)) for x in crudo.split(",") if x.strip()] if crudo else list(BRECHA_MONTOS_DEFAULT)
+    except (TypeError, ValueError):
+        return jsonify({"error": "montos tiene que ser una lista de numeros, ej: 20000,50000"}), 400
+    montos = sorted({m for m in montos if 1000 <= m <= 50_000_000})[:12]
+    if not montos:
+        return jsonify({"error": "ningun monto valido (entre 1.000 y 50.000.000 CLP)"}), 400
+    solo_verif = str(request.args.get("verificados", "1")).strip().lower() not in ("0", "false", "no")
+
+    with config_lock:
+        c = dict(config)
+    mi_nick = str(c.get("MI_NICKNAME") or "").strip().lower()
+    min_stock = float(c.get("FILTRO_MIN_USDT", 200) or 0)
+    min_ord = int(c.get("FILTRO_MIN_ORD", 100) or 0)
+    min_tasa = float(c.get("FILTRO_MIN_TASA", 90) or 0)
+
+    libro_c, libro_v, edad, fuente = _libro_mas_fresco()
+    if not libro_c and not libro_v:
+        return jsonify({"error": "sin datos del libro aun", "fuente": None}), 503
+
+    def pasa(a):
+        try:
+            return (float(a.get("disponible") or 0) >= min_stock
+                    and int(a.get("completadas") or 0) >= min_ord
+                    and float(a.get("tasa_exito") or 0) >= min_tasa
+                    and (a.get("es_merchant") or not solo_verif))
+        except (TypeError, ValueError):
+            return False
+
+    def es_mio(a):
+        return bool(mi_nick) and str(a.get("anunciante", "")).strip().lower() == mi_nick
+
+    filtros = []
+    for m in montos:
+        fila = {"monto": m}
+        # (clave, libro, el mejor es el mas caro?)
+        for clave, filas, mas_caro in (("compra", libro_v, True), ("venta", libro_c, False)):
+            cands = [a for a in filas if pasa(a) and _aparece_en_filtro(a, m)]
+            rivales = [a for a in cands if not es_mio(a)]
+            mios = [a for a in cands if es_mio(a)]
+            elige = max if mas_caro else min
+            if rivales:
+                p = elige(rivales, key=lambda x: float(x["precio"]))
+                fila[clave] = {"precio": round(float(p["precio"]), 2),
+                               "anunciante": p.get("anunciante"),
+                               "n": len(rivales)}
+            else:
+                fila[clave] = None
+            fila["mio_" + clave] = (round(float(elige(mios, key=lambda x: float(x["precio"]))["precio"]), 2)
+                                    if mios else None)
+        filtros.append(fila)
+
+    ts_foto = None
+    if edad is not None:
+        ts_foto = (datetime.now(SANTIAGO_TZ) - timedelta(seconds=edad)).strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify({
+        "timestamp": ts_foto,
+        "edad_seg": (round(edad, 1) if edad is not None else None),
+        "fuente": fuente,
+        "solo_verificados": solo_verif,
+        "comision_vuelta_pct": BRECHA_COMISION_VUELTA_PCT,
+        "filtros": filtros,
+        "nota": ("compra = la punta de la pestaña VENDER de Binance (el mas caro: ahi "
+                 "competis cuando compras). venta = la punta de la pestaña COMPRAR (el "
+                 "mas barato: ahi competis cuando vendes). Un anuncio esta en el filtro M "
+                 "si min <= M <= su maximo efectivo y su stock alcanza. Tus anuncios no "
+                 "cuentan como punta: van en mio_compra / mio_venta. Sin velocidad."),
+    })
+
+
+BRECHA_HTML = r'''<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#181A20">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Brecha">
+<title>Brecha</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23181A20'/%3E%3Ccircle cx='9' cy='16' r='4' fill='%23F6465D'/%3E%3Crect x='11' y='14' width='10' height='4' fill='%23F0B90B'/%3E%3Ccircle cx='23' cy='16' r='4' fill='%230ECB81'/%3E%3C/svg%3E">
+<style>
+:root{--bg:#0B0E11;--card:#181A20;--card2:#1E2329;--line:#2B3139;--tx:#EAECEF;--tx2:#848E9C;--y:#F0B90B;--g:#0ECB81;--r:#F6465D}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;font-variant-numeric:tabular-nums}
+.wrap{max-width:480px;margin:0 auto;padding:12px 12px 32px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:4px 2px 12px}
+.top h1{font-size:18px;font-weight:600;margin:0}
+.top h1 span{color:var(--y)}
+.edad{font-size:12px;color:var(--tx2)}
+.btn{background:var(--y);color:#181A20;border:0;border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600;cursor:pointer}
+.btn:active{transform:scale(.97)}
+.btn[disabled]{opacity:.6}
+.card{background:var(--card);border-radius:14px;padding:14px;margin-bottom:12px}
+.lb{font-size:12px;color:var(--tx2)}
+.tit{font-size:13px;color:var(--tx2);margin:0 0 8px}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 12px}
+.chip{background:var(--line);color:var(--tx);border:0;border-radius:6px;padding:7px 9px;font-size:13px;cursor:pointer}
+.chip.r{background:var(--r);color:#fff}
+.chip.g{background:var(--g);color:#181A20}
+.res{border-radius:12px;padding:14px}
+.big{font-size:42px;font-weight:600;line-height:1.15}
+.tag{font-size:11px;padding:2px 6px;border-radius:4px;white-space:nowrap}
+.mejor{background:var(--y);color:#181A20;border-radius:10px;padding:10px 12px;font-size:13px;margin-bottom:10px;cursor:pointer}
+.fila{display:flex;align-items:center;height:40px;border-top:1px solid var(--line)}
+.fila .f{width:58px;font-size:13px}
+.fila .t{flex:1;position:relative;height:100%}
+.fila .v{width:92px;text-align:right;font-size:13px;line-height:1.2}
+.dot{position:absolute;top:50%;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;border-radius:50%}
+.yo{position:absolute;top:50%;width:2px;height:16px;margin:-8px 0 0 -1px;background:#fff;border-radius:1px}
+.grid{display:grid;grid-template-columns:46px repeat(var(--n),minmax(0,1fr));gap:2px;font-size:11px}
+.cel{height:36px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:12px;cursor:pointer}
+.det{margin-top:10px;background:var(--card2);border-radius:8px;padding:10px;font-size:13px}
+.ley{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center;font-size:12px;color:var(--tx2);margin:8px 0}
+.err{background:#3A1F25;color:#F6465D;border-radius:8px;padding:8px 10px;font-size:13px;margin-bottom:10px;display:none}
+.pie{text-align:center;font-size:11px;color:var(--tx2);margin-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div><h1>Brecha <span>por filtro</span></h1><div class="edad" id="edad">cargando…</div></div>
+    <button class="btn" id="btn" type="button">↻ Actualizar</button>
+  </div>
+  <div class="err" id="err"></div>
+
+  <div class="card">
+    <div class="lb">Compro en el filtro de · mirá la <span style="color:var(--r)">pestaña Vender</span></div>
+    <div class="chips" id="cb"></div>
+    <div class="lb">Vendo en el filtro de · mirá la <span style="color:var(--g)">pestaña Comprar</span></div>
+    <div class="chips" id="cv"></div>
+    <div class="res" id="res"></div>
+  </div>
+
+  <div class="card">
+    <div class="mejor" id="mejor"></div>
+    <div class="tit">Cada filtro contra sí mismo</div>
+    <div id="lista"></div>
+    <div class="lb" style="margin-top:8px"><span style="color:var(--r)">●</span> comprás (pestaña Vender) · <span style="color:var(--g)">●</span> vendés (pestaña Comprar) · <span style="color:#fff">|</span> vos</div>
+  </div>
+
+  <div class="card">
+    <div class="tit">Todas las combinaciones</div>
+    <div class="lb" style="margin-bottom:8px">Filas: <span style="color:var(--r)">compro en</span> · columnas: <span style="color:var(--g)">vendo en</span> (miles de pesos)</div>
+    <div class="grid" id="grid"></div>
+    <div class="det" id="det"></div>
+  </div>
+
+  <div class="ley">Te queda después de la comisión:
+    <span class="tag" style="background:#2B3139;color:#848E9C">pérdida</span>
+    <span class="tag" style="background:#4A3D12;color:#F0B90B">hasta 0,2%</span>
+    <span class="tag" style="background:#A88209;color:#fff">0,2 a 0,4%</span>
+    <span class="tag" style="background:#F0B90B;color:#181A20">más de 0,4%</span>
+  </div>
+  <div class="pie">Sólo verificados · comisión de la vuelta <span id="com">0,29</span>% · el libro se renueva cada 15 s · __VERSION__</div>
+</div>
+<script>
+var D = null, recibido = 0, sc = null, sv = null, cargando = false;
+var GUARDA = "p2p_brecha_sel";
+try { var g = JSON.parse(localStorage.getItem(GUARDA) || "null"); if (g) { sc = g[0]; sv = g[1]; } } catch (e) {}
+
+function $(id) { return document.getElementById(id); }
+function esc(t) { return String(t == null ? "" : t).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+function fx(n, d) { return (n < 0 ? "−" : "") + Math.abs(n).toFixed(d == null ? 1 : d).replace(".", ","); }
+function mil(m) { return m >= 1000000 ? fx(m / 1000000, m % 1000000 ? 1 : 0) + " M" : Math.round(m / 1000) + " mil"; }
+function corto(m) { return m >= 1000000 ? fx(m / 1000000, 0) + "M" : String(Math.round(m / 1000)); }
+function fila(m) { for (var i = 0; i < D.filtros.length; i++) if (D.filtros[i].monto === m) return D.filtros[i]; return null; }
+function com() { return D && D.comision_vuelta_pct != null ? D.comision_vuelta_pct : 0.29; }
+function combo(c, v) {
+  var a = fila(c), b = fila(v);
+  if (!a || !b || !a.compra || !b.venta) return null;
+  var g = b.venta.precio - a.compra.precio;
+  return { g: g, n: g / a.compra.precio * 100 - com(), pc: a.compra, pv: b.venta };
+}
+function color(n) {
+  if (n == null) return ["#1E2329", "#5E6673"];
+  if (n < 0) return ["#2B3139", "#848E9C"];
+  if (n < 0.2) return ["#4A3D12", "#F0B90B"];
+  if (n < 0.4) return ["#A88209", "#FFFFFF"];
+  return ["#F0B90B", "#181A20"];
+}
+function signo(n) { return (n > 0 ? "+" : "") + fx(n, 2) + "%"; }
+
+function mejorCombo() {
+  var best = null;
+  D.filtros.forEach(function (a) { D.filtros.forEach(function (b) {
+    var k = combo(a.monto, b.monto);
+    if (k && (!best || k.n > best.k.n)) best = { c: a.monto, v: b.monto, k: k };
+  }); });
+  return best;
+}
+
+function elegir(c, v) {
+  sc = c; sv = v;
+  try { localStorage.setItem(GUARDA, JSON.stringify([c, v])); } catch (e) {}
+  pintar();
+}
+
+function pintarSelector() {
+  $("cb").innerHTML = D.filtros.map(function (f) {
+    return '<button class="chip' + (f.monto === sc ? " r" : "") + '" onclick="elegir(' + f.monto + ',sv)">' + mil(f.monto) + "</button>";
+  }).join("");
+  $("cv").innerHTML = D.filtros.map(function (f) {
+    return '<button class="chip' + (f.monto === sv ? " g" : "") + '" onclick="elegir(sc,' + f.monto + ')">' + mil(f.monto) + "</button>";
+  }).join("");
+  var k = combo(sc, sv), r = $("res"), col = color(k ? k.n : null);
+  r.style.background = col[0]; r.style.color = col[1];
+  if (!k) { r.innerHTML = '<div style="font-size:14px">En esta combinación falta una de las dos puntas: no hay verificados con stock en ese filtro.</div>'; return; }
+  r.innerHTML = '<div style="font-size:12px;opacity:.85">Compro en ' + mil(sc) + " → vendo en " + mil(sv) + "</div>" +
+    '<div class="big">' + fx(k.g, 2) + " $</div>" +
+    '<div style="font-size:15px">te queda ' + signo(k.n) + "</div>" +
+    '<div style="font-size:12px;margin-top:8px;opacity:.9">Pestaña Vender: ' + fx(k.pc.precio, 2) + " · " + esc(k.pc.anunciante) +
+    "<br>Pestaña Comprar: " + fx(k.pv.precio, 2) + " · " + esc(k.pv.anunciante) + "</div>";
+}
+
+function pintarLista() {
+  var b = mejorCombo();
+  $("mejor").innerHTML = b ? "<b>Mejor ahora:</b> comprar en " + mil(b.c) + ", vender en " + mil(b.v) + " · " + fx(b.k.g, 2) + " $ · " + signo(b.k.n) : "Sin combinaciones con las dos puntas.";
+  $("mejor").onclick = b ? function () { elegir(b.c, b.v); window.scrollTo({ top: 0, behavior: "smooth" }); } : null;
+  var ps = [];
+  D.filtros.forEach(function (f) {
+    [f.compra && f.compra.precio, f.venta && f.venta.precio, f.mio_compra, f.mio_venta].forEach(function (p) { if (p) ps.push(p); });
+  });
+  if (!ps.length) { $("lista").innerHTML = ""; return; }
+  var lo = Math.min.apply(null, ps) - 1, hi = Math.max.apply(null, ps) + 1;
+  function X(p) { return ((p - lo) / (hi - lo) * 100).toFixed(1) + "%"; }
+  $("lista").innerHTML = D.filtros.map(function (f) {
+    var k = combo(f.monto, f.monto), col = color(k ? k.n : null), h = "";
+    if (f.compra && f.venta) {
+      var a = Math.min(f.compra.precio, f.venta.precio), z = Math.max(f.compra.precio, f.venta.precio);
+      h += '<div style="position:absolute;top:50%;left:' + X(a) + ";width:calc(" + X(z) + " - " + X(a) + ');height:6px;margin-top:-3px;border-radius:3px;background:' + col[0] + '"></div>';
+    }
+    if (f.mio_compra) h += '<div class="yo" style="left:' + X(f.mio_compra) + '"></div>';
+    if (f.mio_venta) h += '<div class="yo" style="left:' + X(f.mio_venta) + '"></div>';
+    if (f.compra) h += '<div class="dot" style="left:' + X(f.compra.precio) + ';background:var(--r)"></div>';
+    if (f.venta) h += '<div class="dot" style="left:' + X(f.venta.precio) + ';background:var(--g)"></div>';
+    var v = k ? '<span style="color:' + (k.n < 0 ? "#848E9C" : "#F0B90B") + '">' + fx(k.g, 1) + " $</span><br>" +
+      '<span style="font-size:11px;color:#848E9C">' + signo(k.n) + "</span>" : '<span style="color:#5E6673">sin punta</span>';
+    return '<div class="fila" onclick="elegir(' + f.monto + "," + f.monto + ')"><span class="f">' + mil(f.monto) + '</span><div class="t">' + h + '</div><span class="v">' + v + "</span></div>";
+  }).join("") + '<div style="display:flex;justify-content:space-between;font-size:11px;color:#5E6673;margin:4px 92px 0 58px"><span>' + fx(lo, 0) + "</span><span>" + fx(hi, 0) + "</span></div>";
+}
+
+function pintarMapa() {
+  var F = D.filtros, h = "<div></div>";
+  $("grid").style.setProperty("--n", F.length);
+  F.forEach(function (v) { h += '<div style="text-align:center;color:var(--g)">' + corto(v.monto) + "</div>"; });
+  F.forEach(function (c) {
+    h += '<div style="color:var(--r);display:flex;align-items:center">' + corto(c.monto) + "</div>";
+    F.forEach(function (v) {
+      var k = combo(c.monto, v.monto), col = color(k ? k.n : null), sel = c.monto === sc && v.monto === sv;
+      h += '<div class="cel" onclick="elegir(' + c.monto + "," + v.monto + ')" style="background:' + col[0] + ";color:" + col[1] + (sel ? ";outline:2px solid #EAECEF" : "") + '">' + (k ? fx(k.g, 1) : "—") + "</div>";
+    });
+  });
+  $("grid").innerHTML = h;
+  var k = combo(sc, sv);
+  $("det").innerHTML = k ? 'Comprás en <b style="color:var(--r)">' + mil(sc) + "</b> a " + fx(k.pc.precio, 2) + ' · vendés en <b style="color:var(--g)">' + mil(sv) + "</b> a " + fx(k.pv.precio, 2) +
+    '<br><span style="font-size:17px;font-weight:600">' + fx(k.g, 2) + ' pesos</span> <span style="color:' + (k.n < 0 ? "#848E9C" : "#F0B90B") + '">· te queda ' + signo(k.n) + "</span>" : "Tocá una casilla para ver el detalle.";
+}
+
+function pintar() {
+  if (!D || !D.filtros || !D.filtros.length) return;
+  var ms = D.filtros.map(function (f) { return f.monto; });
+  if (ms.indexOf(sc) < 0 || ms.indexOf(sv) < 0) { var b = mejorCombo(); sc = b ? b.c : ms[0]; sv = b ? b.v : ms[0]; }
+  $("com").textContent = fx(com(), 2);
+  pintarSelector(); pintarLista(); pintarMapa(); reloj();
+}
+
+function reloj() {
+  if (!D) return;
+  var s = Math.round((D.edad_seg || 0) + (Date.now() - recibido) / 1000);
+  $("edad").textContent = "libro de hace " + s + " s" + (D.fuente === "colector" ? " · (respaldo)" : "");
+  $("edad").style.color = s > 60 ? "#F6465D" : "#848E9C";
+}
+
+function cargar() {
+  if (cargando) return;
+  cargando = true; $("btn").disabled = true; $("btn").textContent = "…";
+  fetch("/api/brecha", { cache: "no-store" })
+    .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || ("error " + r.status)); return j; }); })
+    .then(function (j) { D = j; recibido = Date.now(); $("err").style.display = "none"; pintar(); })
+    .catch(function (e) { $("err").textContent = "No se pudo actualizar (" + e.message + "). Reintento solo."; $("err").style.display = "block"; })
+    .then(function () { cargando = false; $("btn").disabled = false; $("btn").textContent = "↻ Actualizar"; });
+}
+
+$("btn").onclick = cargar;
+setInterval(function () { if (document.visibilityState === "visible") cargar(); }, 15000);
+setInterval(reloj, 1000);
+document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") cargar(); });
+cargar();
+</script>
+</body>
+</html>
+'''
+
+
+@app.route("/brecha")
+def pagina_brecha():
+    """La pagina para el celular (COL71). HTML suelto, sin React: carga en
+    un segundo con 4G y se puede 'Agregar a pantalla de inicio'."""
+    return Response(BRECHA_HTML.replace("__VERSION__", f"{VERSION} · {VERSION_FECHA}"),
+                    mimetype="text/html")
 
 
 @app.route("/api/minimos")
