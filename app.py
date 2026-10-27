@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL71"
-VERSION_FECHA = "2026-10-26"
+VERSION       = "COL72"
+VERSION_FECHA = "2026-10-27"
 
 config = {
     "MONEDA":               "USDT",
@@ -13384,14 +13384,30 @@ def api_brecha():
     def es_mio(a):
         return bool(mi_nick) and str(a.get("anunciante", "")).strip().lower() == mi_nick
 
+    # COL72 — SUS anuncios NO pasan por los filtros de calidad: un filtro de
+    # "aviso muerto" no aplica a uno mismo. Medido 27-oct: su compra tenia
+    # 147 USDT (< 200 de FILTRO_MIN_USDT) y la pagina no lo mostraba. Solo se
+    # exige que el anuncio aparezca en el filtro (_aparece_en_filtro).
+    mis = {"compra": [a for a in libro_v if es_mio(a)],
+           "venta": [a for a in libro_c if es_mio(a)]}
+
+    def puesto(precio, rivales, mas_caro):
+        """Puesto entre los verificados del filtro: 1 + los que estan MEJOR.
+        Los empatados se cuentan aparte: Binance no dice como los ordena."""
+        delante = sum(1 for r in rivales
+                      if (float(r["precio"]) > precio if mas_caro else float(r["precio"]) < precio))
+        empate = sum(1 for r in rivales if float(r["precio"]) == precio)
+        return delante + 1, empate
+
     filtros = []
+    rivales_de = {}
     for m in montos:
         fila = {"monto": m}
         # (clave, libro, el mejor es el mas caro?)
         for clave, filas, mas_caro in (("compra", libro_v, True), ("venta", libro_c, False)):
-            cands = [a for a in filas if pasa(a) and _aparece_en_filtro(a, m)]
-            rivales = [a for a in cands if not es_mio(a)]
-            mios = [a for a in cands if es_mio(a)]
+            rivales = [a for a in filas if pasa(a) and _aparece_en_filtro(a, m) and not es_mio(a)]
+            rivales_de[(clave, m)] = rivales
+            mios = [a for a in mis[clave] if _aparece_en_filtro(a, m)]
             elige = max if mas_caro else min
             if rivales:
                 p = elige(rivales, key=lambda x: float(x["precio"]))
@@ -13400,9 +13416,41 @@ def api_brecha():
                                "n": len(rivales)}
             else:
                 fila[clave] = None
-            fila["mio_" + clave] = (round(float(elige(mios, key=lambda x: float(x["precio"]))["precio"]), 2)
-                                    if mios else None)
+            fila["mio_" + clave] = fila["mi_puesto_" + clave] = fila["mi_empate_" + clave] = None
+            if mios:
+                pm = float(elige(mios, key=lambda x: float(x["precio"]))["precio"])
+                fila["mio_" + clave] = round(pm, 2)
+                fila["mi_puesto_" + clave], fila["mi_empate_" + clave] = puesto(pm, rivales, mas_caro)
         filtros.append(fila)
+
+    # COL72 — cada anuncio suyo, con su puesto en cada filtro donde aparece.
+    # Puede tener dos del mismo lado (medido 27-oct: compra de 20 mil y de
+    # 50 mil a la vez, 10:04-12:47), por eso es una lista.
+    mis_anuncios = {}
+    for clave, mas_caro in (("compra", True), ("venta", False)):
+        lista = []
+        for a in sorted(mis[clave], key=lambda x: float(x.get("min_orden") or 0)):
+            pm = float(a.get("precio") or 0)
+            en = []
+            for m in montos:
+                if _aparece_en_filtro(a, m):
+                    pu, em = puesto(pm, rivales_de[(clave, m)], mas_caro)
+                    en.append({"monto": m, "puesto": pu, "empate": em})
+            lista.append({"precio": round(pm, 2),
+                          "min_orden": int(float(a.get("min_orden") or 0)) or None,
+                          "max_orden": int(float(a.get("max_efectivo") or a.get("max_orden") or 0)) or None,
+                          "disponible": round(float(a.get("disponible") or 0)),
+                          "filtros": en})
+        mis_anuncios[clave] = lista
+
+    # SU brecha: su venta mas barata menos su compra mas cara.
+    mi_brecha = None
+    if mis["compra"] and mis["venta"]:
+        pc = max(float(a["precio"]) for a in mis["compra"])
+        pv = min(float(a["precio"]) for a in mis["venta"])
+        mi_brecha = {"compra": round(pc, 2), "venta": round(pv, 2),
+                     "pesos": round(pv - pc, 2),
+                     "neto_pct": round((pv - pc) / pc * 100 - BRECHA_COMISION_VUELTA_PCT, 3)}
 
     ts_foto = None
     if edad is not None:
@@ -13414,6 +13462,8 @@ def api_brecha():
         "solo_verificados": solo_verif,
         "comision_vuelta_pct": BRECHA_COMISION_VUELTA_PCT,
         "filtros": filtros,
+        "mis_anuncios": mis_anuncios,
+        "mi_brecha": mi_brecha,
         "nota": ("compra = la punta de la pestaña VENDER de Binance (el mas caro: ahi "
                  "competis cuando compras). venta = la punta de la pestaña COMPRAR (el "
                  "mas barato: ahi competis cuando vendes). Un anuncio esta en el filtro M "
@@ -13457,7 +13507,14 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
 .big{font-size:42px;font-weight:600;line-height:1.15}
 .tag{font-size:11px;padding:2px 6px;border-radius:4px;white-space:nowrap}
 .mejor{background:var(--y);color:#181A20;border-radius:10px;padding:10px 12px;font-size:13px;margin-bottom:10px;cursor:pointer}
-.fila{display:flex;align-items:center;height:40px;border-top:1px solid var(--line)}
+.mios{display:flex;gap:8px}
+.mio{flex:1;min-width:0;border:1.5px solid var(--line);border-radius:10px;padding:10px}
+.precio{font-size:22px;font-weight:600;line-height:1.2}
+.pst{font-size:12px;line-height:1.5}
+.pst b{color:var(--y)}
+.tub{border-radius:10px;padding:10px 12px;margin-top:8px;display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.pill{position:absolute;top:1px;transform:translateX(-50%);font-size:10px;font-weight:700;padding:0 4px;border-radius:4px;line-height:14px;white-space:nowrap}
+.fila{display:flex;align-items:center;height:48px;border-top:1px solid var(--line)}
 .fila .f{width:58px;font-size:13px}
 .fila .t{flex:1;position:relative;height:100%}
 .fila .v{width:92px;text-align:right;font-size:13px;line-height:1.2}
@@ -13480,6 +13537,11 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
   <div class="err" id="err"></div>
 
   <div class="card">
+    <div class="tit" style="color:var(--tx)">Vos ahora</div>
+    <div id="vos"></div>
+  </div>
+
+  <div class="card">
     <div class="lb">Compro en el filtro de · mirá la <span style="color:var(--r)">pestaña Vender</span></div>
     <div class="chips" id="cb"></div>
     <div class="lb">Vendo en el filtro de · mirá la <span style="color:var(--g)">pestaña Comprar</span></div>
@@ -13491,7 +13553,7 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
     <div class="mejor" id="mejor"></div>
     <div class="tit">Cada filtro contra sí mismo</div>
     <div id="lista"></div>
-    <div class="lb" style="margin-top:8px"><span style="color:var(--r)">●</span> comprás (pestaña Vender) · <span style="color:var(--g)">●</span> vendés (pestaña Comprar) · <span style="color:#fff">|</span> vos</div>
+    <div class="lb" style="margin-top:8px"><span style="color:var(--r)">●</span> punta pestaña Vender · <span style="color:var(--g)">●</span> punta pestaña Comprar · <span class="tag" style="background:var(--r);color:#fff">2º</span> <span class="tag" style="background:var(--g);color:#181A20">1º</span> = vos y tu puesto</div>
   </div>
 
   <div class="card">
@@ -13499,6 +13561,7 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
     <div class="lb" style="margin-bottom:8px">Filas: <span style="color:var(--r)">compro en</span> · columnas: <span style="color:var(--g)">vendo en</span> (miles de pesos)</div>
     <div class="grid" id="grid"></div>
     <div class="det" id="det"></div>
+    <div class="lb" style="margin-top:6px">Borde punteado = combinaciones donde tenés los dos anuncios</div>
   </div>
 
   <div class="ley">Te queda después de la comisión:
@@ -13535,6 +13598,48 @@ function color(n) {
   return ["#F0B90B", "#181A20"];
 }
 function signo(n) { return (n > 0 ? "+" : "") + fx(n, 2) + "%"; }
+function pu(p, e) { return p + "º" + (e ? " empatado" : ""); }
+
+function rangoPuestos(fs) {
+  var out = [], i = 0;
+  while (i < fs.length) {
+    var j = i;
+    while (j + 1 < fs.length && fs[j + 1].puesto === fs[i].puesto && !fs[j + 1].empate === !fs[i].empate) j++;
+    var r = i === j ? mil(fs[i].monto) : corto(fs[i].monto) + " a " + mil(fs[j].monto);
+    out.push(r + ": <b>" + pu(fs[i].puesto, fs[i].empate) + "</b>");
+    i = j + 1;
+  }
+  return out.join("<br>");
+}
+
+function caja(lado) {
+  var L = (D.mis_anuncios && D.mis_anuncios[lado]) || [], esC = lado === "compra";
+  var tit = esC ? 'Tu compra · <span style="color:var(--r)">pestaña Vender</span>' : 'Tu venta · <span style="color:var(--g)">pestaña Comprar</span>';
+  var h = '<div class="mio" style="border-color:' + (L.length ? (esC ? "var(--r)" : "var(--g)") : "var(--line)") + '"><div class="lb">' + tit + "</div>";
+  if (!L.length) return h + '<div style="color:#5E6673;margin-top:6px">sin anuncio prendido</div></div>';
+  L.forEach(function (a, i) {
+    h += '<div style="margin-top:' + (i ? "10px;border-top:1px solid var(--line);padding-top:8px" : "6px") + '">' +
+      '<div class="precio">' + fx(a.precio, 2) + "</div>" +
+      '<div class="lb">mín ' + (a.min_orden ? mil(a.min_orden) : "—") + " · " + a.disponible + " USDT</div>" +
+      '<div class="pst">' + (a.filtros.length ? rangoPuestos(a.filtros) : '<span style="color:#5E6673">no entra en estos filtros</span>') + "</div></div>";
+  });
+  return h + "</div>";
+}
+
+function pintarVos() {
+  var M = D.mis_anuncios || { compra: [], venta: [] };
+  if (!M.compra.length && !M.venta.length) { $("vos").innerHTML = '<div style="color:#848E9C">No tenés anuncios prendidos ahora.</div>'; return; }
+  var h = '<div class="mios">' + caja("compra") + caja("venta") + "</div>", b = D.mi_brecha;
+  if (b) {
+    var col = color(b.neto_pct);
+    h += '<div class="tub" style="background:' + col[0] + ";color:" + col[1] + '"><span>Tu brecha</span><span><span style="font-size:22px;font-weight:600">' + fx(b.pesos, 2) + " $</span> · te queda " + signo(b.neto_pct) + "</span></div>";
+    var f0 = null;
+    D.filtros.forEach(function (f) { if (!f0 && f.mio_compra && f.mio_venta) f0 = f; });
+    var k = f0 ? combo(f0.monto, f0.monto) : null;
+    if (k) h += '<div class="lb" style="margin-top:6px">Las puntas de ' + mil(f0.monto) + " dejan " + fx(k.g, 2) + " $ (" + signo(k.n) + ")</div>";
+  }
+  $("vos").innerHTML = h;
+}
 
 function mejorCombo() {
   var best = null;
@@ -13565,7 +13670,14 @@ function pintarSelector() {
     '<div class="big">' + fx(k.g, 2) + " $</div>" +
     '<div style="font-size:15px">te queda ' + signo(k.n) + "</div>" +
     '<div style="font-size:12px;margin-top:8px;opacity:.9">Pestaña Vender: ' + fx(k.pc.precio, 2) + " · " + esc(k.pc.anunciante) +
-    "<br>Pestaña Comprar: " + fx(k.pv.precio, 2) + " · " + esc(k.pv.anunciante) + "</div>";
+    "<br>Pestaña Comprar: " + fx(k.pv.precio, 2) + " · " + esc(k.pv.anunciante) + "</div>" + yoAca(sc, sv);
+}
+
+function yoAca(c, v) {
+  var fc = fila(c), fv = fila(v), yo = [];
+  if (fc && fc.mio_compra) yo.push("compra " + fx(fc.mio_compra, 2) + " (" + pu(fc.mi_puesto_compra, fc.mi_empate_compra) + ")");
+  if (fv && fv.mio_venta) yo.push("venta " + fx(fv.mio_venta, 2) + " (" + pu(fv.mi_puesto_venta, fv.mi_empate_venta) + ")");
+  return yo.length ? '<div style="font-size:12px;margin-top:6px;font-weight:600">Vos acá: ' + yo.join(" · ") + "</div>" : "";
 }
 
 function pintarLista() {
@@ -13585,8 +13697,8 @@ function pintarLista() {
       var a = Math.min(f.compra.precio, f.venta.precio), z = Math.max(f.compra.precio, f.venta.precio);
       h += '<div style="position:absolute;top:50%;left:' + X(a) + ";width:calc(" + X(z) + " - " + X(a) + ');height:6px;margin-top:-3px;border-radius:3px;background:' + col[0] + '"></div>';
     }
-    if (f.mio_compra) h += '<div class="yo" style="left:' + X(f.mio_compra) + '"></div>';
-    if (f.mio_venta) h += '<div class="yo" style="left:' + X(f.mio_venta) + '"></div>';
+    if (f.mio_compra) h += '<div class="yo" style="left:' + X(f.mio_compra) + '"></div><div class="pill" style="left:' + X(f.mio_compra) + ';background:var(--r);color:#fff">' + f.mi_puesto_compra + "º</div>";
+    if (f.mio_venta) h += '<div class="yo" style="left:' + X(f.mio_venta) + '"></div><div class="pill" style="left:' + X(f.mio_venta) + ';background:var(--g);color:#181A20">' + f.mi_puesto_venta + "º</div>";
     if (f.compra) h += '<div class="dot" style="left:' + X(f.compra.precio) + ';background:var(--r)"></div>';
     if (f.venta) h += '<div class="dot" style="left:' + X(f.venta.precio) + ';background:var(--g)"></div>';
     var v = k ? '<span style="color:' + (k.n < 0 ? "#848E9C" : "#F0B90B") + '">' + fx(k.g, 1) + " $</span><br>" +
@@ -13603,7 +13715,9 @@ function pintarMapa() {
     h += '<div style="color:var(--r);display:flex;align-items:center">' + corto(c.monto) + "</div>";
     F.forEach(function (v) {
       var k = combo(c.monto, v.monto), col = color(k ? k.n : null), sel = c.monto === sc && v.monto === sv;
-      h += '<div class="cel" onclick="elegir(' + c.monto + "," + v.monto + ')" style="background:' + col[0] + ";color:" + col[1] + (sel ? ";outline:2px solid #EAECEF" : "") + '">' + (k ? fx(k.g, 1) : "—") + "</div>";
+      var mio = c.mio_compra && v.mio_venta;
+      h += '<div class="cel" onclick="elegir(' + c.monto + "," + v.monto + ')" style="background:' + col[0] + ";color:" + col[1] +
+        (sel ? ";outline:2px solid #EAECEF" : mio ? ";outline:1.5px dashed #EAECEF;outline-offset:-3px" : "") + '">' + (k ? fx(k.g, 1) : "—") + "</div>";
     });
   });
   $("grid").innerHTML = h;
@@ -13617,7 +13731,7 @@ function pintar() {
   var ms = D.filtros.map(function (f) { return f.monto; });
   if (ms.indexOf(sc) < 0 || ms.indexOf(sv) < 0) { var b = mejorCombo(); sc = b ? b.c : ms[0]; sv = b ? b.v : ms[0]; }
   $("com").textContent = fx(com(), 2);
-  pintarSelector(); pintarLista(); pintarMapa(); reloj();
+  pintarVos(); pintarSelector(); pintarLista(); pintarMapa(); reloj();
 }
 
 function reloj() {
