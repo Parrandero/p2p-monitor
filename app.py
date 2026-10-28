@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL74"
+VERSION       = "COL75"
 VERSION_FECHA = "2026-10-28"
 
 config = {
@@ -13740,6 +13740,10 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
 .chip{background:var(--line);color:var(--tx);border:0;border-radius:6px;padding:7px 9px;font-size:13px;cursor:pointer}
 .chip.r{background:var(--r);color:#fff}
 .chip.g{background:var(--g);color:#181A20}
+.chip.y{background:var(--y);color:#181A20}
+#tSvg{display:block;width:100%;height:auto;touch-action:pan-y;margin-top:4px}
+.tres{background:var(--card2);border-radius:8px;padding:9px 10px;font-size:13px;line-height:1.5;margin-top:8px}
+.tres b{color:var(--y)}
 .res{border-radius:12px;padding:14px}
 .big{font-size:42px;font-weight:600;line-height:1.15}
 .tag{font-size:11px;padding:2px 6px;border-radius:4px;white-space:nowrap}
@@ -13803,7 +13807,7 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
 
   <div class="card">
     <div class="mejor" id="mejor"></div>
-    <div class="tabs"><button class="tab" id="tabLista" type="button" onclick="vista('lista')">Lista</button><button class="tab" id="tabFichas" type="button" onclick="vista('fichas')">Fichas (nuevo)</button></div>
+    <div class="tabs"><button class="tab" id="tabLista" type="button" onclick="vista('lista')">Lista</button><button class="tab" id="tabFichas" type="button" onclick="vista('fichas')">Fichas</button><button class="tab" id="tabTiempo" type="button" onclick="vista('tiempo')">Tiempo</button></div>
     <div class="tit">Cada filtro, comprando y vendiendo en el mismo</div>
     <div id="vLista">
       <div id="lista"></div>
@@ -13812,6 +13816,14 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
     <div id="vFichas">
       <div class="fichas" id="fichas"></div>
       <div class="lb" style="margin-top:8px"><span style="color:var(--r)">●</span> punta pestaña Vender · <span style="color:var(--g)">●</span> punta pestaña Comprar · barra = comparada con el filtro más ancho · flecha = cambio en la última hora · rayita = últimas 3 horas</div>
+    </div>
+    <div id="vTiempo">
+      <div class="lb">Filtro</div>
+      <div class="chips" id="tChips" style="margin-bottom:6px"></div>
+      <div class="chips" id="tHoras" style="margin:0 0 2px"></div>
+      <svg id="tSvg" viewBox="0 0 340 214"></svg>
+      <div class="tres" id="tRes"></div>
+      <div class="lb" style="margin-top:8px"><span style="color:var(--y)">━</span> el filtro elegido · <span style="color:#5E6673">━</span> los otros · <span style="color:#848E9C">┄</span> comisión de la vuelta · tocá el gráfico para ver una hora · un hueco = rato sin dato</div>
     </div>
   </div>
 
@@ -13942,9 +13954,9 @@ function yoAca(c, v) {
 function fecha(t) { return t ? new Date(String(t).replace(" ", "T")) : null; }
 
 function cargarHist() {
-  fetch("/api/brecha_historia?horas=3", { cache: "no-store" })
+  fetch("/api/brecha_historia?horas=" + Math.max(3, HORAS), { cache: "no-store" })
     .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (j) { if (j && j.puntos) { HIST = j; if (D) pintarFichas(); } })
+    .then(function (j) { if (j && j.puntos) { HIST = j; if (D) { pintarFichas(); pintarTiempo(); } } })
     .catch(function () {});
 }
 
@@ -13973,7 +13985,7 @@ function pintarMejor() {
 }
 
 var VISTA = "lista";
-try { if (localStorage.getItem("p2p_brecha_vista") === "fichas") VISTA = "fichas"; } catch (e) {}
+try { var v0 = localStorage.getItem("p2p_brecha_vista"); if (v0 === "fichas" || v0 === "tiempo") VISTA = v0; } catch (e) {}
 function vista(v) {
   VISTA = v;
   try { localStorage.setItem("p2p_brecha_vista", v); } catch (e) {}
@@ -13981,6 +13993,9 @@ function vista(v) {
   $("vFichas").style.display = v === "fichas" ? "" : "none";
   $("tabLista").className = "tab" + (v === "lista" ? " on" : "");
   $("tabFichas").className = "tab" + (v === "fichas" ? " on" : "");
+  $("vTiempo").style.display = v === "tiempo" ? "" : "none";
+  $("tabTiempo").className = "tab" + (v === "tiempo" ? " on" : "");
+  if (v === "tiempo") pintarTiempo();
 }
 
 function pintarLista() {
@@ -14016,7 +14031,7 @@ function pintarFichas() {
   $("fichas").innerHTML = D.filtros.map(function (f) {
     var k = combo(f.monto, f.monto), click = ' onclick="elegir(' + f.monto + "," + f.monto + ')"';
     if (!k) return '<div class="ficha"' + click + ' style="background:#1E2329;color:#5E6673"><div class="cab"><span>' + mil(f.monto) + '</span></div><div class="num">—</div><div class="sub">sin punta en un lado</div></div>';
-    var col = color(k.n), pts = serie(f.monto), flecha = "";
+    var col = color(k.n), pts = serie(f.monto).filter(function (p) { return ahora - p.t <= 10800000; }), flecha = "";
     pts.push({ t: ahora, v: k.g });
     var antes = null;
     for (var i = 0; i < pts.length; i++) { if (ahora - pts[i].t <= 3600000) { antes = pts[i]; break; } }
@@ -14036,6 +14051,133 @@ function pintarFichas() {
       '<div class="sub">te queda ' + signo(k.n) + (yo.length ? " · vos: " + yo.join(" · ") : "") + "</div>" +
       rayita(pts, col[1]) + "</div>";
   }).join("");
+}
+
+var FOCO = 20000, HORAS = 8, CURSOR = null;
+try {
+  var f0 = parseInt(localStorage.getItem("p2p_brecha_foco"), 10); if (f0) FOCO = f0;
+  var h0 = parseInt(localStorage.getItem("p2p_brecha_horas"), 10); if ([3, 8, 12].indexOf(h0) >= 0) HORAS = h0;
+} catch (e) {}
+function focoElegir(m) { FOCO = m; CURSOR = null; try { localStorage.setItem("p2p_brecha_foco", String(m)); } catch (e) {} pintarTiempo(); }
+function horasElegir(h) {
+  var mas = h > HORAS && h > 3;
+  HORAS = h; CURSOR = null;
+  try { localStorage.setItem("p2p_brecha_horas", String(h)); } catch (e) {}
+  pintarTiempo(); if (mas) cargarHist();
+}
+function hhmm(d) { return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2); }
+function serieT(m, desde) {
+  var out = [];
+  if (HIST) HIST.puntos.forEach(function (p) { var t = fecha(p.ts); if (t >= desde) out.push({ t: t, v: p.brechas[String(m)] }); });
+  return out;
+}
+// corta la linea donde no hay dato o donde el colector salto mas de 8 min
+function tramos(pts) {
+  var segs = [], cur = [];
+  pts.forEach(function (p, i) {
+    if ((p.v == null || (i && p.t - pts[i - 1].t > 480000)) && cur.length) { segs.push(cur); cur = []; }
+    if (p.v != null) cur.push(p);
+  });
+  if (cur.length) segs.push(cur);
+  return segs;
+}
+function cerca(pts, t) {
+  var b = null;
+  pts.forEach(function (p) { if (p.v != null && (!b || Math.abs(p.t - t) < Math.abs(b.t - t))) b = p; });
+  return b;
+}
+
+function pintarTiempo() {
+  if (!D || VISTA !== "tiempo") return;
+  if (!fila(FOCO)) FOCO = D.filtros.length > 1 ? D.filtros[1].monto : D.filtros[0].monto;
+  $("tChips").innerHTML = D.filtros.map(function (f) {
+    return '<button class="chip' + (f.monto === FOCO ? " y" : "") + '" type="button" onclick="focoElegir(' + f.monto + ')">' + mil(f.monto) + "</button>";
+  }).join("");
+  $("tHoras").innerHTML = '<span class="lb" style="align-self:center;margin-right:4px">Últimas</span>' + [3, 8, 12].map(function (h) {
+    return '<button class="chip' + (h === HORAS ? " y" : "") + '" type="button" onclick="horasElegir(' + h + ')">' + h + " h</button>";
+  }).join("");
+  var svg = $("tSvg");
+  if (!HIST) { svg.innerHTML = ""; $("tRes").textContent = "Cargando la historia…"; return; }
+
+  var ahora = fecha(D.timestamp) || new Date(), desde = new Date(ahora.getTime() - HORAS * 3600000);
+  var W = 340, H = 214, L = 28, R = 10, T = 22, B = 20;
+  var S = {}, vals = [];
+  D.filtros.forEach(function (f) {
+    var pts = serieT(f.monto, desde), k = combo(f.monto, f.monto);
+    if (k) pts.push({ t: ahora, v: k.g, vivo: true });
+    S[f.monto] = pts;
+    pts.forEach(function (p) { if (p.v != null) vals.push(p.v); });
+  });
+  var kf = combo(FOCO, FOCO), ref = kf ? kf.pc.precio : 985, comP = com() / 100 * ref;
+  if (!vals.length) { svg.innerHTML = ""; $("tRes").textContent = "Sin datos en este rato."; return; }
+  var lo = Math.min(0, Math.min.apply(null, vals)), hi = Math.max(comP + 1, Math.max.apply(null, vals));
+  var paso = hi - lo > 24 ? 10 : (hi - lo > 10 ? 5 : 2);
+  lo = lo < 0 ? -Math.ceil(-lo) : 0; hi = Math.ceil(hi / paso) * paso;
+  function X(t) { return L + (t - desde) / Math.max(1, ahora - desde) * (W - L - R); }
+  function Y(v) { return T + (hi - v) / Math.max(0.01, hi - lo) * (H - T - B); }
+  function linea(pts, col, ancho) {
+    return tramos(pts).map(function (sg) {
+      if (sg.length === 1) return '<circle cx="' + X(sg[0].t).toFixed(1) + '" cy="' + Y(sg[0].v).toFixed(1) + '" r="' + ancho + '" fill="' + col + '"/>';
+      return '<polyline points="' + sg.map(function (p) { return X(p.t).toFixed(1) + "," + Y(p.v).toFixed(1); }).join(" ") +
+        '" fill="none" stroke="' + col + '" stroke-width="' + ancho + '" stroke-linejoin="round" stroke-linecap="round"/>';
+    }).join("");
+  }
+  var h = "";
+  for (var v = Math.ceil(lo / paso) * paso; v <= hi + 0.001; v += paso) {
+    h += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(v).toFixed(1) + '" y2="' + Y(v).toFixed(1) + '" stroke="' + (v === 0 && lo < 0 ? "#5E6673" : "#2B3139") + '"/>' +
+      '<text x="' + (L - 5) + '" y="' + (Y(v) + 3.5).toFixed(1) + '" text-anchor="end" font-size="10" fill="#848E9C">' + v + "</text>";
+  }
+  h += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(comP).toFixed(1) + '" y2="' + Y(comP).toFixed(1) + '" stroke="#848E9C" stroke-dasharray="4 3"/>' +
+    '<text x="' + (L + 3) + '" y="' + (Y(comP) - 4).toFixed(1) + '" font-size="9" fill="#848E9C">comisión ' + fx(comP, 1) + " $</text>";
+  var medio = new Date((desde.getTime() + ahora.getTime()) / 2);
+  [[desde, "start"], [medio, "middle"], [ahora, "end"]].forEach(function (x) {
+    h += '<text x="' + X(x[0]).toFixed(1) + '" y="' + (H - 5) + '" text-anchor="' + x[1] + '" font-size="10" fill="#848E9C">' + hhmm(x[0]) + "</text>";
+  });
+  D.filtros.forEach(function (f) { if (f.monto !== FOCO) h += linea(S[f.monto], "#474D57", 1.2); });
+  var P = S[FOCO] || [];
+  h += linea(P, "#F0B90B", 2.4);
+  var ult = P.length ? P[P.length - 1] : null;
+  if (ult && ult.vivo) {
+    h += '<circle cx="' + X(ult.t).toFixed(1) + '" cy="' + Y(ult.v).toFixed(1) + '" r="4.5" fill="#F0B90B" stroke="#181A20" stroke-width="2"/>';
+  }
+  // el dedo: una hora elegida
+  var sel = CURSOR != null ? cerca(P, CURSOR) : null;
+  if (sel) {
+    var xs = X(sel.t), txt = hhmm(sel.t) + " · " + fx(sel.v, 1) + " $", an = txt.length * 6.2 + 12;
+    var bx = Math.min(W - R - an, Math.max(L, xs - an / 2));
+    h += '<line x1="' + xs.toFixed(1) + '" x2="' + xs.toFixed(1) + '" y1="' + T + '" y2="' + (H - B) + '" stroke="#EAECEF" stroke-width="1" opacity=".6"/>' +
+      '<circle cx="' + xs.toFixed(1) + '" cy="' + Y(sel.v).toFixed(1) + '" r="4" fill="#EAECEF"/>' +
+      '<rect x="' + bx.toFixed(1) + '" y="1" width="' + an.toFixed(1) + '" height="17" rx="4" fill="#EAECEF"/>' +
+      '<text x="' + (bx + an / 2).toFixed(1) + '" y="13.5" text-anchor="middle" font-size="11" font-weight="600" fill="#181A20">' + txt + "</text>";
+  } else if (ult) {
+    h += '<text x="' + (W - R) + '" y="13" text-anchor="end" font-size="11" font-weight="600" fill="#EAECEF">' + mil(FOCO) + " · ahora " + fx(ult.v, 1) + " $</text>";
+  }
+  svg.innerHTML = h;
+  svg.onpointerdown = svg.onpointermove = function (e) {
+    if (e.type === "pointermove" && e.pointerType !== "mouse") return;
+    var r = svg.getBoundingClientRect(), x = (e.clientX - r.left) / r.width * W;
+    if (x < L - 10) { CURSOR = null; } else { CURSOR = desde.getTime() + (Math.min(W - R, Math.max(L, x)) - L) / (W - L - R) * (ahora - desde); }
+    pintarTiempo();
+  };
+  svg.onpointerleave = function (e) { if (e.pointerType === "mouse") { CURSOR = null; pintarTiempo(); } };
+
+  // el resumen, en palabras
+  var con = P.filter(function (p) { return p.v != null; });
+  if (!con.length) { $("tRes").innerHTML = "<b>" + mil(FOCO) + "</b>: sin punta en los dos lados en este rato."; return; }
+  var mx = con[0], mn = con[0];
+  con.forEach(function (p) { if (p.v > mx.v) mx = p; if (p.v < mn.v) mn = p; });
+  var r = "<b>" + mil(FOCO) + "</b> · ahora " + (ult && ult.vivo ? fx(ult.v, 1) + " $" : "sin punta");
+  var hace = cerca(P.filter(function (p) { return !p.vivo; }), ahora.getTime() - 3600000);
+  if (ult && ult.vivo && hace && Math.abs(hace.t - (ahora.getTime() - 3600000)) < 900000) {
+    var d = ult.v - hace.v;
+    r += " · hace 1 h " + fx(hace.v, 1) + " $ (" + (Math.abs(d) < 0.05 ? "igual" : (d > 0 ? "se abrió " : "se cerró ") + fx(Math.abs(d), 1) + " $") + ")";
+  }
+  var arriba = con.filter(function (p) { return p.v > comP; }).length / con.length * 100;
+  r += "<br>En " + HORAS + " h: máx " + fx(mx.v, 1) + " $ a las " + hhmm(mx.t) + " · mín " + fx(mn.v, 1) + " $ a las " + hhmm(mn.t) +
+    "<br>Por encima de la comisión el " + Math.round(arriba) + "% del rato";
+  var huecos = P.filter(function (p) { return p.v == null; }).length;
+  if (huecos) r += ' <span style="color:#848E9C">· ' + huecos + " fotos sin punta</span>";
+  $("tRes").innerHTML = r;
 }
 
 function pintarMapa() {
@@ -14062,7 +14204,7 @@ function pintar() {
   var ms = D.filtros.map(function (f) { return f.monto; });
   if (ms.indexOf(sc) < 0 || ms.indexOf(sv) < 0) { var b = mejorCombo(); sc = b ? b.c : ms[0]; sv = b ? b.v : ms[0]; }
   $("com").textContent = fx(com(), 2);
-  pintarVos(); pintarSelector(); pintarMejor(); pintarLista(); pintarFichas(); pintarMapa(); reloj();
+  pintarVos(); pintarSelector(); pintarMejor(); pintarLista(); pintarFichas(); pintarTiempo(); pintarMapa(); reloj();
 }
 
 function reloj() {
