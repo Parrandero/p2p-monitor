@@ -19,8 +19,8 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL72"
-VERSION_FECHA = "2026-10-27"
+VERSION       = "COL73"
+VERSION_FECHA = "2026-10-28"
 
 config = {
     "MONEDA":               "USDT",
@@ -13472,6 +13472,110 @@ def api_brecha():
     })
 
 
+_brecha_hist_cache = {}
+_brecha_hist_lock = threading.Lock()
+
+
+@app.route("/api/brecha_historia")
+def api_brecha_historia():
+    """COL73 — LA BRECHA DE CADA FILTRO EN LAS ULTIMAS HORAS, foto por foto.
+
+    Para las fichas de /brecha (pedido de Sebastian, 28-oct: la opcion
+    "fichas" entre cuatro maquetas; lo que no le dejaba ver la lista vieja
+    era "comparar filtros"): la flecha de cada ficha (ahora contra hace una
+    hora) y su rayita de tendencia.
+
+    Sale del detalle que guarda el COLECTOR (cada ~2,5 min), no del libro
+    vivo: el vivo no se guarda (Manual §4.15). MISMA REGLA que /api/brecha:
+    filtros de calidad, solo verificados por default y sus anuncios no son
+    punta. UNA diferencia, chica: el detalle guardado tiene max_orden, no el
+    maximo efectivo de Binance (recortado al stock); el corte por stock igual
+    se hace con disponible x precio, asi que casi siempre da lo mismo.
+
+    ?horas=3      (1 a 12)
+    ?montos=      (igual que /api/brecha)
+    ?verificados= (default 1)
+    Cache 120 s: el colector no trae una foto nueva antes."""
+    try:
+        horas = float(request.args.get("horas", 3) or 3)
+    except (TypeError, ValueError):
+        return jsonify({"error": "horas tiene que ser un numero"}), 400
+    horas = max(1.0, min(12.0, horas))
+    crudo = str(request.args.get("montos", "") or "").strip()
+    try:
+        montos = [int(float(x)) for x in crudo.split(",") if x.strip()] if crudo else list(BRECHA_MONTOS_DEFAULT)
+    except (TypeError, ValueError):
+        return jsonify({"error": "montos tiene que ser una lista de numeros, ej: 20000,50000"}), 400
+    montos = sorted({m for m in montos if 1000 <= m <= 50_000_000})[:12]
+    if not montos:
+        return jsonify({"error": "ningun monto valido (entre 1.000 y 50.000.000 CLP)"}), 400
+    solo_verif = str(request.args.get("verificados", "1")).strip().lower() not in ("0", "false", "no")
+
+    clave = (horas, tuple(montos), solo_verif)
+    ahora_t = time.time()
+    with _brecha_hist_lock:
+        hit = _brecha_hist_cache.get(clave)
+        if hit and ahora_t - hit[0] < 120:
+            return jsonify(hit[1])
+
+    with config_lock:
+        c = dict(config)
+    mi_nick = str(c.get("MI_NICKNAME") or "").strip().lower()
+    min_stock = float(c.get("FILTRO_MIN_USDT", 200) or 0)
+    min_ord = int(c.get("FILTRO_MIN_ORD", 100) or 0)
+    min_tasa = float(c.get("FILTRO_MIN_TASA", 90) or 0)
+
+    now = datetime.now(SANTIAGO_TZ)
+    desde = (now - timedelta(hours=horas)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '20s'")
+                cur.execute("""
+                    SELECT snapshot_timestamp, tipo, anunciante, precio, disponible,
+                           min_orden, max_orden
+                    FROM snapshots_detalle
+                    WHERE snapshot_timestamp >= %(desde)s
+                      AND min_orden IS NOT NULL
+                      AND disponible >= %(st)s AND completadas >= %(o)s AND tasa_exito >= %(t)s
+                      AND (es_merchant OR NOT %(v)s)
+                    ORDER BY snapshot_timestamp
+                """, {"desde": desde, "st": min_stock, "o": min_ord, "t": min_tasa, "v": solo_verif})
+                filas = cur.fetchall()
+            conn.commit()
+    except Exception as e:
+        print(f"[BRECHA HISTORIA] {e}")
+        return jsonify({"error": "no se pudo leer la base", "detalle": str(e)[:200]}), 503
+
+    fotos = {}
+    for ts, tipo, an, precio, disp, mn, mx in filas:
+        if mi_nick and str(an or "").strip().lower() == mi_nick:
+            continue
+        fotos.setdefault(ts, []).append((tipo, {"precio": precio, "disponible": disp,
+                                                "min_orden": mn, "max_orden": mx}))
+    puntos = []
+    for ts in sorted(fotos):
+        br = {}
+        for m in montos:
+            compra = [float(a["precio"]) for t, a in fotos[ts] if t == "SELL" and _aparece_en_filtro(a, m)]
+            venta = [float(a["precio"]) for t, a in fotos[ts] if t == "BUY" and _aparece_en_filtro(a, m)]
+            br[str(m)] = round(min(venta) - max(compra), 2) if compra and venta else None
+        tss = ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts)[:19]
+        puntos.append({"ts": tss, "t": tss[11:16], "brechas": br})
+
+    out = {"desde": desde, "horas": horas, "solo_verificados": solo_verif,
+           "montos": montos, "puntos": puntos,
+           "nota": ("Brecha en pesos (punta de la pestaña Comprar - punta de la pestaña "
+                    "Vender) de cada filtro, en cada foto del colector (~2,5 min). Misma "
+                    "regla que /api/brecha; usa max_orden en vez del maximo efectivo. "
+                    "null = ese filtro no tenia punta en un lado.")}
+    with _brecha_hist_lock:
+        if len(_brecha_hist_cache) > 30:
+            _brecha_hist_cache.clear()
+        _brecha_hist_cache[clave] = (ahora_t, out)
+    return jsonify(out)
+
+
 BRECHA_HTML = r'''<!doctype html>
 <html lang="es">
 <head>
@@ -13514,12 +13618,26 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
 .pst b{color:var(--y)}
 .tub{border-radius:10px;padding:10px 12px;margin-top:8px;display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .pill{position:absolute;top:1px;transform:translateX(-50%);font-size:10px;font-weight:700;padding:0 4px;border-radius:4px;line-height:14px;white-space:nowrap}
-.fila{display:flex;align-items:center;height:48px;border-top:1px solid var(--line)}
+.fila{display:flex;align-items:center;height:56px;border-top:1px solid var(--line)}
 .fila .f{width:58px;font-size:13px}
 .fila .t{flex:1;position:relative;height:100%}
 .fila .v{width:92px;text-align:right;font-size:13px;line-height:1.2}
 .dot{position:absolute;top:50%;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;border-radius:50%}
 .yo{position:absolute;top:50%;width:2px;height:16px;margin:-8px 0 0 -1px;background:#fff;border-radius:1px}
+.pre{position:absolute;bottom:3px;font-size:10px;font-weight:600;white-space:nowrap;line-height:12px}
+.tabs{display:flex;gap:4px;background:#0B0E11;border-radius:8px;padding:3px;margin:12px 0 10px}
+.tab{flex:1;background:none;border:0;color:#848E9C;padding:7px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
+.tab.on{background:#2B3139;color:#EAECEF}
+.fichas{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.ficha{border-radius:10px;padding:9px 10px 6px;cursor:pointer;min-width:0}
+.ficha .cab{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;gap:4px}
+.ficha .num{font-size:26px;font-weight:600;line-height:1.15}
+.ficha .sub{font-size:11px}
+.ficha svg{display:block;width:100%;height:26px;margin-top:4px}
+.ficha .barra{height:5px;border-radius:3px;margin:5px 0 4px;background:rgba(0,0,0,.18);overflow:hidden}
+.ficha .barra i{display:block;height:100%;border-radius:3px}
+.ficha .px{font-size:11px;margin-top:2px;white-space:nowrap}
+.ficha .px i{display:inline-block;width:7px;height:7px;border-radius:50%;margin:0 3px 0 0}
 .grid{display:grid;grid-template-columns:46px repeat(var(--n),minmax(0,1fr));gap:2px;font-size:11px}
 .cel{height:36px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:12px;cursor:pointer}
 .det{margin-top:10px;background:var(--card2);border-radius:8px;padding:10px;font-size:13px}
@@ -13551,9 +13669,16 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
 
   <div class="card">
     <div class="mejor" id="mejor"></div>
-    <div class="tit">Cada filtro contra sí mismo</div>
-    <div id="lista"></div>
-    <div class="lb" style="margin-top:8px"><span style="color:var(--r)">●</span> punta pestaña Vender · <span style="color:var(--g)">●</span> punta pestaña Comprar · <span class="tag" style="background:var(--r);color:#fff">2º</span> <span class="tag" style="background:var(--g);color:#181A20">1º</span> = vos y tu puesto</div>
+    <div class="tabs"><button class="tab" id="tabLista" type="button" onclick="vista('lista')">Lista</button><button class="tab" id="tabFichas" type="button" onclick="vista('fichas')">Fichas (nuevo)</button></div>
+    <div class="tit">Cada filtro, comprando y vendiendo en el mismo</div>
+    <div id="vLista">
+      <div id="lista"></div>
+      <div class="lb" style="margin-top:8px"><span style="color:var(--r)">●</span> punta pestaña Vender · <span style="color:var(--g)">●</span> punta pestaña Comprar, con su precio abajo · <span class="tag" style="background:var(--r);color:#fff">2º</span> <span class="tag" style="background:var(--g);color:#181A20">1º</span> = vos y tu puesto</div>
+    </div>
+    <div id="vFichas">
+      <div class="fichas" id="fichas"></div>
+      <div class="lb" style="margin-top:8px"><span style="color:var(--r)">●</span> punta pestaña Vender · <span style="color:var(--g)">●</span> punta pestaña Comprar · barra = comparada con el filtro más ancho · flecha = cambio en la última hora · rayita = últimas 3 horas</div>
+    </div>
   </div>
 
   <div class="card">
@@ -13573,7 +13698,7 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
   <div class="pie">Sólo verificados · comisión de la vuelta <span id="com">0,29</span>% · el libro se renueva cada 15 s · __VERSION__</div>
 </div>
 <script>
-var D = null, recibido = 0, sc = null, sv = null, cargando = false;
+var D = null, HIST = null, recibido = 0, sc = null, sv = null, cargando = false;
 var GUARDA = "p2p_brecha_sel";
 try { var g = JSON.parse(localStorage.getItem(GUARDA) || "null"); if (g) { sc = g[0]; sv = g[1]; } } catch (e) {}
 
@@ -13680,16 +13805,58 @@ function yoAca(c, v) {
   return yo.length ? '<div style="font-size:12px;margin-top:6px;font-weight:600">Vos acá: ' + yo.join(" · ") + "</div>" : "";
 }
 
-function pintarLista() {
+function fecha(t) { return t ? new Date(String(t).replace(" ", "T")) : null; }
+
+function cargarHist() {
+  fetch("/api/brecha_historia?horas=3", { cache: "no-store" })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (j) { if (j && j.puntos) { HIST = j; if (D) pintarFichas(); } })
+    .catch(function () {});
+}
+
+function serie(m) {
+  if (!HIST) return [];
+  return HIST.puntos.map(function (p) { return { t: fecha(p.ts), v: p.brechas[String(m)] }; })
+    .filter(function (p) { return p.v != null; });
+}
+
+function rayita(pts, tinta) {
+  if (pts.length < 2) return "";
+  var vs = pts.map(function (p) { return p.v; }), lo = Math.min.apply(null, vs), hi = Math.max.apply(null, vs);
+  if (hi - lo < 3) { var c = (hi + lo) / 2; lo = c - 1.5; hi = c + 1.5; }
+  var t0 = pts[0].t.getTime(), t1 = pts[pts.length - 1].t.getTime() || t0 + 1;
+  var xy = pts.map(function (p) {
+    return ((p.t.getTime() - t0) / Math.max(1, t1 - t0) * 100).toFixed(1) + "," + (25 - (p.v - lo) / (hi - lo) * 22).toFixed(1);
+  }).join(" ");
+  return '<svg viewBox="0 0 100 27" preserveAspectRatio="none"><polyline points="' + xy + '" fill="none" stroke="' + tinta +
+    '" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke" opacity=".85"/></svg>';
+}
+
+function pintarMejor() {
   var b = mejorCombo();
   $("mejor").innerHTML = b ? "<b>Mejor ahora:</b> comprar en " + mil(b.c) + ", vender en " + mil(b.v) + " · " + fx(b.k.g, 2) + " $ · " + signo(b.k.n) : "Sin combinaciones con las dos puntas.";
   $("mejor").onclick = b ? function () { elegir(b.c, b.v); window.scrollTo({ top: 0, behavior: "smooth" }); } : null;
+}
+
+var VISTA = "lista";
+try { if (localStorage.getItem("p2p_brecha_vista") === "fichas") VISTA = "fichas"; } catch (e) {}
+function vista(v) {
+  VISTA = v;
+  try { localStorage.setItem("p2p_brecha_vista", v); } catch (e) {}
+  $("vLista").style.display = v === "lista" ? "" : "none";
+  $("vFichas").style.display = v === "fichas" ? "" : "none";
+  $("tabLista").className = "tab" + (v === "lista" ? " on" : "");
+  $("tabFichas").className = "tab" + (v === "fichas" ? " on" : "");
+}
+
+function pintarLista() {
   var ps = [];
   D.filtros.forEach(function (f) {
     [f.compra && f.compra.precio, f.venta && f.venta.precio, f.mio_compra, f.mio_venta].forEach(function (p) { if (p) ps.push(p); });
   });
   if (!ps.length) { $("lista").innerHTML = ""; return; }
-  var lo = Math.min.apply(null, ps) - 1, hi = Math.max.apply(null, ps) + 1;
+  var mn = Math.min.apply(null, ps), mx = Math.max.apply(null, ps), pad = Math.max(1, (mx - mn) * 0.35);
+  var lo = mn - pad, hi = mx + pad;
   function X(p) { return ((p - lo) / (hi - lo) * 100).toFixed(1) + "%"; }
   $("lista").innerHTML = D.filtros.map(function (f) {
     var k = combo(f.monto, f.monto), col = color(k ? k.n : null), h = "";
@@ -13699,12 +13866,42 @@ function pintarLista() {
     }
     if (f.mio_compra) h += '<div class="yo" style="left:' + X(f.mio_compra) + '"></div><div class="pill" style="left:' + X(f.mio_compra) + ';background:var(--r);color:#fff">' + f.mi_puesto_compra + "º</div>";
     if (f.mio_venta) h += '<div class="yo" style="left:' + X(f.mio_venta) + '"></div><div class="pill" style="left:' + X(f.mio_venta) + ';background:var(--g);color:#181A20">' + f.mi_puesto_venta + "º</div>";
-    if (f.compra) h += '<div class="dot" style="left:' + X(f.compra.precio) + ';background:var(--r)"></div>';
-    if (f.venta) h += '<div class="dot" style="left:' + X(f.venta.precio) + ';background:var(--g)"></div>';
+    if (f.compra) h += '<div class="dot" style="left:' + X(f.compra.precio) + ';background:var(--r)"></div>' +
+      '<span class="pre" style="right:calc(100% - ' + X(f.compra.precio) + ');color:#F6465D">' + fx(f.compra.precio, 2) + "</span>";
+    if (f.venta) h += '<div class="dot" style="left:' + X(f.venta.precio) + ';background:var(--g)"></div>' +
+      '<span class="pre" style="left:' + X(f.venta.precio) + ';color:#0ECB81">' + fx(f.venta.precio, 2) + "</span>";
     var v = k ? '<span style="color:' + (k.n < 0 ? "#848E9C" : "#F0B90B") + '">' + fx(k.g, 1) + " $</span><br>" +
       '<span style="font-size:11px;color:#848E9C">' + signo(k.n) + "</span>" : '<span style="color:#5E6673">sin punta</span>';
     return '<div class="fila" onclick="elegir(' + f.monto + "," + f.monto + ')"><span class="f">' + mil(f.monto) + '</span><div class="t">' + h + '</div><span class="v">' + v + "</span></div>";
-  }).join("") + '<div style="display:flex;justify-content:space-between;font-size:11px;color:#5E6673;margin:4px 92px 0 58px"><span>' + fx(lo, 0) + "</span><span>" + fx(hi, 0) + "</span></div>";
+  }).join("");
+}
+
+function pintarFichas() {
+  var ahora = fecha(D.timestamp) || new Date(), mejorN = null, maxG = 0;
+  D.filtros.forEach(function (f) { var k = combo(f.monto, f.monto); if (k) { if (mejorN == null || k.n > mejorN) mejorN = k.n; if (k.g > maxG) maxG = k.g; } });
+  $("fichas").innerHTML = D.filtros.map(function (f) {
+    var k = combo(f.monto, f.monto), click = ' onclick="elegir(' + f.monto + "," + f.monto + ')"';
+    if (!k) return '<div class="ficha"' + click + ' style="background:#1E2329;color:#5E6673"><div class="cab"><span>' + mil(f.monto) + '</span></div><div class="num">—</div><div class="sub">sin punta en un lado</div></div>';
+    var col = color(k.n), pts = serie(f.monto), flecha = "";
+    pts.push({ t: ahora, v: k.g });
+    var antes = null;
+    for (var i = 0; i < pts.length; i++) { if (ahora - pts[i].t <= 3600000) { antes = pts[i]; break; } }
+    if (antes && ahora - antes.t >= 2400000) {
+      var d = k.g - antes.v;
+      flecha = Math.abs(d) < 0.05 ? "= igual" : (d > 0 ? "▲ " : "▼ ") + fx(Math.abs(d), 1) + " $";
+    }
+    var yo = [];
+    if (f.mi_puesto_compra) yo.push("compra " + f.mi_puesto_compra + "º");
+    if (f.mi_puesto_venta) yo.push("venta " + f.mi_puesto_venta + "º");
+    var borde = k.n === mejorN ? ";box-shadow:inset 0 0 0 2px #EAECEF" : "";
+    return '<div class="ficha"' + click + ' style="background:' + col[0] + ";color:" + col[1] + borde + '">' +
+      '<div class="cab"><span>' + mil(f.monto) + '</span><span style="font-weight:600">' + flecha + "</span></div>" +
+      '<div class="num">' + fx(k.g, 1) + " $</div>" +
+      '<div class="barra"><i style="width:' + (maxG > 0 ? Math.max(2, k.g / maxG * 100) : 0).toFixed(0) + "%;background:" + col[1] + '"></i></div>' +
+      '<div class="px"><i style="background:#F6465D"></i>' + fx(k.pc.precio, 2) + ' <i style="background:#0ECB81;margin-left:5px"></i>' + fx(k.pv.precio, 2) + "</div>" +
+      '<div class="sub">te queda ' + signo(k.n) + (yo.length ? " · vos: " + yo.join(" · ") : "") + "</div>" +
+      rayita(pts, col[1]) + "</div>";
+  }).join("");
 }
 
 function pintarMapa() {
@@ -13731,7 +13928,7 @@ function pintar() {
   var ms = D.filtros.map(function (f) { return f.monto; });
   if (ms.indexOf(sc) < 0 || ms.indexOf(sv) < 0) { var b = mejorCombo(); sc = b ? b.c : ms[0]; sv = b ? b.v : ms[0]; }
   $("com").textContent = fx(com(), 2);
-  pintarVos(); pintarSelector(); pintarLista(); pintarMapa(); reloj();
+  pintarVos(); pintarSelector(); pintarMejor(); pintarLista(); pintarFichas(); pintarMapa(); reloj();
 }
 
 function reloj() {
@@ -13753,9 +13950,12 @@ function cargar() {
 
 $("btn").onclick = cargar;
 setInterval(function () { if (document.visibilityState === "visible") cargar(); }, 15000);
+setInterval(function () { if (document.visibilityState === "visible") cargarHist(); }, 150000);
 setInterval(reloj, 1000);
-document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") cargar(); });
+document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") { cargar(); cargarHist(); } });
+vista(VISTA);
 cargar();
+cargarHist();
 </script>
 </body>
 </html>
