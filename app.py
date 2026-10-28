@@ -19,7 +19,7 @@ SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 # Version del codigo: se expone en /api/version y en el pie del dashboard, para
 # confirmar de un vistazo QUE version esta corriendo en Railway tras un deploy.
-VERSION       = "COL73"
+VERSION       = "COL74"
 VERSION_FECHA = "2026-10-28"
 
 config = {
@@ -13344,13 +13344,106 @@ def _aparece_en_filtro(a, monto):
         return False
 
 
+# ──────────────────────────────────────────────────────────────
+# COL74 — LAS PUNTAS SE LE PIDEN A BINANCE FILTRO POR FILTRO
+# El libro vivo son los primeros TOP_ANUNCIOS (80) SIN filtro de monto.
+# Medido 28-oct 13:54: la pestaña Vender estaba llena de NO verificados
+# pagando caro (993 a 984) y los 80 terminaban en 979,45. Los verificados de
+# ticket chico estaban mas abajo (el 1º en 20 mil a 978,70, y era EL) ->
+# la pagina decia "sin punta" en 10-50 mil y "sin anuncio prendido".
+# En 12 h: 10 mil sin punta 63 de 288 fotos, 20 mil 12, 30 mil 10 (desde 09:49).
+# Arreglo: la misma consulta que hace la app con el monto escrito
+# (transAmount) y "solo verificados" (publisherType=merchant). Una pagina de
+# 50 alcanza (10 mil: 45 verificados en total).
+# COSTO: 2 consultas por filtro (14 con los 7 de siempre), 3 a la vez,
+# SOLO cuando alguien pide /api/brecha, con cache de 25 s. Si una falla, 2 min
+# sin insistir (misma IP que el colector) y se cae al libro de 80, avisando.
+BRECHA_BINANCE_CACHE_SEG = 25
+BRECHA_BINANCE_PAUSA_SEG = 120
+_brecha_bn = {"clave": None, "t": 0.0, "datos": None, "falla_t": 0.0, "falla": None}
+_brecha_bn_lock = threading.Lock()
+
+
+def _brecha_fila(item, pos):
+    """Un anuncio del buscador de Binance, con las mismas cuentas que
+    libro_vivo_como_detalle, mas su advNo (para no contarlo dos veces)."""
+    adv = item.get("adv") or {}
+    tr = item.get("advertiser") or {}
+    mino, maxo = _limites_adv(adv)
+    op = _operabilidad_adv(adv)
+    return {"posicion": pos, "anunciante": tr.get("nickName", ""),
+            "precio": float(adv.get("price", 0) or 0),
+            "disponible": float(adv.get("tradableQuantity", 0) or 0),
+            "completadas": int(tr.get("monthOrderCount", 0) or 0),
+            "tasa_exito": round(float(tr.get("monthFinishRate", 0) or 0) * 100, 1),
+            "es_merchant": tr.get("userType") == "merchant",
+            "min_orden": mino, "max_orden": maxo,
+            "max_efectivo": op["max_efectivo"],
+            "adv_no": adv.get("advNo")}
+
+
+def _brecha_pedir_filtro(tipo, monto, solo_verif, c):
+    """Lo que ve quien escribe 'monto' en la pestaña de 'tipo'. Levanta
+    excepcion si Binance no contesta bien (el que llama decide)."""
+    r = requests.post(URL, json={
+        "asset": c["MONEDA"], "fiat": c["FIAT"], "merchantCheck": False,
+        "page": 1, "rows": 50, "tradeType": tipo,
+        "transAmount": str(int(monto)), "payTypes": [],
+        "publisherType": "merchant" if solo_verif else None,
+    }, headers=HEADERS, timeout=8)
+    r.raise_for_status()
+    j = r.json()
+    data = j.get("data")
+    if data is None:
+        raise ValueError(f"Binance sin data (code {j.get('code')})")
+    filas, vistos = [], set()
+    for i, it in enumerate(data, 1):
+        f = _brecha_fila(it, i)
+        if f["adv_no"] and f["adv_no"] in vistos:
+            continue
+        vistos.add(f["adv_no"])
+        filas.append(f)
+    return filas
+
+
+def _brecha_libros_por_filtro(montos, solo_verif):
+    """({("SELL"|"BUY", monto): filas}, edad_seg) o (None, motivo).
+    Con el lock tomado durante la consulta: si llegan dos pedidos juntos,
+    el segundo espera y usa la misma foto (no se duplica la carga)."""
+    from concurrent.futures import ThreadPoolExecutor
+    clave = (tuple(montos), bool(solo_verif))
+    with _brecha_bn_lock:
+        ahora = time.time()
+        if _brecha_bn["clave"] == clave and ahora - _brecha_bn["t"] < BRECHA_BINANCE_CACHE_SEG:
+            return _brecha_bn["datos"], ahora - _brecha_bn["t"]
+        if ahora - _brecha_bn["falla_t"] < BRECHA_BINANCE_PAUSA_SEG:
+            return None, _brecha_bn["falla"]
+        with config_lock:
+            c = dict(config)
+        pedidos = [(t, m) for m in montos for t in ("SELL", "BUY")]
+        try:
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                res = list(ex.map(lambda p: _brecha_pedir_filtro(p[0], p[1], solo_verif, c), pedidos))
+        except Exception as e:
+            _brecha_bn["falla_t"] = time.time()
+            _brecha_bn["falla"] = str(e)[:150]
+            print(f"[BRECHA BINANCE] {e}")
+            return None, _brecha_bn["falla"]
+        datos = dict(zip(pedidos, res))
+        _brecha_bn.update(clave=clave, t=time.time(), datos=datos)
+        return datos, 0.0
+
+
 @app.route("/api/brecha")
 def api_brecha():
-    """Las dos puntas de cada filtro de monto, del libro mas fresco (15 s).
+    """Las dos puntas de cada filtro de monto. COL74: pedidas a Binance
+    filtro por filtro (cache 25 s); si Binance no contesta, del libro mas
+    fresco de 80 (15 s), con "aviso".
 
     ?montos=10000,20000,...   CLP, hasta 12 (default BRECHA_MONTOS_DEFAULT)
     ?verificados=1            default 1; 0 = todos
-    Sin cache: es un recorrido de ~160 anuncios en memoria."""
+    El libro de 80 se sigue leyendo: es el respaldo y suma los anuncios
+    suyos que no salieran en ningun filtro."""
     crudo = str(request.args.get("montos", "") or "").strip()
     try:
         montos = [int(float(x)) for x in crudo.split(",") if x.strip()] if crudo else list(BRECHA_MONTOS_DEFAULT)
@@ -13384,12 +13477,44 @@ def api_brecha():
     def es_mio(a):
         return bool(mi_nick) and str(a.get("anunciante", "")).strip().lower() == mi_nick
 
+    # COL74 — primero lo que Binance muestra en cada filtro; si no contesta,
+    # el libro de 80 de siempre (y se avisa en "aviso").
+    por_filtro, info_bn = _brecha_libros_por_filtro(montos, solo_verif)
+    aviso = None
+    if por_filtro is not None:
+        edad, fuente = info_bn, "binance_por_filtro"
+    else:
+        aviso = ("Binance no contesto la consulta por filtro (" + str(info_bn or "")[:80] +
+                 "): puntas sacadas de los primeros 80 del libro. En montos chicos "
+                 "puede faltar la punta o tu anuncio.")
+
     # COL72 — SUS anuncios NO pasan por los filtros de calidad: un filtro de
     # "aviso muerto" no aplica a uno mismo. Medido 27-oct: su compra tenia
     # 147 USDT (< 200 de FILTRO_MIN_USDT) y la pagina no lo mostraba. Solo se
     # exige que el anuncio aparezca en el filtro (_aparece_en_filtro).
     mis = {"compra": [a for a in libro_v if es_mio(a)],
            "venta": [a for a in libro_c if es_mio(a)]}
+    en_filtro = {}           # (clave, monto) -> advNo suyos que Binance mostro ahi
+    if por_filtro is not None:
+        # COL74 — los suyos salen de las consultas por filtro (uno por advNo);
+        # el libro de 80 no los ve si estan mas abajo del corte.
+        for clave, tipo in (("compra", "SELL"), ("venta", "BUY")):
+            propios = {}
+            for m in montos:
+                for a in por_filtro[(tipo, m)]:
+                    if es_mio(a):
+                        propios.setdefault(a["adv_no"], a)
+                        en_filtro.setdefault((clave, m), set()).add(a["adv_no"])
+            # y alguno del libro de 80 que no haya salido en ningun filtro
+            ya = {(round(float(a["precio"]), 2), a.get("min_orden")) for a in propios.values()}
+            extra = [a for a in mis[clave]
+                     if (round(float(a["precio"]), 2), a.get("min_orden")) not in ya]
+            mis[clave] = list(propios.values()) + extra
+
+    def mio_en(a, clave, m):
+        """Su anuncio a aparece en el filtro m? Si Binance lo mostro ahi, si;
+        si no, la cuenta de siempre (puede estar mas abajo del puesto 50)."""
+        return (a.get("adv_no") in en_filtro.get((clave, m), ())) or _aparece_en_filtro(a, m)
 
     def puesto(precio, rivales, mas_caro):
         """Puesto entre los verificados del filtro: 1 + los que estan MEJOR.
@@ -13405,9 +13530,14 @@ def api_brecha():
         fila = {"monto": m}
         # (clave, libro, el mejor es el mas caro?)
         for clave, filas, mas_caro in (("compra", libro_v, True), ("venta", libro_c, False)):
-            rivales = [a for a in filas if pasa(a) and _aparece_en_filtro(a, m) and not es_mio(a)]
+            if por_filtro is not None:
+                # Binance ya filtro por monto: no se repite _aparece_en_filtro
+                tipo = "SELL" if clave == "compra" else "BUY"
+                rivales = [a for a in por_filtro[(tipo, m)] if pasa(a) and not es_mio(a)]
+            else:
+                rivales = [a for a in filas if pasa(a) and _aparece_en_filtro(a, m) and not es_mio(a)]
             rivales_de[(clave, m)] = rivales
-            mios = [a for a in mis[clave] if _aparece_en_filtro(a, m)]
+            mios = [a for a in mis[clave] if mio_en(a, clave, m)]
             elige = max if mas_caro else min
             if rivales:
                 p = elige(rivales, key=lambda x: float(x["precio"]))
@@ -13433,7 +13563,7 @@ def api_brecha():
             pm = float(a.get("precio") or 0)
             en = []
             for m in montos:
-                if _aparece_en_filtro(a, m):
+                if mio_en(a, clave, m):
                     pu, em = puesto(pm, rivales_de[(clave, m)], mas_caro)
                     en.append({"monto": m, "puesto": pu, "empate": em})
             lista.append({"precio": round(pm, 2),
@@ -13464,11 +13594,14 @@ def api_brecha():
         "filtros": filtros,
         "mis_anuncios": mis_anuncios,
         "mi_brecha": mi_brecha,
+        "aviso": aviso,
         "nota": ("compra = la punta de la pestaña VENDER de Binance (el mas caro: ahi "
                  "competis cuando compras). venta = la punta de la pestaña COMPRAR (el "
                  "mas barato: ahi competis cuando vendes). Un anuncio esta en el filtro M "
                  "si min <= M <= su maximo efectivo y su stock alcanza. Tus anuncios no "
-                 "cuentan como punta: van en mio_compra / mio_venta. Sin velocidad."),
+                 "cuentan como punta: van en mio_compra / mio_venta. Sin velocidad. "
+                 "fuente binance_por_filtro = la misma consulta que la app con el monto "
+                 "escrito (COL74); si no, el libro de 80 y 'aviso' lo dice."),
     })
 
 
@@ -13653,6 +13786,7 @@ html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 -apple-sys
     <button class="btn" id="btn" type="button">↻ Actualizar</button>
   </div>
   <div class="err" id="err"></div>
+  <div id="aviso" style="display:none;color:#F0B90B;font-size:12px;margin:0 0 10px"></div>
 
   <div class="card">
     <div class="tit" style="color:var(--tx)">Vos ahora</div>
@@ -13741,7 +13875,7 @@ function caja(lado) {
   var L = (D.mis_anuncios && D.mis_anuncios[lado]) || [], esC = lado === "compra";
   var tit = esC ? 'Tu compra · <span style="color:var(--r)">pestaña Vender</span>' : 'Tu venta · <span style="color:var(--g)">pestaña Comprar</span>';
   var h = '<div class="mio" style="border-color:' + (L.length ? (esC ? "var(--r)" : "var(--g)") : "var(--line)") + '"><div class="lb">' + tit + "</div>";
-  if (!L.length) return h + '<div style="color:#5E6673;margin-top:6px">sin anuncio prendido</div></div>';
+  if (!L.length) return h + '<div style="color:#5E6673;margin-top:6px">' + (D.fuente === "binance_por_filtro" ? "sin anuncio prendido" : "no lo veo en los primeros 80 del libro") + "</div></div>";
   L.forEach(function (a, i) {
     h += '<div style="margin-top:' + (i ? "10px;border-top:1px solid var(--line);padding-top:8px" : "6px") + '">' +
       '<div class="precio">' + fx(a.precio, 2) + "</div>" +
@@ -13934,8 +14068,11 @@ function pintar() {
 function reloj() {
   if (!D) return;
   var s = Math.round((D.edad_seg || 0) + (Date.now() - recibido) / 1000);
-  $("edad").textContent = "libro de hace " + s + " s" + (D.fuente === "colector" ? " · (respaldo)" : "");
-  $("edad").style.color = s > 60 ? "#F6465D" : "#848E9C";
+  var pf = D.fuente === "binance_por_filtro";
+  $("edad").textContent = (pf ? "Binance por filtro, hace " : "libro de hace ") + s + " s" + (pf ? "" : " · sólo los primeros 80");
+  $("edad").style.color = (s > 60 || !pf) ? "#F6465D" : "#848E9C";
+  $("aviso").textContent = D.aviso ? "Binance no contestó la consulta por filtro: muestro los primeros 80 del libro. En montos chicos puede faltar la punta o tu anuncio. Reintento solo en 2 minutos." : "";
+  $("aviso").style.display = D.aviso ? "block" : "none";
 }
 
 function cargar() {
